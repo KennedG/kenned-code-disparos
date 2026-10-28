@@ -19,7 +19,8 @@ class MediaManager {
     }
     const [mime,type] = types[ext]; const id = randomUUID(); const target = path.join(this.dir,`${id}${ext}`);
     atomicWrite(target,buffer);
-    return this.store.saveMedia({id,name:name.includes('.')?name:`${name}${ext}`,mime,type,path:target,size:buffer.length,sha256:createHash('sha256').update(buffer).digest('hex'),createdAt:Date.now()});
+    const displayName=path.extname(name).toLowerCase()===ext?name:`${name}${ext}`;
+    return this.store.saveMedia({id,name:displayName,mime,type,path:target,size:buffer.length,sha256:createHash('sha256').update(buffer).digest('hex'),createdAt:Date.now()});
   }
   getPath(id) {
     const m = this.store.getMedia(id); if (!m || !m.path) throw new Error('Mídia não encontrada.');
@@ -42,9 +43,11 @@ class MediaManager {
       data.media=data.media.map(m=> {
         if(typeof m.id!=='string'||ids.has(m.id)||typeof m.base64!=='string') throw new Error('Mídia inválida no backup.'); ids.add(m.id);
         const bytes=Buffer.from(m.base64,'base64'); if(!bytes.length||bytes.length>MAX_FILE||createHash('sha256').update(bytes).digest('hex')!==m.sha256) throw new Error('Arquivo de backup corrompido.');
-        const ext=path.extname(String(m.name)).toLowerCase(); if(!types[ext]) throw new Error('Formato inválido no backup.');
+        let ext=path.extname(String(m.name)).toLowerCase();
+        if(!types[ext])ext=Object.entries(types).find(([,value])=>value[0]===m.mime)?.[0];
+        if(!types[ext]) throw new Error('Formato inválido no backup.');
         const target=path.join(this.dir,`${randomUUID()}${ext}`); atomicWrite(target,bytes); created.push(target);
-        const {base64:ignored,path:unsafe,...meta}=m; return {...meta,path:target,type:types[ext][1],mime:types[ext][0],size:bytes.length};
+        const {base64:ignored,path:unsafe,...meta}=m; return {...meta,name:path.extname(String(m.name)).toLowerCase()===ext?m.name:`${m.name}${ext}`,path:target,type:types[ext][1],mime:types[ext][0],size:bytes.length};
       });
       const allItems=data.campaigns.flatMap(c=>[...(c.items||[]),...Object.values(c.groupOverrides||{}).flatMap(v=>v.items||[])]).concat((data.templates||[]).flatMap(t=>t.items||[]));
       for(const item of allItems) if(item.type!=='text'&&!ids.has(item.mediaId)) throw new Error('Conteúdo referencia uma mídia ausente.');

@@ -7,6 +7,7 @@ const { randomBytes, createHash } = require('node:crypto');
 
 const AUTH_FILE = 'session.dpapi';
 const ACK_TIMEOUT_MS = 20000;
+const SUBMISSION_TIMEOUT_MS = 90000;
 const MAX_MEDIA_BYTES = 64 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(['text', 'image', 'video', 'document']);
 
@@ -129,12 +130,14 @@ class EncryptedAuthStore {
 }
 
 class WhatsAppAdapter extends EventEmitter {
-  constructor({ store, credentialsDir, safeStorage, ackTimeoutMs = ACK_TIMEOUT_MS, loadLibrary, runtimePlatform = process.platform } = {}) {
+  constructor({ store, credentialsDir, safeStorage, ackTimeoutMs = ACK_TIMEOUT_MS, submissionTimeoutMs = SUBMISSION_TIMEOUT_MS, controlTimeoutMs = SUBMISSION_TIMEOUT_MS, loadLibrary, runtimePlatform = process.platform } = {}) {
     super();
     this.store = store;
     this.credentialsDir = credentialsDir;
     this.safeStorage = safeStorage;
     this.ackTimeoutMs = ackTimeoutMs;
+    this.submissionTimeoutMs = submissionTimeoutMs;
+    this.controlTimeoutMs = controlTimeoutMs;
     this.loadLibrary = loadLibrary || (() => import('@whiskeysockets/baileys'));
     this.runtimePlatform = runtimePlatform;
     this.status = { state: 'disconnected', mode: 'whatsapp', detail: 'WhatsApp desconectado. Integração Baileys não oficial.' };
@@ -143,6 +146,7 @@ class WhatsAppAdapter extends EventEmitter {
     this.authStore = null;
     this.logger = null;
     this.connectPromise = null;
+    this.sessionResetPromise = null;
     this.generation = 0;
     this.pendingAcks = new Map();
     this.receipts = new Map();
@@ -163,12 +167,15 @@ class WhatsAppAdapter extends EventEmitter {
     if (!this.credentialsDir) throw new Error('Pasta protegida da sessão não configurada.');
   }
 
-  async connect() {
-    if (this.status.state === 'connected') return this.status;
+  async connect({ reconnect = false } = {}) {
     if (this.connectPromise) return this.connectPromise;
-    this.requestedDisconnect = false;
-    this.restartCount = 0;
-    this.connectPromise = this._connect().finally(() => { this.connectPromise = null; });
+    if (this.status.state === 'connected' && !reconnect) return this.status;
+    this.connectPromise = (async () => {
+      if (reconnect && this.socket) await this.disconnect();
+      this.requestedDisconnect = false;
+      this.restartCount = 0;
+      return this._connect();
+    })().finally(() => { this.connectPromise = null; });
     return this.connectPromise;
   }
 
@@ -181,7 +188,9 @@ class WhatsAppAdapter extends EventEmitter {
       if (this.socket) this.socket.end(new Error('Reconexão solicitada.'));
       this.library ||= await this.loadLibrary();
       this.logger ||= require('pino')({ level: 'silent' });
+      await this.sessionResetPromise;
       this.authStore ||= new EncryptedAuthStore({ dir: this.credentialsDir, safeStorage: this.safeStorage, library: this.library });
+      await this.authStore.writeChain;
       const auth = await this.authStore.load();
       if (generation !== this.generation || this.requestedDisconnect) return this.status;
       const makeSocket = this.library.default || this.library.makeWASocket;
@@ -267,7 +276,14 @@ class WhatsAppAdapter extends EventEmitter {
     if (this.status.state === 'restricted' || code === 403 || code === 429 || (reasons.forbidden && code === reasons.forbidden)) {
       this._status('restricted', 'O WhatsApp restringiu a conexão. Todos os envios estão pausados; respeite a restrição.');
     } else if (code === reasons.loggedOut || code === 401) {
-      this._status('disconnected', 'A conta foi desconectada pelo WhatsApp. Conecte novamente pelo QR Code.');
+      const reset = this._clearSession();
+      this._status('disconnected', 'A conta foi desconectada pelo WhatsApp. Removendo a sessão local inválida…');
+      try {
+        await reset;
+        if (generation === this.generation) this._status('disconnected', 'A conta foi desconectada pelo WhatsApp. Conecte novamente pelo QR Code.');
+      } catch {
+        if (generation === this.generation) this._status('disconnected', 'Não foi possível remover a sessão inválida. Use Remover sessão antes de conectar novamente.');
+      }
     } else {
       this._status('disconnected', this.requestedDisconnect ? 'WhatsApp desconectado.' : 'Conexão interrompida. Envios pausados; reconecte para continuar.');
     }
@@ -277,6 +293,17 @@ class WhatsAppAdapter extends EventEmitter {
       await this.authStore.writeChain.catch(() => {});
       if (generation === this.generation && !this.requestedDisconnect) await this._connect();
     }
+  }
+
+  async _clearSession() {
+    if (this.sessionResetPromise) return this.sessionResetPromise;
+    const previous = this.authStore;
+    this.authStore = null;
+    this.sessionResetPromise = (async () => {
+      if (previous) await previous.clear();
+      else if (this.credentialsDir) await fs.unlink(path.join(this.credentialsDir, AUTH_FILE)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    })().finally(() => { this.sessionResetPromise = null; });
+    return this.sessionResetPromise;
   }
 
   async disconnect({ logout = false } = {}) {
@@ -292,9 +319,7 @@ class WhatsAppAdapter extends EventEmitter {
     finally {
       socket?.end(new Error('Desconexão solicitada pelo usuário.'));
       if (logout) {
-        if (this.authStore) await this.authStore.clear();
-        else if (this.credentialsDir) await fs.unlink(path.join(this.credentialsDir, AUTH_FILE)).catch(error => { if (error.code !== 'ENOENT') throw error; });
-        this.authStore = null;
+        await this._clearSession();
       } else if (this.authStore) await this.authStore.writeChain.catch(() => {});
       this._status('disconnected', logout ? (logoutFailed ? 'Sessão local removida. Remova também o aparelho nas configurações do WhatsApp.' : 'Conta desconectada e sessão local removida.') : 'WhatsApp desconectado. A sessão permanece protegida para reconexão.');
     }
@@ -380,12 +405,26 @@ class WhatsAppAdapter extends EventEmitter {
     const socket = this.socket;
     // Register before submitting so even an immediate server ACK cannot be lost.
     const resultPromise = new Promise(resolve => {
-      this.pendingAcks.set(messageId, { resolve, timer: null });
+      const timer = setTimeout(() => {
+        if (!this.pendingAcks.has(messageId)) return;
+        this._status('disconnected', 'O envio excedeu o tempo de resposta. Resultado incerto; revise o Histórico antes de retomar.');
+        this._resolveAllPending();
+        // Close the old socket so a delayed media upload cannot submit after the queue is paused.
+        if (this.socket === socket) {
+          this.generation += 1;
+          this.socket = null;
+          socket.end(new Error('Tempo de submissão excedido; transporte encerrado.'));
+        }
+      }, this.submissionTimeoutMs);
+      this.pendingAcks.set(messageId, { resolve, timer });
     });
     const sent = message => {
       if (Number(message?.status) >= 2 || this.receipts.has(messageId)) this._ack(messageId);
       const pending = this.pendingAcks.get(messageId);
-      if (pending) pending.timer = setTimeout(() => this._uncertain(messageId), this.ackTimeoutMs);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(() => this._uncertain(messageId), this.ackTimeoutMs);
+      }
     };
     const failed = error => {
       const code = error?.output?.statusCode || error?.statusCode;
@@ -444,8 +483,26 @@ class WhatsAppAdapter extends EventEmitter {
   async reply(chatId, text) {
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado.', true);
     if (typeof chatId !== 'string' || (!phoneFromJid(chatId) && !/^\d+@lid$/.test(chatId))) throw definitiveError('Conversa de controle inválida.');
-    const result = await this.socket.sendMessage(chatId, { text: String(text) });
-    return { messageId: result?.key?.id };
+    const socket = this.socket;
+    let timer;
+    try {
+      const result = await Promise.race([
+        socket.sendMessage(chatId, { text: String(text) }),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => {
+            if (this.socket === socket) {
+              this.generation += 1;
+              this.socket = null;
+              this._status('disconnected', 'A resposta de controle excedeu o tempo de espera. Reconecte para continuar.');
+              this._resolveAllPending();
+              socket.end(new Error('Tempo de resposta de controle excedido.'));
+            }
+            reject(definitiveError('Não foi possível confirmar a resposta de controle. Ela não será repetida automaticamente.'));
+          }, this.controlTimeoutMs);
+        })
+      ]);
+      return { messageId: result?.key?.id };
+    } finally { clearTimeout(timer); }
   }
 
   async downloadIncoming(context) {
@@ -455,19 +512,36 @@ class WhatsAppAdapter extends EventEmitter {
     if (!metadata) throw definitiveError('Anexo não encontrado.');
     const declaredSize = typeof metadata.fileLength?.toNumber === 'function' ? metadata.fileLength.toNumber() : Number(metadata.fileLength || 0);
     if (declaredSize > MAX_MEDIA_BYTES) throw definitiveError('O anexo excede o limite local de 64 MB.');
-    const stream = await this.library.downloadMediaMessage(context.raw, 'stream', {}, { logger: this.logger, reuploadRequest: this.socket.updateMediaMessage });
-    const chunks = [];
-    let size = 0;
+    const socket = this.socket;
+    let stream, timer;
+    let timedOut = false;
+    const timeoutError = definitiveError('O download da mídia excedeu o tempo de espera. Nenhum conteúdo parcial foi adicionado. Envie o anexo novamente.');
+    const download = (async () => {
+      stream = await this.library.downloadMediaMessage(context.raw, 'stream', {}, { logger: this.logger, reuploadRequest: socket.updateMediaMessage });
+      if (timedOut) { stream.destroy?.(); throw timeoutError; }
+      const chunks = [];
+      let size = 0;
+      try {
+        for await (const chunk of stream) {
+          size += chunk.length;
+          if (size > MAX_MEDIA_BYTES) throw definitiveError('O anexo excede o limite local de 64 MB.');
+          chunks.push(Buffer.from(chunk));
+        }
+      } finally { stream.destroy?.(); }
+      if (timedOut) throw timeoutError;
+      const buffer = Buffer.concat(chunks, size);
+      const extension = context.type === 'image' ? '.jpg' : context.type === 'video' ? '.mp4' : '';
+      return { buffer, name: metadata.fileName || `anexo-${Date.now()}${extension}`, mime: metadata.mimetype || 'application/octet-stream', type: context.type };
+    })();
     try {
-      for await (const chunk of stream) {
-        size += chunk.length;
-        if (size > MAX_MEDIA_BYTES) throw definitiveError('O anexo excede o limite local de 64 MB.');
-        chunks.push(Buffer.from(chunk));
-      }
-    } finally { stream.destroy?.(); }
-    const buffer = Buffer.concat(chunks, size);
-    const extension = context.type === 'image' ? '.jpg' : context.type === 'video' ? '.mp4' : '';
-    return { buffer, name: metadata.fileName || `anexo-${Date.now()}${extension}`, mime: metadata.mimetype || 'application/octet-stream', type: context.type };
+      return await Promise.race([download, new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          stream?.destroy?.();
+          reject(timeoutError);
+        }, this.controlTimeoutMs);
+      })]);
+    } finally { clearTimeout(timer); }
   }
 }
 

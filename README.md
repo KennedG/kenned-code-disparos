@@ -1,6 +1,6 @@
 # Kenned Code Disparos
 
-Snapshot: **v1.0.0**. Versão recomendada: **2.3.2 R9**, sem vendas e financeiro.
+Snapshot: **v1.0.1**. Versão recomendada: **2.3.2 R9**, sem vendas e financeiro.
 
 Código e histórico dos aplicativos para Windows. Integração WhatsApp Baileys não oficial.
 

@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomUUID, randomBytes } = require('node:crypto');
+const { configurationFingerprint } = require('./campaign-version.cjs');
 
 const SESSION_TTL = 15 * 60 * 1000;
 const CONFIRM_TTL = 5 * 60 * 1000;
@@ -34,6 +35,11 @@ class CommandController {
   }
 
   handle(context) {
+    // An administrator's stop must not wait for a media download or a slow reply.
+    // _handle still checks the protocol identity and durable replay guard first.
+    if (context?.type === 'text' && /^!mega\s+(?:parar\s+tudo|pausar\s+\S+)\s*$/i.test(String(context.text || '').trim())) {
+      return this._handle(context);
+    }
     const operation = this._tail.then(() => this._handle(context));
     this._tail = operation.catch(() => {});
     return operation;
@@ -94,7 +100,7 @@ class CommandController {
     if (session) session.expiresAt = Number(this.now()) + SESSION_TTL;
     const text = String(context.text || '').trim();
     try {
-      if (/^!mega(?:\s|$)/i.test(text)) {
+      if (context.type === 'text' && /^!mega(?:\s|$)/i.test(text)) {
         await this._command(context, sender, text.replace(/^!mega\s*/i, ''));
         return true;
       }
@@ -158,7 +164,7 @@ class CommandController {
     if (!campaign.groupIds.length) fail('Selecione pelo menos um grupo antes de ativar a campanha.');
     for (const id of campaign.groupIds) {
       const override = campaign.groupOverrides?.[id];
-      const items = override?.enabled && override.items ? override.items : campaign.items;
+      const items = override?.enabled && Array.isArray(override.items) && override.items.length ? override.items : campaign.items;
       if (!items.length) fail('Adicione pelo menos um conteúdo para cada grupo antes de ativar a campanha.');
     }
     const uncertain = this.store.listJobs({ campaignId: campaign.id, status: 'uncertain', limit: 1000000 });
@@ -204,6 +210,7 @@ class CommandController {
     // Uma solicitação por administrador; emitir outra invalida a anterior.
     this.pending.set(sender, {
       token, campaignId: campaign.id, revision: campaign.revision,
+      fingerprint: configurationFingerprint(campaign), state: campaign.state,
       operation, proposal: proposal ? clone(proposal) : null,
       expiresAt: Number(this.now()) + CONFIRM_TTL
     });
@@ -215,12 +222,16 @@ class CommandController {
     if (!request || request.token !== token || request.expiresAt <= Number(this.now())) fail('Confirmação inválida ou expirada. Solicite uma nova prévia/ativação.');
     this.pending.delete(sender); // Consumir antes da execução, inclusive se ela falhar.
     const current = this._campaign(request.campaignId);
-    if (current.revision !== request.revision) fail('A campanha mudou desde o resumo. Confira a campanha e solicite outra confirmação.');
+    if (configurationFingerprint(current) !== request.fingerprint || current.state !== request.state) fail('A campanha mudou desde o resumo. Confira a campanha e solicite outra confirmação.');
     if (request.operation === 'edit') {
-      this._validateActivation(request.proposal);
       // Cancelar a fila antiga antes de trocar conteúdos/destinos.
       await this.scheduler.pause(current.id);
-      this.store.saveCampaign({ ...request.proposal, state: 'paused', nextRunAt: null });
+      await this.scheduler.waitForIdle?.();
+      const settled = this._campaign(current.id);
+      if (configurationFingerprint(settled) !== request.fingerprint || settled.state !== 'paused') fail('A campanha mudou enquanto a fila era pausada. Solicite outra confirmação.');
+      const proposal = { ...request.proposal, roundIndex: settled.roundIndex, state: 'paused', nextRunAt: null };
+      this._validateActivation(proposal);
+      this.store.saveCampaign(proposal);
       await this.scheduler.resume(current.id);
     } else if (request.operation === 'resume') {
       this._validateActivation(current);
@@ -230,21 +241,21 @@ class CommandController {
       await this.scheduler.activate(current.id);
     }
     const session = this.sessions.get(sender);
-    if (session?.campaignId === current.id) session.revision = this.store.getCampaign(current.id).revision;
+    if (session?.campaignId === current.id) this._refreshSession(session);
     await this._reply(context, 'Confirmação recebida. Campanha ativada; os envios respeitarão o horário, a conexão e a fila.');
   }
 
   async _saveEdit(context, sender, original, proposal) {
     this._validateProposal(proposal);
     const current = this._campaign(original.id);
-    if (current.revision !== original.revision) fail('A campanha foi alterada enquanto você editava. Selecione-a novamente no menu.');
+    if (configurationFingerprint(current) !== configurationFingerprint(original) || current.state !== original.state) fail('A campanha foi alterada enquanto você editava. Selecione-a novamente no menu.');
     if (current.state === 'active') {
       await this._reply(context, this._requestConfirmation(sender, current, 'edit', proposal));
       return false;
     }
-    this.store.saveCampaign(proposal);
+    this.store.saveCampaign({ ...proposal, state: current.state, roundIndex: current.roundIndex, nextRunAt: current.nextRunAt });
     const session = this.sessions.get(sender);
-    if (session?.campaignId === original.id) session.revision = this.store.getCampaign(original.id).revision;
+    if (session?.campaignId === original.id) this._refreshSession(session);
     await this._reply(context, 'Alteração salva. A campanha não foi ativada.');
     return true;
   }
@@ -278,9 +289,18 @@ class CommandController {
   }
 
   _session(sender, campaign) {
-    const session = { phase: 'home', campaignId: campaign?.id || null, revision: campaign?.revision || null, groupId: null, expiresAt: Number(this.now()) + SESSION_TTL };
+    const session = { phase: 'home', campaignId: campaign?.id || null, revision: campaign?.revision || null,
+      fingerprint: campaign ? configurationFingerprint(campaign) : null, state: campaign?.state || null,
+      groupId: null, expiresAt: Number(this.now()) + SESSION_TTL };
     this.sessions.set(sender, session);
     return session;
+  }
+
+  _refreshSession(session) {
+    const campaign = this.store.getCampaign(session.campaignId);
+    session.revision = campaign?.revision || null;
+    session.fingerprint = campaign ? configurationFingerprint(campaign) : null;
+    session.state = campaign?.state || null;
   }
 
   _home(session) {
@@ -372,7 +392,7 @@ class CommandController {
   _editing(session) {
     if (!session.campaignId) fail('Selecione uma campanha pela opção 2 do menu.');
     const campaign = this._campaign(session.campaignId);
-    if (session.revision !== campaign.revision) fail('A campanha mudou desde a seleção. Envie !mega editar ID para selecioná-la novamente.');
+    if (session.fingerprint !== configurationFingerprint(campaign) || session.state !== campaign.state) fail('A campanha mudou desde a seleção. Envie !mega editar ID para selecioná-la novamente.');
     return campaign;
   }
 
@@ -431,6 +451,7 @@ class CommandController {
     if (session.phase === 'create_name') {
       const campaign = this._newCampaign(text);
       session.campaignId = campaign.id; session.revision = campaign.revision; session.groupId = null; session.phase = 'home';
+      this._refreshSession(session);
       return this._reply(context, `Campanha criada e desativada. ID: ${campaign.id}\n${this._home(session)}`);
     }
     if (session.phase === 'choose_campaign') {
@@ -438,6 +459,7 @@ class CommandController {
       const choice = /^\d+$/.test(text) ? campaigns[Number(text) - 1] : campaigns.find(campaign => campaign.id === text);
       if (!choice) fail('Seleção inválida. Informe o número ou identificador de uma campanha da lista.');
       session.campaignId = choice.id; session.revision = choice.revision; session.groupId = null; session.phase = 'home';
+      this._refreshSession(session);
       return this._reply(context, this._home(session));
     }
     if (session.phase === 'home') {
