@@ -2,11 +2,12 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { configurationFingerprint } = require('./campaign-version.cjs');
 const { createSearchSchema, attachSearchStore } = require('./search-store.cjs');
 const { inspectDatabaseCompatibility } = require('./schema-compatibility.cjs');
+const { attachSourceStore } = require('./source-campaign-store.cjs');
 
 const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts','reminders','reminder_deliveries','contact_pending','contact_intake_events']);
 const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
@@ -52,7 +53,8 @@ async function createStore(dir,options={}) {
   fs.mkdirSync(dir,{recursive:true});
   const filename=path.join(dir,'mega.sqlite'),existed=fs.existsSync(filename);
   const db=new DatabaseSync(filename,{timeout:5000});
-  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0,modeIsolationReady=false,upgradeBackup=null,databaseSchemaVersion=SCHEMA_VERSION,schemaCompatibility=null,compatibilityReviewRequired=false;
+  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0,modeIsolationReady=false,upgradeBackup=null,databaseSchemaVersion=SCHEMA_VERSION,schemaCompatibility=null,compatibilityReviewRequired=false,operationRevision=0;
+  const operationCache=new Map();
   const statements=new Map();
   const prepared=sql=>{let st=statements.get(sql);if(!st){st=db.prepare(sql);if(statements.size>=128)statements.delete(statements.keys().next().value);statements.set(sql,st);}return st;};
   const storageMode=()=>{const row=prepared("SELECT data FROM settings WHERE id='integrationMode'").get();return row&&JSON.parse(row.data).value==='simulated'?'simulated':'whatsapp';};
@@ -230,19 +232,25 @@ async function createStore(dir,options={}) {
     }
   }
   function roundRaw(input) {
+    operationRevision++;
     const r=tagged('rounds',input);
     if(!r?.id)throw new Error('Identificador obrigatório.');
     prepared(`INSERT INTO rounds(id,data,campaignId,startedAt,finishedAt,status,dayKey,storageMode)VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET data=excluded.data,campaignId=excluded.campaignId,startedAt=excluded.startedAt,finishedAt=excluded.finishedAt,status=excluded.status,dayKey=excluded.dayKey`).run(r.id,json(r),r.campaignId??null,r.startedAt??0,r.finishedAt??null,r.status??null,localDay(r.startedAt||0),storageMode());
     projection('campaigns',`round:${r.id}`,{...r,kind:'round'});return r;
   }
   function jobRaw(input) {
+    operationRevision++;
     const j=tagged('jobs',input);
+    j.operationId=createHash('sha256').update(JSON.stringify([j.storageMode,j.campaignId,j.roundId,j.itemId,j.groupId])).digest('hex');
     if(!j?.id)throw new Error('Identificador obrigatório.');
-    const old=one('jobs',j.id);if(old?.status==='confirmed'&&j.status!=='confirmed')throw new Error('Um envio confirmado não pode voltar à fila.');
+    const old=one('jobs',j.id);
+    if(old&&['confirmed','accepted','delivered'].includes(old.status)&&!['confirmed','accepted','delivered'].includes(j.status))throw new Error('Um envio aceito não pode voltar à fila ou perder sua confirmação.');
+    if(old?.status==='delivered'&&j.status!=='delivered')throw new Error('Uma entrega confirmada não pode perder sua confirmação.');
     if(old&&['roundId','campaignId','groupId','itemId'].some(key=>old[key]!==j[key]))throw new Error('A identidade operacional do envio não pode ser alterada.');
-    if(old?.status==='uncertain'&&['queued','sending','accepted'].includes(j.status))throw new Error('Um envio incerto precisa de revisão e não pode voltar à fila.');
+    if(old?.status==='uncertain'&&['queued','sending'].includes(j.status))throw new Error('Um envio incerto precisa de revisão e não pode voltar à fila.');
+    if(old?.status==='uncertain'&&['accepted','delivered'].includes(j.status)&&j.proofAccepted!==true&&j.reconciled!==true)throw new Error('A reconciliação de um envio incerto exige evidência da integração.');
     prepared(`INSERT INTO jobs(id,roundId,campaignId,groupId,itemId,status,data,createdAt,firstAttemptAt,resultAt,attempts,messageId,dayKey,storageMode)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET status=excluded.status,data=excluded.data,createdAt=excluded.createdAt,firstAttemptAt=excluded.firstAttemptAt,resultAt=excluded.resultAt,attempts=excluded.attempts,messageId=excluded.messageId,dayKey=excluded.dayKey`).run(j.id,j.roundId,j.campaignId,j.groupId,j.itemId,j.status,json(j),j.createdAt??0,j.firstAttemptAt??null,j.resultAt??null,j.attempts||0,j.messageId??null,localDay(j.firstAttemptAt??j.createdAt??0),storageMode());
-    if(j.attempts>0||['confirmed','uncertain','sending'].includes(j.status)){
+    if(j.attempts>0||['confirmed','accepted','delivered','uncertain','sending'].includes(j.status)){
       const r=prepared('SELECT startedAt FROM rounds WHERE id=?').get(j.roundId);
       if(r){const added=prepared('INSERT OR IGNORE INTO group_rounds(campaignId,groupId,roundId,startedAt,storageMode)VALUES(?,?,?,?,?)').run(j.campaignId,j.groupId,j.roundId,r.startedAt,storageMode());if(added.changes)prepared('INSERT INTO group_progress(campaignId,groupId,lastAt,roundCount,storageMode)VALUES(?,?,?,1,?) ON CONFLICT(campaignId,groupId)DO UPDATE SET lastAt=MAX(lastAt,excluded.lastAt),roundCount=roundCount+1').run(j.campaignId,j.groupId,r.startedAt,storageMode());}
     }
@@ -261,7 +269,7 @@ async function createStore(dir,options={}) {
   function queryFilter(filter={},allowed={},table='history') {
     const where=[],params=[];
     if(isolated(table)){where.push('storageMode=?');params.push(storageMode());}
-    for(const[key,column]of Object.entries(allowed))if(filter[key]!==undefined&&filter[key]!==null){const values=Array.isArray(filter[key])?filter[key]:[filter[key]],global=filter.includeGlobal&&column==='campaignId';if(!values.length){where.push(global?'campaignId IS NULL':'0');continue;}where.push(`${global?'(':''}${column} IN(${values.map(()=>'?').join(',')})${global?' OR campaignId IS NULL)':''}`);params.push(...values);}
+    for(const[key,column]of Object.entries(allowed))if(filter[key]!==undefined&&filter[key]!==null){const values=Array.isArray(filter[key])?filter[key]:[filter[key]],global=filter.includeGlobal&&column==='campaignId';if(!values.length){where.push(global?'campaignId IS NULL':'0');continue;}if(key==='messageId'&&column==='messageId'){const markers=values.map(()=>'?').join(',');where.push(`(messageId IN(${markers}) OR json_extract(data,'$.clientMessageId') IN(${markers}))`);params.push(...values,...values);continue;}where.push(`${global?'(':''}${column} IN(${values.map(()=>'?').join(',')})${global?' OR campaignId IS NULL)':''}`);params.push(...values);}
     if(filter.from!==undefined&&filter.from!==''){where.push('createdAt>=?');params.push(filterTimestamp(filter.from));}
     if(filter.to!==undefined&&filter.to!==''){where.push('createdAt<=?');params.push(filterTimestamp(filter.to,true));}
     if(filter.search){where.push("data LIKE ? ESCAPE '\\'");params.push(`%${String(filter.search).slice(0,200).replace(/[\\%_]/g,'\\$&')}%`);}
@@ -305,10 +313,29 @@ async function createStore(dir,options={}) {
     listJobs(filter={}){const f=queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',roundId:'roundId',status:'status',messageId:'messageId',groupId:'groupId'}),limited=filter.limit!==undefined;return parseRows(prepared(`SELECT data FROM jobs${f.sql}${limited?' ORDER BY rowid DESC LIMIT ? OFFSET ?':' ORDER BY rowid'}`).all(...f.params,...(limited?[clamp(filter.limit,50,1000000),clamp(filter.offset,0,10000000)]:[])));},
     queryJobs(filter={}){const f=queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',roundId:'roundId',status:'status',messageId:'messageId',groupId:'groupId'}),limit=clamp(filter.limit,50,500),offset=clamp(filter.offset,0,10000000);return {items:store.listJobs({...filter,limit,offset}),total:Number(prepared(`SELECT COUNT(*)AS n FROM jobs${f.sql}`).get(...f.params).n),limit,offset};},
     listOperationalReviews(filter={}){return store.queryJobs({...filter,status:'uncertain'});},
-    getCampaignCounts(campaignId,at){const day=localDay(at);return {rounds:Number(prepared('SELECT COUNT(*)AS n FROM rounds WHERE campaignId=? AND dayKey=? AND storageMode=?').get(campaignId,day,storageMode()).n),sends:Number(prepared('SELECT COUNT(*)AS n FROM jobs WHERE campaignId=? AND dayKey=? AND storageMode=? AND attempts>0').get(campaignId,day,storageMode()).n)};},
+    getCampaignOperations({campaignIds}={}){
+      const mode=storageMode(),ids=campaignIds===undefined?null:[...new Set(campaignIds)].sort(),cacheKey=json([mode,ids]),cached=operationCache.get(cacheKey);
+      if(cached&&cached.revision===operationRevision&&Date.now()-cached.at<1000)return cached.value;
+      const clause=ids===null?'':ids.length?` AND campaignId IN(${ids.map(()=>'?').join(',')})`:' AND 0',params=[mode,...(ids||[])],result={};
+      const get=id=>result[id]||(result[id]={counts:{},groups:{},round:null,uncertainJobs:[]});
+      for(const row of prepared(`SELECT campaignId,groupId,status,COUNT(*)AS count FROM jobs WHERE storageMode=?${clause} GROUP BY campaignId,groupId,status`).all(...params)){
+        const entry=get(row.campaignId);entry.counts[row.status]=(entry.counts[row.status]||0)+Number(row.count);const group=entry.groups[row.groupId]||(entry.groups[row.groupId]={counts:{}});group.counts[row.status]=Number(row.count);
+      }
+      for(const row of prepared(`SELECT data FROM rounds WHERE rowid IN(SELECT MAX(rowid)FROM rounds WHERE storageMode=?${clause} GROUP BY campaignId)`).all(...params)){const round=JSON.parse(row.data);get(round.campaignId).round=round;}
+      for(const row of prepared(`SELECT data FROM jobs WHERE storageMode=?${clause} AND status='uncertain' ORDER BY resultAt DESC LIMIT 200`).all(...params)){const job=JSON.parse(row.data);const entry=get(job.campaignId);if(entry.uncertainJobs.length<20)entry.uncertainJobs.push({id:job.id,groupId:job.groupId,itemId:job.itemId,status:job.status,operationId:job.operationId,messageId:job.messageId,error:job.error,errorCode:job.errorCode,resultAt:job.resultAt,manualResendJobId:job.manualResendJobId||null});}
+      if(operationCache.size>16)operationCache.clear();operationCache.set(cacheKey,{at:Date.now(),revision:operationRevision,value:result});return result;
+    },
+    getCampaignCounts(campaignId,at,{timezone}={}){
+      if(timezone){
+        const {localParts,localEpoch}=require('./reminders.cjs'),p=localParts(at,timezone),next=new Date(Date.UTC(p.year,p.month-1,p.day+1));
+        const startOf=parts=>{for(let minute=0;minute<180;minute++){const value=localEpoch(parts,`${String(Math.floor(minute/60)).padStart(2,'0')}:${String(minute%60).padStart(2,'0')}`,timezone);if(Number.isFinite(value))return value;}throw new Error('Não foi possível calcular o início do dia nesse fuso.');};
+        const start=startOf(p),end=startOf({year:next.getUTCFullYear(),month:next.getUTCMonth()+1,day:next.getUTCDate()});
+        return {rounds:Number(prepared('SELECT COUNT(*)AS n FROM rounds WHERE campaignId=? AND storageMode=? AND startedAt>=? AND startedAt<?').get(campaignId,storageMode(),start,end).n),sends:Number(prepared('SELECT COUNT(*)AS n FROM jobs WHERE campaignId=? AND storageMode=? AND attempts>0 AND COALESCE(json_extract(data,\'$.firstAttemptAt\'),createdAt)>=? AND COALESCE(json_extract(data,\'$.firstAttemptAt\'),createdAt)<?').get(campaignId,storageMode(),start,end).n)};
+      }
+      const day=localDay(at);return {rounds:Number(prepared('SELECT COUNT(*)AS n FROM rounds WHERE campaignId=? AND dayKey=? AND storageMode=?').get(campaignId,day,storageMode()).n),sends:Number(prepared('SELECT COUNT(*)AS n FROM jobs WHERE campaignId=? AND dayKey=? AND storageMode=? AND attempts>0').get(campaignId,day,storageMode()).n)};},
     getGroupHistory(campaignId){return new Map(prepared('SELECT groupId,lastAt,roundCount FROM group_progress WHERE campaignId=? AND storageMode=?').all(campaignId,storageMode()).map(r=>[r.groupId,{lastAt:r.lastAt,roundCount:Number(r.roundCount)}]));},
-    getMetrics({campaignIds}={}){const campaigns=store.listCampaigns(campaignIds?{ids:campaignIds}:{}),f=queryFilter({campaignId:campaignIds},{campaignId:'campaignId'}),counts={};for(const row of prepared(`SELECT status,COUNT(*)AS n FROM jobs${f.sql} GROUP BY status`).all(...f.params))counts[row.status]=Number(row.n);const next=campaigns.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt);return {campaigns:campaigns.length,activeCampaigns:campaigns.filter(c=>c.state==='active').length,selectedGroups:new Set(campaigns.flatMap(c=>c.groupIds||[])).size,confirmed:counts.confirmed||0,pending:(counts.queued||0)+(counts.sending||0)+(counts.accepted||0),uncertain:counts.uncertain||0,failed:counts.failed||0,nextRunAt:next.length?Math.min(...next):null};},
-    recoverInterrupted(){return transaction(()=>{const affected=new Set();for(const j of store.listJobs({status:['sending','accepted','queued']})){jobRaw({...j,status:j.status==='queued'?'cancelled':'uncertain',resultAt:Date.now(),error:j.status==='queued'?'Fila anterior cancelada na inicialização; sem recuperação de rodadas atrasadas.':'Aplicativo encerrado durante o envio; revise sem reenviar automaticamente.'});affected.add(j.campaignId);}for(const row of prepared('SELECT data FROM rounds WHERE finishedAt IS NULL AND storageMode=?').all(storageMode())){const r=JSON.parse(row.data);roundRaw({...r,finishedAt:Date.now(),status:'interrupted'});}for(const c of store.listCampaigns())if(c.state==='active')putRaw('campaigns',{...c,state:'paused',nextRunAt:null,revision:c.revision+1,pauseReason:affected.has(c.id)?'Fila interrompida; verifique o histórico.':'Reabertura do aplicativo: retome após conferir a conexão.'});return [...affected];});},
+    getMetrics({campaignIds}={}){const campaigns=store.listCampaigns(campaignIds?{ids:campaignIds}:{}),f=queryFilter({campaignId:campaignIds},{campaignId:'campaignId'}),counts={};for(const row of prepared(`SELECT status,COUNT(*)AS n FROM jobs${f.sql} GROUP BY status`).all(...f.params))counts[row.status]=Number(row.n);const next=campaigns.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt);return {campaigns:campaigns.length,activeCampaigns:campaigns.filter(c=>c.state==='active').length,selectedGroups:new Set(campaigns.flatMap(c=>c.groupIds||[])).size,confirmed:(counts.confirmed||0)+(counts.accepted||0)+(counts.delivered||0),accepted:(counts.accepted||0)+(counts.confirmed||0),delivered:counts.delivered||0,pending:(counts.queued||0)+(counts.sending||0),uncertain:counts.uncertain||0,failed:counts.failed||0,nextRunAt:next.length?Math.min(...next):null};},
+    recoverInterrupted(){return transaction(()=>{const affected=new Set();for(const j of store.listJobs({status:['sending','queued']})){jobRaw({...j,status:j.status==='queued'?'cancelled':'uncertain',resultAt:Date.now(),error:j.status==='queued'?'Fila anterior cancelada na inicialização; sem recuperação de rodadas atrasadas.':'Aplicativo encerrado durante o envio; revise sem reenviar automaticamente.'});affected.add(j.campaignId);}for(const row of prepared('SELECT data FROM rounds WHERE finishedAt IS NULL AND storageMode=?').all(storageMode())){const r=JSON.parse(row.data);roundRaw({...r,finishedAt:Date.now(),status:'interrupted'});}for(const c of store.listCampaigns())if(c.state==='active')putRaw('campaigns',{...c,state:'paused',nextRunAt:null,revision:c.revision+1,pauseReason:affected.has(c.id)?'Fila interrompida; verifique o histórico.':'Reabertura do aplicativo: retome após conferir a conexão.'});return [...affected];});},
     getEntity:(table,id)=>one(entityTable(table),id),
     listEntities(table,filter={}){entityTable(table);const f=entityFilter(filter,table),page=filter.limit!==undefined;return parseRows(prepared(`SELECT data FROM ${table}${f.sql} ORDER BY createdAt DESC,rowid DESC${page?' LIMIT ? OFFSET ?':''}`).all(...f.params,...(page?[clamp(filter.limit,50,1000000),clamp(filter.offset,0,10000000)]:[])));},
     queryEntities(table,filter={}){entityTable(table);const f=entityFilter(filter,table),limit=clamp(filter.limit,50,500),offset=clamp(filter.offset,0,10000000);return {items:store.listEntities(table,{...filter,limit,offset}),total:Number(prepared(`SELECT COUNT(*)AS n FROM ${table}${f.sql}`).get(...f.params).n),limit,offset};},
@@ -322,7 +349,7 @@ async function createStore(dir,options={}) {
     cleanupPreview(input){const cats=categories(Array.isArray(input)?input:input?.categories),counts=Object.fromEntries(cats.map(c=>[c,Number(prepared('SELECT COUNT(*)AS n FROM history WHERE category=? AND storageMode=?').get(c,storageMode()).n)]));return {categories:cats,counts,total:Object.values(counts).reduce((a,b)=>a+b,0)};},
     clearHistory({categories:input,actor}={}){return transaction(()=>{const preview=store.cleanupPreview(input);for(const category of preview.categories){prepared('DELETE FROM history WHERE category=? AND storageMode=?').run(category,storageMode());if(category==='errors')prepared('DELETE FROM diagnostics WHERE storageMode=?').run(storageMode());if(category==='notifications')prepared('DELETE FROM notifications WHERE storageMode=?').run(storageMode());}const audit=store.addAudit({actorId:typeof actor==='string'?actor:actor?.id??actor?.userId??null,actorName:actor?.name??null,action:'history.clear',at:Date.now(),detail:{categories:preview.categories,counts:preview.counts},preserved:'operational jobs, rounds, alerts, users, campaigns, media and audit'});return {...preview,auditId:audit.id};});},
     applyHistoryRetention:config=>transaction(()=>retentionRaw(config)),applyRetention:config=>transaction(()=>retentionRaw(config)),
-    exportData(){return {format:'mega-disparos',version:1,storageMode:storageMode(),createdAt:new Date().toISOString(),campaigns:all('campaigns'),groups:all('groups_data'),templates:all('templates'),contacts:all('contacts'),alertRecipients:all('alert_recipients'),reminders:all('reminders').map(r=>({id:r.id,...require('./reminders.cjs').normalizeReminder(r)})),settings:all('settings').filter(s=>!PRIVATE_SETTING.test(s.id)),media:all('media')};},
+    exportData(){return {format:'mega-disparos',version:1,storageMode:storageMode(),createdAt:new Date().toISOString(),campaigns:all('campaigns'),groups:all('groups_data'),templates:all('templates'),contacts:all('contacts'),alertRecipients:all('alert_recipients'),reminders:all('reminders').map(r=>({id:r.id,...require('./reminders.cjs').normalizeReminder(r)})),sources:store.exportSourceData(),settings:all('settings').filter(s=>!PRIVATE_SETTING.test(s.id)),media:all('media')};},
     importData(data){
       data=require('./backup-validation.cjs').validateBackupData(data);
       const targetMode=['simulated','whatsapp'].includes(data.storageMode)?data.storageMode:data.groups.length&&data.groups.every(g=>g.simulation)?'simulated':'whatsapp';
@@ -349,6 +376,7 @@ async function createStore(dir,options={}) {
           }
         }
         for(const s of data.settings||[])if(!PRIVATE_SETTING.test(s.id))putRaw('settings',s);
+        if(data.sources)store.importSourceData(data.sources);
         putRaw('settings',{id:'initialized',value:true});
       });
     },
@@ -369,6 +397,10 @@ async function createStore(dir,options={}) {
   // This one-time migration marker preserves deliberately cleared histories.
   if(!getSetting('historyProjectionInitialized',false))transaction(()=>{for(const row of prepared('SELECT data FROM jobs ORDER BY rowid DESC LIMIT 10000').all()){const j=JSON.parse(row.data);projection('sends',j.id,j);}for(const row of prepared('SELECT data FROM rounds ORDER BY rowid DESC LIMIT 10000').all()){const r=JSON.parse(row.data);projection('campaigns',`round:${r.id}`,{...r,kind:'round'});}putRaw('settings',{id:'historyProjectionInitialized',value:true});retentionRaw();});
   attachSearchStore(store,{db,prepared,transaction});
+  attachSourceStore(store,{db,prepared,transaction});
+  db.exec(`CREATE INDEX IF NOT EXISTS jobs_mode_campaign_group_status ON jobs(storageMode,campaignId,groupId,status);
+    CREATE INDEX IF NOT EXISTS jobs_mode_campaign_attempt_time ON jobs(storageMode,campaignId,COALESCE(json_extract(data,'$.firstAttemptAt'),createdAt)) WHERE attempts>0;
+    CREATE INDEX IF NOT EXISTS rounds_mode_campaign_started_time ON rounds(storageMode,campaignId,startedAt); CREATE INDEX IF NOT EXISTS jobs_mode_client_message ON jobs(storageMode,json_extract(data,'$.clientMessageId'));`);
   if(compatibilityReviewRequired)transaction(()=>{
     const at=Date.now(),reason='Banco de uma versão anterior aberto com compatibilidade verificada. Revise as campanhas antes de retomar os envios.';
     for(const mode of ['whatsapp','simulated']){

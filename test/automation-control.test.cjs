@@ -86,7 +86,7 @@ test('global stop aborts a campaign spacing wait and records an already-submitte
   assert.equal(jobs.filter(job => job.status === 'cancelled').length, 1);
   released.resolve(); await round;
   assert.equal(f.adapter.sent.length, 1);
-  assert.equal(f.store.listJobs({ status: 'confirmed' }).length, 1);
+  assert.equal(f.store.listJobs({ status: 'accepted' }).length, 1);
   assert.equal(f.store.getCampaign(f.campaign.id).state, 'stopped');
   await f.scheduler.tick(); assert.equal(f.adapter.sent.length, 1);
 });
@@ -225,4 +225,28 @@ test('an ambiguous administrative reply has one submission and cannot repeat a c
   const diagnostics = f.store.listEntities('diagnostics');
   assert.ok(diagnostics.some(row => row.code === 'WA_SEND_UNCERTAIN'));
   assert.equal(JSON.stringify(diagnostics).includes('do-not-log'), false);
+});
+
+test('emergency stop reports durable uncertainty after deadline released the worker, including private automation ledgers',async t=>{
+ const f=await fixture(t,{authenticated:true});
+ f.store.insertRound({id:'uncertain-stop-round',campaignId:f.campaign.id,startedAt:f.clock.now,status:'completed'});
+ f.store.insertJob({id:'uncertain-stop-job',campaignId:f.campaign.id,roundId:'uncertain-stop-round',groupId:f.campaign.groupIds[0],itemId:f.campaign.items[0].id,status:'uncertain',attempts:1,messageId:'STOP-UNKNOWN-CAMPAIGN',createdAt:f.clock.now});
+ f.store.saveSearchDelivery({id:'uncertain-stop-search',runId:'uncertain-stop-search-run',createdAt:f.clock.now,status:'uncertain',messageId:'STOP-UNKNOWN-SEARCH'});
+ f.store.saveEntity('alerts',{id:'uncertain-stop-alert',status:'uncertain',createdAt:f.clock.now,messageId:'STOP-UNKNOWN-ALERT'});
+ f.store.saveEntity('reminder_deliveries',{id:'uncertain-stop-reminder',status:'uncertain',createdAt:f.clock.now,messageId:'STOP-UNKNOWN-REMINDER'});
+ const controller=new CommandController({store:f.store,scheduler:f.scheduler,adapter:f.adapter,authService:f.auth,automationControl:f.control,now:()=>f.clock.now});
+ const report=await f.control.stop();assert.equal(report.inFlight,0);assert.equal(report.uncertainForReview,4);
+ await controller.handle(f.adapter.injectIncoming({senderNumber:f.owner.phone,timestamp:f.clock.now,text:'!mega parar tudo'}));
+ assert.match(f.adapter.sent[0].text,/4 resultado\(s\) incerto\(s\)/);assert.match(f.adapter.sent[0].text,/pode concluir após a parada/);assert.match(f.adapter.sent[0].text,/nenhum reenvio automático/);assert.equal(f.store.getJob('uncertain-stop-job').status,'uncertain');
+});
+
+test('private resume allows the eligible destination without requeueing a different uncertain item/destination pair',async t=>{
+ const f=await fixture(t,{authenticated:true});const originalSend=f.adapter.send.bind(f.adapter);let first=true;
+ f.adapter.send=async(group,item,...rest)=>{if(first){first=false;return{status:'uncertain',messageId:item.clientMessageId};}return originalSend(group,item,...rest);};
+ await f.scheduler.activate(f.campaign.id);await f.scheduler.tick();const uncertain=f.store.listJobs({status:'uncertain'})[0];assert.equal(f.store.listJobs({status:'accepted'}).length,1);await f.scheduler.pause(f.campaign.id);f.clock.now+=600000;
+ const controller=new CommandController({store:f.store,scheduler:f.scheduler,adapter:f.adapter,authService:f.auth,automationControl:f.control,now:()=>f.clock.now});
+ await controller.handle(f.adapter.injectIncoming({senderNumber:f.owner.phone,timestamp:f.clock.now,text:`!mega retomar ${f.campaign.id}`}));
+ const token=f.adapter.sent.at(-1).text.match(/!mega confirmar ([a-f0-9]{8})/);assert(token,'a retomada continua exigindo a confirmação do resumo');
+ await controller.handle(f.adapter.injectIncoming({senderNumber:f.owner.phone,timestamp:f.clock.now,text:`!mega confirmar ${token[1]}`}));
+ assert.equal(f.store.getCampaign(f.campaign.id).state,'active');await f.scheduler.tick();assert.equal(f.store.listJobs({status:'accepted'}).length,2);assert.equal(f.store.getJob(uncertain.id).status,'uncertain');assert.equal(f.store.getJob(uncertain.id).attempts,1);
 });

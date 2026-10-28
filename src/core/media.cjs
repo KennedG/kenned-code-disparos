@@ -59,6 +59,14 @@ class MediaManager {
       for(const delivery of page.items||[]){const id=delivery.mediaId;if(selected.has(id))references.get(id).push({kind:'searchDelivery',id:delivery.id,label:delivery.status==='uncertain'?'Excel de busca com resultado incerto — revisão necessária':'Excel de busca na fila ou em processamento',state:delivery.status});}
       if((page.items||[]).length<500)break;
     }
+    if(this.store.listSourcePublications)for(let offset=0;;offset+=200){
+      const page=this.store.listSourcePublications({status:['pending','downloading','review','failed','ready'],limit:200,offset});
+      for(const publication of page.items||[])if(selected.has(publication.mediaId)){
+        const campaign=publication.campaignId&&this.store.getCampaign(publication.campaignId),visible=this.auth?.canFor(userId??this.auth.currentUserId,'campaign.view',campaign||{ownerId:publication.ownerId});
+        references.get(publication.mediaId).push({kind:'sourcePublication',...(visible?{id:publication.id,campaignId:publication.campaignId,groupId:publication.groupId}:{}),label:visible?'Publicação capturada do grupo de origem — revise ou remova antes de excluir':'Publicação de origem protegida',state:publication.status});
+      }
+      if((page.items||[]).length<200)break;
+    }
     const media=this.store.listMediaAnyMode?.()||this.store.listMedia();
     for(const id of ids){const item=this.store.getMedia(id);if(!item?.path)continue;for(const other of media)if(other.id!==id&&!selected.has(other.id)&&path.resolve(other.path||'')===path.resolve(item.path))references.get(id).push({kind:'sharedFile',label:'Arquivo gerenciado compartilhado com outro registro da biblioteca'});}
     return references;
@@ -149,6 +157,9 @@ class MediaManager {
     } catch(error) {await handle?.close().catch(()=>{});await fs.promises.unlink(temp).catch(()=>{});await fs.promises.unlink(target).catch(()=>{});throw error;}
   }
   async importBuffer(buffer, metadata = {}) {
+    const expectedMode=metadata.expectedMode??this.store.getStorageMode?.();
+    const assertImport=()=>{if(metadata.signal?.aborted||expectedMode!==undefined&&this.store.getStorageMode?.()!==expectedMode)throw Object.assign(new Error('Importação cancelada; o modo de integração foi alterado ou a operação foi interrompida.'),{code:'MEDIA_IMPORT_CANCELLED'});};
+    assertImport();
     if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer);
     if (!buffer.length || buffer.length > MAX_FILE) throw new Error('Arquivos devem ter entre 1 byte e 64 MB.');
     const name = path.basename(String(metadata.name || 'arquivo')).replace(/[\x00-\x1f]/g,'').slice(0,180);
@@ -156,7 +167,10 @@ class MediaManager {
     let handle;
     try {
       handle=await fs.promises.open(temp,'wx',0o600);await writeAll(handle,buffer);await handle.sync();await handle.close();handle=null;
+      assertImport();
       await fs.promises.rename(temp,target);await syncDirectory(this.dir);
+      assertImport();
+      if(metadata.beforeSave){const allowed=metadata.beforeSave();if(allowed===false||allowed&&typeof allowed.then==='function')throw Object.assign(new Error('A origem, a permissão ou o conteúdo foi alterado antes de concluir a mídia.'),{code:'MEDIA_IMPORT_CANCELLED'});}
       return this.store.saveMedia({id,name:info.name,mime:info.mime,type:info.type,path:target,size:buffer.length,sha256:createHash('sha256').update(buffer).digest('hex'),createdAt:Date.now()});
     } catch(error) {await handle?.close().catch(()=>{});await fs.promises.unlink(temp).catch(()=>{});await fs.promises.unlink(target).catch(()=>{});throw error;}
   }

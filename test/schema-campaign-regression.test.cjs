@@ -76,7 +76,7 @@ test('an ordinary authorized campaign with commercial words sends through the fi
   await f.scheduler.activate(f.campaign.id);
   await f.scheduler.tick();
   assert.equal(f.submitted.length, 1);
-  assert.equal(f.store.listJobs()[0].status, 'confirmed');
+  assert.equal(f.store.listJobs()[0].status, 'accepted');
 });
 
 test('a queued snapshot with an unsupported reference is cancelled without a retry or network submission', async t => {

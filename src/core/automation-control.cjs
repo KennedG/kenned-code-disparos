@@ -30,6 +30,16 @@ class AutomationControl extends EventEmitter {
     return () => this.handlers.delete(name);
   }
 
+  _uncertainForReview() {
+    let count = Number(this.store.getMetrics?.().uncertain) || 0;
+    count += Number(this.store.listSearchDeliveries?.({ status: 'uncertain', limit: 0 })?.total) || 0;
+    for (const table of ['alerts', 'reminder_deliveries']) {
+      if (this.store.queryEntities) count += Number(this.store.queryEntities(table, { status: 'uncertain', limit: 0 }).total) || 0;
+      else if (this.store.listEntities) count += this.store.listEntities(table, { status: 'uncertain' }).length;
+    }
+    return count;
+  }
+
   stop({ actorId = null, source = 'app', reason = 'Todos os envios automáticos foram interrompidos.' } = {}) {
     // Latch before disk access, callbacks and the first await. Even a storage
     // failure leaves the runtime stopped, so no later callback can submit work.
@@ -43,7 +53,7 @@ class AutomationControl extends EventEmitter {
     if (this.operation) return this.operation;
     const report = { stopped: true, campaigns: 0, jobs: 0, search: 0, alerts: 0, reminders: 0,
       inFlight: this.scheduler?.getCampaignInFlightCount?.() || 0,
-      processing: this.scheduler?.getInFlightCount?.() || 0, errors: [] };
+      processing: this.scheduler?.getInFlightCount?.() || 0, uncertainForReview: 0, errors: [] };
     // Invoke every service synchronously before waiting for any one service.
     // A stop implementation can cancel its timers immediately and return a
     // promise only for its durable bookkeeping.
@@ -63,6 +73,11 @@ class AutomationControl extends EventEmitter {
       // each service's actual submission counter is an uncancellable send.
       report.inFlight = Math.max(report.inFlight, this.scheduler?.getCampaignInFlightCount?.() || 0,
         ...Object.values(report).filter(value => value && typeof value === 'object' && !Array.isArray(value)).map(value => Number(value.inFlight) || 0));
+      // A deadline releases the shared worker while the original network
+      // submission may still settle. Ledger uncertainty is not an active
+      // queue lock, but must remain visible in the emergency-stop report.
+      try { report.uncertainForReview = this._uncertainForReview(); }
+      catch { report.errors.push('Não foi possível consultar todos os resultados incertos. Revise os históricos antes de reenviar.'); }
       this.emit('stopped', report);
       return report;
     }).finally(() => { if (this.operation === operation) this.operation = null; });

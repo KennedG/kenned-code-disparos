@@ -159,7 +159,7 @@ test('restart cancels old queued work, preserves uncertain outcomes and never re
   assert.deepEqual(affected, ['camp-1']);
   assert.equal(store.getJob('job-queued').status, 'cancelled');
   assert.equal(store.getJob('job-sending').status, 'uncertain');
-  assert.equal(store.getJob('job-accepted').status, 'uncertain');
+  assert.equal(store.getJob('job-accepted').status, 'accepted', 'Server acceptance is durable evidence and cannot become uncertainty after restart');
   assert.equal(store.getJob('job-confirmed').status, 'confirmed');
   assert.equal(store.getJob('job-failed').status, 'failed');
   assert.equal(store.getJob('job-uncertain').status, 'uncertain');

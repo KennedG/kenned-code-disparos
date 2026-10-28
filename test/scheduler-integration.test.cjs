@@ -42,7 +42,7 @@ test('real SQLite + local simulator: 15 deliveries are durable before transport 
   await f.scheduler.tick(); assert.equal(f.adapter.sent.length, 0);
   await f.scheduler.activate(f.campaign.id); await f.scheduler.tick();
   assert.equal(f.adapter.sent.length, 15);
-  assert.equal(f.store.listJobs({ status: 'confirmed' }).length, 15);
+  assert.equal(f.store.listJobs({ status: 'accepted' }).length, 15);
   assert.equal(f.store.getCampaign(f.campaign.id).nextRunAt, beginning + 600000);
   // Emulate process termination between rounds, without a graceful shutdown.
   f.store.close();
@@ -57,30 +57,34 @@ test('real SQLite + local simulator: 15 deliveries are durable before transport 
   f.clock.now = beginning + 600000;
   await secondScheduler.tick();
   assert.equal(secondAdapter.sent.length, 15);
-  assert.equal(reopened.listJobs({ status: 'confirmed' }).length, 30);
+  assert.equal(reopened.listJobs({ status: 'accepted' }).length, 30);
   await secondScheduler.shutdown();
 });
 
-test('real SQLite + local simulator: uncertain delivery survives restart, blocks resume and reconciles by durable ID', async t => {
+test('real SQLite + local simulator: uncertain delivery survives restart, permits eligible work and reconciles by durable ID', async t => {
   const f = await setup(t);
   f.adapter.setNextOutcome('uncertain');
   await f.scheduler.activate(f.campaign.id); await f.scheduler.tick();
-  assert.equal(f.adapter.sent.length, 1);
+  assert.equal(f.adapter.sent.length, 15);
   const uncertain = f.store.listJobs({ status: 'uncertain' })[0];
   assert.equal(uncertain.messageId, f.adapter.sent[0].messageId);
-  assert.equal(f.store.listJobs({ status: 'cancelled' }).length, 14);
+  assert.equal(f.store.listJobs({ status: 'accepted' }).length, 14);
+  assert.equal(f.store.listJobs({ status: 'cancelled' }).length, 0);
   f.store.close();
   const reopened = await f.open(); reopened.recoverInterrupted();
   const adapter = new SimulatedAdapter({ store: reopened, delayMs: 0 });
   const scheduler = new Scheduler({ store: reopened, adapter, now: () => f.clock.now, sleep: async ms => { f.clock.now += ms; } });
   await adapter.connect();
-  await assert.rejects(scheduler.resume(f.campaign.id), /resultado incerto/);
+  await scheduler.resume(f.campaign.id);
   await scheduler.tick(); assert.equal(adapter.sent.length, 0);
   adapter.emit('receipt', { messageId: uncertain.messageId, status: 'confirmed', simulation: true });
-  assert.equal(reopened.getJob(uncertain.id).status, 'confirmed');
+  assert.equal(reopened.getJob(uncertain.id).status, 'accepted');
   await scheduler.resume(f.campaign.id); await scheduler.tick();
-  assert.equal(adapter.sent.length, 14);
-  assert(adapter.sent.every(send => send.groupId !== uncertain.groupId));
-  assert.equal(reopened.listJobs({ status: 'confirmed' }).length, 15);
+  assert.equal(adapter.sent.length, 0, 'A late receipt must not replay the original task');
+  assert.equal(reopened.listJobs({ status: 'accepted' }).length, 15);
+  f.clock.now = beginning + 600000;
+  await scheduler.tick();
+  assert.equal(adapter.sent.length, 15, 'Only the next intentionally scheduled round repeats the content');
+  assert.equal(reopened.listJobs({ status: 'accepted' }).length, 30);
   await scheduler.shutdown();
 });

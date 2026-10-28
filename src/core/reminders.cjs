@@ -257,9 +257,9 @@ class ReminderService extends EventEmitter {
       if (this._blocked() || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode() || adapter.status?.state !== 'connected') break;
       if (item.nextAttemptAt > this.now()) continue;
       if (item.deadlineAt < this.now()) { this._save('reminder_deliveries', { ...item, status: 'skipped', resultAt: this.now(), code: 'REMINDER_OVERDUE_SKIPPED', error: 'A tolerância venceu antes da conexão ou do envio; aviso descartado.' }); this.emit('change'); continue; }
-      const work = () => this._submit(item, adapter, revision, mode);
+      const work = context => this._submit(item, adapter, revision, mode, context || {});
       try {
-        if (this.scheduler?.runExternalSubmission) await this.scheduler.runExternalSubmission(work);
+        if (this.scheduler?.runExternalSubmission) await this.scheduler.runExternalSubmission(work, { timeoutMs: 2 * this._attemptTimeoutMs() + Math.max(3, adapter.minimumSpacingSeconds || 3) * 1000 + 5000 });
         else await work();
       } catch (error) {
         // Cancelling the global shared queue is a requested stop, not a disk
@@ -269,7 +269,22 @@ class ReminderService extends EventEmitter {
       }
     }
   }
-  async _submit(item, adapter, revision, mode) {
+  _attemptTimeoutMs() { return this.scheduler?.getAttemptTimeoutMs?.() || Math.max(5, Math.min(300, Number(this.store.getSetting('submissionTimeoutSeconds', 30)) || 30)) * 1000; }
+  _bounded(work, options = {}) { return this.scheduler?.runBoundedAttempt ? this.scheduler.runBoundedAttempt(work, { timeoutMs: this._attemptTimeoutMs(), ...options }) : Promise.resolve().then(() => work({ beforeSubmit: () => {}, signal: options.signal, timeoutMs: this._attemptTimeoutMs() })); }
+  _reconcileDelivery(item, proof, adapter, revision, mode) {
+    if (this.closed || !proof || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode()) return false;
+    const current = this._get('reminder_deliveries', item.id);
+    if (!current || !['sending', 'uncertain', 'confirmed', 'delivered'].includes(current.status)) return false;
+    if (proof.status === 'failed' && proof.confirmedFailure === true) {
+      if (['confirmed', 'delivered'].includes(current.status)) return true;
+      this._save('reminder_deliveries', { ...current, status: 'failed', resultAt: this.now(), code: codeOf(proof.code), error: 'A integração confirmou que o lembrete não foi aceito.' }); return true;
+    }
+    if (!['confirmed', 'accepted', 'delivered', 'read'].includes(proof.status)) return false;
+    const delivered = current.status === 'delivered' || ['delivered', 'read'].includes(proof.status) || proof.delivered === true || Number.isFinite(proof.deliveredAt);
+    const saved = this._save('reminder_deliveries', { ...current, status: delivered ? 'delivered' : 'confirmed', clientMessageId: current.clientMessageId || item.messageId, messageId: proof.messageId || current.messageId, resultAt: current.resultAt || this.now(), confirmationScope: current.confirmationScope === 'whatsapp-read' ? current.confirmationScope : proof.confirmationScope || current.confirmationScope || (mode === 'simulated' ? 'simulation-only' : 'whatsapp-server'), ...(delivered ? { deliveredAt: current.deliveredAt || proof.deliveredAt || this.now() } : {}), ...(proof.readAt || proof.status === 'read' ? { readAt: current.readAt || proof.readAt || this.now() } : {}), error: null, code: null });
+    this._trace(saved, 'result', delivered ? 'REMINDER_DELIVERED' : 'REMINDER_CONFIRMED', 'Confirmação posterior disponível na integração registrada.', 'Mesmo envio reconciliado, sem nova submissão.'); this.emit('change'); return true;
+  }
+  async _submit(item, adapter, revision, mode, outer = {}) {
     if (this._blocked() || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode() || adapter.status?.state !== 'connected') return;
     let current = this._get('reminder_deliveries', item.id); if (current?.status !== 'pending') return;
     let submitted = false, attempt = (current.attempts || 0) + 1;
@@ -283,7 +298,10 @@ class ReminderService extends EventEmitter {
       if (this._blocked() || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode()) return;
       current = this._save('reminder_deliveries', { ...current, attempts: attempt });
       if (typeof adapter.resolveRecipient !== 'function') throw fail('A integração não permite resolver destinatários privados.', 'WA_RECIPIENT_UNSUPPORTED');
-      const resolved = await adapter.resolveRecipient(current.number);
+      const resolved = await this._bounded(context => {
+        context.beforeSubmit(); outer.beforeSubmit?.();
+        return adapter.resolveRecipient(current.number, { signal: context.signal, timeoutMs: context.timeoutMs, traceId: current.traceId || current.id, beforeSubmit: () => { context.beforeSubmit(); outer.beforeSubmit?.(); } });
+      }, { signal: outer.signal });
       const fresh = this._get('reminders', current.reminderId), ledger = this._get('reminder_deliveries', current.id);
       if (this._blocked() || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode() || ledger?.status !== 'pending') return;
       if (!fresh || fresh.scheduleRevision !== current.scheduleRevision || !current.test && !['active', 'completed'].includes(fresh.state)) throw fail('Lembrete alterado ou pausado durante a consulta do número.', 'REMINDER_CANCELLED');
@@ -294,36 +312,48 @@ class ReminderService extends EventEmitter {
       current = this._save('reminder_deliveries', { ...ledger, attempts: attempt, status: 'sending', submittedAt: this.now(), targetId: resolved.jid, isSelf: resolved.isSelf === true });
       this._trace(current, 'recipient', 'REMINDER_RECIPIENT_RESOLVED', 'Destinatário privado resolvido e autorização validada.', 'Submissão iniciada; confirmação ainda pendente.');
       this.inFlight.add(current.id); if (this.scheduler) this.scheduler.lastSubmissionAt = this.now(); submitted = true;
-      const result = await adapter.sendPrivate(current.number, current.text, { clientMessageId: current.messageId });
+      const result = await this._bounded(context => {
+        const beforeSubmit = () => {
+          context.beforeSubmit(); outer.beforeSubmit?.();
+          const fresh = this._get('reminders', item.reminderId), ledger = this._get('reminder_deliveries', item.id);
+          if (this._blocked() || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode() || ledger?.status !== 'sending' || !fresh || fresh.scheduleRevision !== item.scheduleRevision || !item.test && !['active', 'completed'].includes(fresh.state)) throw Object.assign(fail('Lembrete interrompido antes de submeter a mensagem.', 'REMINDER_CANCELLED'), { submitted: false });
+          if (this._recipient(current.recipientId).phone !== current.number) throw Object.assign(fail('O destinatário foi alterado antes do envio.', 'REMINDER_RECIPIENT_DISABLED'), { submitted: false });
+          if (current.userId) this._assert(current.userId, 'reminder.control');
+        };
+        beforeSubmit();
+        return adapter.sendPrivate(current.number, current.text, { clientMessageId: current.messageId, signal: context.signal, timeoutMs: context.timeoutMs, beforeSubmit, traceId: current.traceId || current.id });
+      }, { signal: outer.signal, onLateResult: proof => this._reconcileDelivery(item, proof, adapter, revision, mode), onLateError: error => {
+        if (this.closed || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode()) return;
+        const current = this._get('reminder_deliveries', item.id);
+        if (current?.status === 'uncertain' && error?.definitive === true && error?.submitted === false) this._save('reminder_deliveries', { ...current, status: 'failed', resultAt: this.now(), code: 'REMINDER_LATE_PRE_SUBMISSION_FAILURE', error: 'A integração confirmou posteriormente que o lembrete não foi submetido.' });
+      } });
+      if (result?.status === 'failed' && result.confirmedFailure === true) throw Object.assign(new Error('A integração confirmou a rejeição do lembrete.'), { ...result, definitive: true });
       if (mode !== this._mode() || adapter !== this.adapter) return;
-      const latest = this._get('reminder_deliveries', current.id), confirmed = ['confirmed', 'delivered'].includes(latest?.status) || ['confirmed', 'delivered'].includes(result?.status);
-      const delivered = latest?.status === 'delivered' || result?.status === 'delivered' || confirmed && ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope);
+      const latest = this._get('reminder_deliveries', current.id), confirmed = ['confirmed', 'delivered'].includes(latest?.status) || (['confirmed', 'delivered'].includes(result?.status) || result?.status === 'accepted' && !!result.messageId);
+      const delivered = latest?.status === 'delivered' || result?.status === 'delivered' || result?.delivered === true || Number.isFinite(result?.deliveredAt) || confirmed && ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope);
       const saved = this._save('reminder_deliveries', { ...latest, status: delivered ? 'delivered' : confirmed ? 'confirmed' : 'uncertain', resultAt: latest.resultAt || this.now(), confirmationScope: confirmed ? result?.confirmationScope || latest.confirmationScope || (mode === 'simulated' ? 'simulation-only' : 'whatsapp-server') : null, ...(delivered ? { deliveredAt: latest.deliveredAt || result?.deliveredAt || this.now() } : {}), code: confirmed ? null : 'REMINDER_SEND_UNCERTAIN', error: confirmed ? null : 'A integração não confirmou o envio. Revise antes de repetir; sem reenvio automático.' });
       this._trace(saved, 'result', delivered ? 'REMINDER_DELIVERED' : confirmed ? 'REMINDER_CONFIRMED' : 'REMINDER_SEND_UNCERTAIN', confirmed ? 'Confirmação disponível na integração registrada.' : 'Resultado incerto registrado.', confirmed ? 'Nenhum reenvio.' : 'Revisão necessária.');
     } catch (error) {
       if (mode !== this._mode() || adapter !== this.adapter) return;
       const latest = this._get('reminder_deliveries', item.id); if (['confirmed', 'delivered', 'cancelled'].includes(latest?.status)) return;
       const reminder = this._get('reminders', item.reminderId), max = reminder?.maxAttempts || 3;
-      const safe = error?.safeToRetry === true || !submitted && error?.definitive !== true && error?.safeToRetry !== false;
+      const safe = error?.safeToRetry === true && error?.submitted !== true && error?.submitted !== 'unknown' || !submitted && error?.definitive !== true && error?.safeToRetry !== false;
       const cancelled = error.code === 'REMINDER_CANCELLED', skipped = error.code === 'REMINDER_OVERDUE_SKIPPED';
-      const status = cancelled ? 'cancelled' : skipped ? 'skipped' : safe && attempt < max ? 'pending' : !submitted || error?.safeToRetry === true || error?.definitive === true ? 'failed' : 'uncertain';
+      const status = cancelled ? 'cancelled' : skipped ? 'skipped' : safe && attempt < max ? 'pending' : !submitted || error?.confirmedFailure === true || error?.safeToRetry === true && error?.submitted !== true && error?.submitted !== 'unknown' || error?.definitive === true && error?.submitted !== true && error?.submitted !== 'unknown' ? 'failed' : 'uncertain';
       const explanation = cancelled || skipped ? safeText(error.message) : status === 'pending' ? 'Falha temporária anterior à confirmação. Nova tentativa limitada agendada.' : status === 'uncertain' ? 'Não foi possível confirmar o envio. Revise antes de repetir; sem reenvio automático.' : `Não foi possível enviar o lembrete (${codeOf(error.code)}). Confira conexão, número com país/DDD e autorização.`;
-      const saved = this._save('reminder_deliveries', { ...latest, attempts: attempt, status, code: codeOf(error.code), error: explanation, resultAt: status === 'pending' ? null : this.now(), nextAttemptAt: this.now() + Math.max(reminder?.retryMinutes || 1, (adapter.minimumSpacingSeconds || 0) / 60) * MINUTE });
+      const saved = this._save('reminder_deliveries', { ...latest, attempts: attempt, status, code: codeOf(error.code), error: explanation, resultAt: status === 'pending' ? null : this.now(), nextAttemptAt: this.now() + Math.max(Math.min(1440, (reminder?.retryMinutes || 1) * 2 ** (attempt - 1)), (adapter.minimumSpacingSeconds || 0) / 60) * MINUTE });
       this._trace(saved, 'failure', saved.code, explanation, status === 'pending' ? 'Nova tentativa com limite e intervalo.' : 'Nenhum reenvio automático.');
       if (['failed', 'uncertain'].includes(status)) this.onCriticalIncident?.({ id: saved.id, traceId: saved.traceId, event: 'critical', at: saved.resultAt, code: saved.code, reason: `Lembrete “${reminder?.title || 'removido'}”: ${explanation}` });
     } finally { this.inFlight.delete(item.id); this.emit('change'); }
   }
   _receipt(receipt) {
-    if (!receipt?.messageId || !['confirmed', 'delivered', 'read'].includes(receipt.status)) return;
+    if (!receipt?.messageId || !['confirmed', 'accepted', 'delivered', 'read', 'failed'].includes(receipt.status)) return;
+    if (receipt.mode && receipt.mode !== this._mode() || receipt.simulation != null && Boolean(receipt.simulation) !== (this._mode() === 'simulated')) return;
     try {
-      for (const item of this._list('reminder_deliveries', { status: ['sending', 'confirmed', 'delivered', 'uncertain'] })) {
-        if (item.messageId !== receipt.messageId) continue;
-        const delivered = item.status === 'delivered' || ['delivered', 'read'].includes(receipt.status);
-        this._save('reminder_deliveries', { ...item, status: delivered ? 'delivered' : 'confirmed', resultAt: item.resultAt || this.now(), confirmationScope: item.confirmationScope === 'whatsapp-read' ? item.confirmationScope : receipt.confirmationScope || item.confirmationScope || (this._mode() === 'simulated' ? 'simulation-only' : 'whatsapp-server'), ...(delivered ? { deliveredAt: item.deliveredAt || receipt.deliveredAt || this.now() } : {}), ...(receipt.status === 'read' ? { readAt: receipt.readAt || this.now() } : {}), error: null, code: null });
-      }
-      this.emit('change');
+      for (const item of this._list('reminder_deliveries', { status: ['sending', 'confirmed', 'delivered', 'uncertain'] })) if ([item.messageId, item.clientMessageId].includes(receipt.messageId)) this._reconcileDelivery(item, receipt, this.adapter, this.adapterRevision, this._mode());
     } catch (error) { this._fatal(error); }
   }
+
   stopAll({ actorId = null } = {}) {
     const result = this.store.transaction(() => {
       let paused = 0, cancelled = 0;

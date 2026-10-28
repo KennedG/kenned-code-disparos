@@ -168,7 +168,8 @@ test('history cleanup preserves dedupe ledgers, unknown outcomes, media and acco
   f.store.recoverInterrupted();
   assert.equal(f.store.getJob('job-confirmed').status, 'confirmed');
   assert.equal(f.store.getJob('job-queued').status, 'cancelled');
-  for (const status of ['sending', 'accepted', 'uncertain']) assert.equal(f.store.getJob('job-' + status).status, 'uncertain');
+  for (const status of ['sending', 'uncertain']) assert.equal(f.store.getJob('job-' + status).status, 'uncertain');
+  assert.equal(f.store.getJob('job-accepted').status, 'accepted', 'History cleanup and recovery preserve server acceptance');
   assert.equal(f.store.getCampaign('preserved-campaign').state, 'paused');
   assert.equal(f.store.getEntity('users', f.owner.id).active, true); assert(f.store.getMedia(file.id)); assert(fs.existsSync(file.path));
   assert(f.store.queryEntities('audit', { kind: 'history.clear' }).total >= 1);

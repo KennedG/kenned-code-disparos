@@ -414,8 +414,8 @@ class CommandController {
       const items = override?.enabled && Array.isArray(override.items) && override.items.length ? override.items : campaign.items;
       if (!items.length) fail('Adicione pelo menos um conteúdo para cada grupo antes de ativar a campanha.');
     }
-    const uncertain = this.store.listJobs({ campaignId: campaign.id, status: 'uncertain', limit: 1000000 });
-    if (uncertain.some(job => job.status === 'uncertain')) fail('Revise os envios com resultado incerto no Histórico do aplicativo antes de retomar. Eles não serão reenviados automaticamente.');
+    // The scheduler excludes ambiguous item/destination pairs until review.
+    // Their presence must not prevent other eligible items from resuming.
   }
 
   _summary(campaign) {
@@ -448,6 +448,7 @@ class CommandController {
       `Datas: ${schedule.startDate || 'sem início definido'} a ${schedule.endDate || 'sem encerramento definido'}\n` +
       `Limites por dia: ${campaign.dailyRoundLimit || 'sem limite'} rodadas / ${campaign.dailySendLimit || 'sem limite'} envios\n` +
       `Estimativa base: ${perRound} envios por rodada; até ${sends} por dia de funcionamento. Filas longas reduzem esta estimativa.\n` +
+      'Itens com resultado incerto ficam excluídos para aquele destino até revisão; os demais itens elegíveis podem continuar.\n' +
       `${overrideCount ? `${overrideCount} grupo(s) com configuração individual; a estimativa base não inclui essas diferenças.\n${individual}\n` : ''}` +
       'O computador precisa permanecer ligado, conectado e sem suspensão. Não há recuperação de rodadas perdidas.';
   }
@@ -622,7 +623,7 @@ class CommandController {
         const report = await this.automationControl.stop({ actorId: this.actorContext.getStore()?.id || null, source: 'whatsapp' });
         this._audit('automation.stop-all', null, { report });
         const count = value => typeof value === 'number' ? value : Number(value?.cancelled ?? value?.stopped ?? value?.campaigns ?? value?.count) || 0;
-        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
+        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}${report.uncertainForReview ? `⚠️ ${report.uncertainForReview} resultado(s) incerto(s) permanecem para revisão. Uma submissão anterior pode concluir após a parada; nenhum reenvio automático será feito.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
       }
       await this.scheduler.stopAll();
       this._audit('campaign.stop-all');

@@ -16,6 +16,9 @@ class SimulatedAdapter extends EventEmitter {
     this.automaticMessages = new Set();
     this.replyContexts = new Map();
     this.ownNumber = String(store?.getSetting?.('simulationOwnNumber', '') || '');
+    this.sourceCapture = { enabled: false, groupIds: new Set(), activatedAt: 0, importFrom: 0, importUntil: 0 };
+    this.seenPublications = new Set();
+    this.groupAvailability = new Map();
     this.searchCapture = { enabled: false, importHistory: false, groupIds: null, commandGroupIds: null };
     this.status = { state: 'disconnected', mode: 'simulated', detail: 'Simulação local: nenhum envio pelo WhatsApp.' };
   }
@@ -91,7 +94,8 @@ class SimulatedAdapter extends EventEmitter {
     while (this.automaticMessages.size > 10000) this.automaticMessages.delete(this.automaticMessages.values().next().value);
   }
 
-  async send(groupId, item, media, {beforeSubmit} = {}) {
+  async send(groupId, item, media, {beforeSubmit,signal} = {}) {
+    this._assertSignal(signal);
     if (this.status.state !== 'connected') {
       throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     }
@@ -111,9 +115,15 @@ class SimulatedAdapter extends EventEmitter {
       throw Object.assign(new Error('Falha temporária simulada antes do envio.'), { safeToRetry: true });
     }
     const messageId = item.clientMessageId || `SIM-${randomUUID()}`;
+    this._assertSignal(signal);
+    const existing = this.sent.find(entry => entry.messageId === messageId);
+    if (existing) {
+      if (existing.groupId !== groupId) throw Object.assign(new Error('Identificador do envio já pertence a outro destino.'), { safeToRetry: false, submitted: false });
+      return { status: existing.status || 'uncertain', messageId, mode: 'simulated', simulation: true };
+    }
     this._beforeSubmit(beforeSubmit);
     this._markAutomatic(messageId);
-    this.sent.push({ groupId, item: { ...item }, mediaId: media?.id, messageId, at: new Date().toISOString(), simulation: true });
+    this.sent.push({ groupId, item: { ...item }, mediaId: media?.id, messageId, at: new Date().toISOString(), status: outcome === 'uncertain' ? 'uncertain' : 'confirmed', simulation: true });
     if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);
     if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
     const result = { status: outcome === 'uncertain' ? 'uncertain' : 'confirmed', messageId, mode: 'simulated', simulation: true };
@@ -142,6 +152,64 @@ class SimulatedAdapter extends EventEmitter {
     const status = outcome === 'uncertain' ? 'uncertain' : 'confirmed';
     if (status === 'confirmed') this.emit('receipt', { messageId, status, confirmationScope: 'simulation-only', mode: 'simulated', simulation: true });
     return { status, messageId, simulation: true };
+  }
+
+  _assertSignal(signal) {
+    if (signal?.aborted) throw Object.assign(new Error('Tentativa simulada cancelada antes do envio.'), { code: 'WA_ATTEMPT_ABORTED', submitted: false, safeToRetry: false });
+  }
+
+  setGroupPublishingStatus(groupId, status) {
+    if (!/^sim-\d+@simulation$/.test(groupId)) throw new Error('A simulação aceita apenas identificadores fictícios.');
+    this.groupAvailability.set(groupId, { ...status, groupId, simulation: true, mode: 'simulated' });
+  }
+
+  async getGroupPublishingStatus(groupId, { signal } = {}) {
+    this._assertSignal(signal);
+    const base = { groupId, id: groupId, name: this.store?.getGroup?.(groupId)?.name || groupId, checkedAt: Date.now(), simulation: true, mode: 'simulated', confirmed: true, groupScoped: true, temporary: false };
+    if (!/^sim-\d+@simulation$/.test(groupId)) return { ...base, available: false, canSend: false, code: 'SIM_GROUP_ID_INVALID', reason: 'Destino real não pode ser usado na simulação.' };
+    if (this.status.state !== 'connected') return { ...base, available: false, canSend: false, temporary: true, groupScoped: false, code: 'WA_CONNECTION_OFFLINE', reason: 'Conexão simulada indisponível.' };
+    return { ...base, available: true, canSend: true, code: 'SIM_GROUP_READY', reason: 'Grupo fictício disponível no cenário de teste.', ...this.groupAvailability.get(groupId) };
+  }
+
+  async reconcile(messageId) {
+    const entry = this.sent.find(row => row.messageId === messageId);
+    return { status: entry?.status || 'uncertain', messageId, confirmed: entry?.status === 'confirmed', confirmationScope: 'simulation-only', simulation: true, mode: 'simulated' };
+  }
+
+  configureSourceCapture({ enabled = false, groupIds = [], activatedAt = Date.now(), importFrom = 0, importUntil = 0 } = {}) {
+    this.sourceCapture = { enabled: enabled === true, groupIds: new Set(groupIds.filter(id => /^sim-\d+@simulation$/.test(id))), activatedAt: Number(activatedAt), importFrom: Number(importFrom), importUntil: Number(importUntil) };
+    return { enabled: this.sourceCapture.enabled, ...this.getSourceCapabilities() };
+  }
+
+  setSourceCapture(options) { return this.configureSourceCapture(options); }
+  getSourceCapabilities() { return { live: true, edits: true, deletes: true, opportunisticHistory: true, completeHistory: false, albumAssociation: 'explicit-simulation-parent-only', simulation: true }; }
+
+  _sourceEvent(event, type = 'publication') {
+    const config = this.sourceCapture;
+    if (!config.enabled || !config.groupIds.has(event.chatId) || event.automaticMessage) return;
+    if (type === 'publication') {
+      const history = event.history || event.timestamp < config.activatedAt;
+      if (history && !(config.importFrom > 0 && event.timestamp >= config.importFrom && event.timestamp <= config.importUntil)) return;
+      const key = `${event.accountId}:${event.chatId}:${event.messageId}`;
+      if (this.seenPublications.has(key)) return;
+      this.seenPublications.add(key);
+      while (this.seenPublications.size > 5000) this.seenPublications.delete(this.seenPublications.values().next().value);
+    }
+    this.emit(type, { ...event, caption: event.text, originalTimestamp: type === 'publication' ? event.timestamp : null });
+  }
+
+  injectPublication(context = {}) {
+    const event = this._offerContext({ ...context, isGroup: true });
+    this._sourceEvent(event);
+    return event;
+  }
+  injectPublicationUpdate(context = {}) {
+    const event = this._offerContext({ ...context, isGroup: true, revisionAt: context.revisionAt ?? Date.now() });
+    this._sourceEvent(event, 'publicationUpdate'); return event;
+  }
+  injectPublicationDelete(context = {}) {
+    if (!this.sourceCapture.enabled || !this.sourceCapture.groupIds.has(context.chatId)) return;
+    this.emit('publicationDelete', { ...context, deletedAt: context.deletedAt ?? Date.now(), simulation: true, mode: 'simulated' });
   }
 
   configureSearchCapture({ enabled = false, importHistory = false, groupIds, commandGroupIds } = {}) {
@@ -227,7 +295,8 @@ class SimulatedAdapter extends EventEmitter {
     return { status: 'confirmed', messageId, mode: 'simulated', simulation: true };
   }
 
-  async downloadIncoming(context) {
+  async downloadIncoming(context, { signal } = {}) {
+    this._assertSignal(signal);
     const media = context?.simulatedMedia;
     if (!media || !Buffer.isBuffer(media.buffer)) throw new Error('Anexe uma mídia de teste válida.');
     return { buffer: media.buffer, name: media.name || 'anexo-simulado', mime: media.mime || 'application/octet-stream', type: media.type || 'document' };
@@ -255,7 +324,8 @@ class SimulatedAdapter extends EventEmitter {
       this.replyContexts.set(event.replyProof, { chatId: event.chatId, senderId: event.senderId, senderNumber: event.senderNumber, fromMe: event.fromMe });
       while (this.replyContexts.size > 10000) this.replyContexts.delete(this.replyContexts.keys().next().value);
     }
-    if (!event.history) this.emit('incoming', event);
+    if (!event.history && !(event.isGroup && event.type !== 'text' && this.sourceCapture.enabled && this.sourceCapture.groupIds.has(event.chatId))) this.emit('incoming', event);
+    this._sourceEvent(event);
     if (this._searchChatAllowed(event.chatId) && !event.history) this.emit('offerMessage', event);
     return event;
   }

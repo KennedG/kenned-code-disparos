@@ -33,7 +33,7 @@ function validateBackupData(input){
     groups.set(key,{...g,authorized:g.authorized??false,simulation:g.simulation??false});
   }
   for(const m of media.values())if(typeof m.name!=='string'||!m.name||m.name.length>512||!['image','video','document'].includes(m.type)||typeof m.mime!=='string'||!Number.isInteger(m.size)||m.size<1||m.size>64*1024*1024||!/^([a-f0-9]{64})$/i.test(m.sha256||''))fail('Dados de mídia inválidos.');
-  const view={getCampaign:key=>campaigns.get(key),getGroup:key=>groups.get(key),getMedia:key=>media.get(key),getSetting:()=>1000};
+  const view={getCampaign:key=>campaigns.get(key),getGroup:key=>groups.get(key),getMedia:key=>media.get(key),getSetting:(key,fallback)=>key==='maxSelectedGroups'?1000:fallback};
   const cleanCampaigns=[];
   for(const c of campaigns.values()){
     if(typeof c.name!=='string'||!Array.isArray(c.groupIds)||c.groupIds.some(g=>!id(g))||new Set(c.groupIds).size!==c.groupIds.length||!Array.isArray(c.items)||!object(c.schedule)||!object(c.groupOverrides||{}))fail('Estrutura da campanha inválida.');

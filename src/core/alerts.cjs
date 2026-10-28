@@ -1,7 +1,7 @@
 'use strict';
 
 const { EventEmitter } = require('node:events');
-const { randomUUID, randomBytes } = require('node:crypto');
+const { randomUUID, randomBytes, createHash } = require('node:crypto');
 const { configurationFingerprint } = require('./campaign-version.cjs');
 const { normalizePhone } = require('./phone.cjs');
 
@@ -13,6 +13,7 @@ const safeDescription = value => String(value || '')
   .replace(/(Bearer\s+)[\w.\-]+/gi, '$1[omitido]')
   .replace(/((?:password|senha|token|secret|authorization|credential|api[_-]?key|private[_-]?key)\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi, '$1[omitido]')
   .replace(/https?:\/\/[^\s/@:]+:[^\s/@]+@/gi, 'https://[omitido]@')
+  .replace(/KCD-[MA]-[A-HJ-NP-Z2-9]{8}(?:-[A-HJ-NP-Z2-9]{8}){3}/gi, '[licença omitida]')
   .slice(0, 500);
 const technicalDescription = error => {
   const description = safeDescription(error?.message);
@@ -27,6 +28,11 @@ const timestampText = (at, timezone = 'America/Sao_Paulo') => {
 function alertText(incident) {
   const at = timestampText(incident.at, incident.timezone);
   const reason = safeDescription(incident.reason || 'Falha de envio.').slice(0, 240);
+  if (incident.event === 'destination') {
+    const summary = incident.summary === true;
+    const connectivity = incident.connectionAvailable === true ? '✅ Os demais grupos elegíveis continuarão sendo processados.' : '⏸️ A conexão geral está indisponível. Os envios estão suspensos até a reconexão.';
+    return `${summary ? '⚠️ Resumo de falhas no grupo' : '⚠️ Não foi possível enviar para um grupo'}\n\n📢 Campanha: ${safeDescription(incident.campaignName || 'Campanha')}\n👥 Grupo: ${safeDescription(incident.groupName || 'Nome indisponível')}\n🆔 ID: ${safeDescription(incident.groupId)}\n📱 Item: ${safeDescription(incident.itemLabel || 'Item não identificado')}\n❗ Motivo: ${reason}\n🔎 Código: ${codeOf(incident.code, 'GROUP_SEND_FAILED')}\n🕒 Ocorrência original: ${at}${summary ? `\n🔁 Recorrências neste período: ${incident.recurrences || 0}\n🕒 Última ocorrência: ${timestampText(incident.lastAt, incident.timezone)}` : ''}\n\n${connectivity}\n🔧 Ação necessária: Revise a conexão ou a permissão do grupo. Verifique novamente o destino no aplicativo antes de reativá-lo. Nenhum envio incerto será repetido automaticamente.`;
+  }
   if (incident.event === 'disconnect') return `🚨 WhatsApp desconectado\n\n🕒 Ocorrência original: ${at}\n⚠️ Motivo: ${reason}\n🔎 Código do erro: ${codeOf(incident.code, 'WHATSAPP_DISCONNECTED')}\n\nOs envios foram pausados com segurança. Este aviso ficou pendente enquanto a conexão estava indisponível. Acesse o Kenned Code Disparos para verificar a conexão.`;
   if (!incident.campaignId && !incident.campaignName) return `${incident.event === 'test' ? '🔔 Teste de alerta' : '🚨 Falha crítica'} — Kenned Code Disparos\n\n🕒 Ocorrência original: ${at}\n⚠️ Motivo: ${reason}\n🔎 Código do erro: ${codeOf(incident.code, 'SYSTEM_ERROR')}\n\nAcesse o sistema para verificar os detalhes. Nenhuma campanha foi ativada por este aviso.`;
   return `🚨 Campanha interrompida por erro\n\n📣 Campanha: ${String(incident.campaignName || 'Campanha').slice(0, 200)}\n🕒 Data e horário: ${at}\n⚠️ Motivo: ${reason}\n✅ Envios confirmados: ${incident.confirmed || 0}\n⏳ Pendentes: ${incident.pending || 0}\n🔎 Código do erro: ${codeOf(incident.code, 'CAMPAIGN_ERROR')}\n\nAcesse o sistema para verificar os detalhes e decidir sobre a retomada.`;
@@ -72,13 +78,13 @@ class AlertService extends EventEmitter {
     };
     this.statusListener = status => { void this._onStatus(status).catch(() => this.scheduler?.blockOnPersistenceFailure()); };
     this.receiptListener = receipt => {
-      if (!['confirmed', 'delivered', 'read'].includes(receipt.status) || !receipt.messageId) return;
+      if (!['accepted', 'confirmed', 'delivered', 'read'].includes(receipt.status) || !receipt.messageId || (receipt.mode && receipt.mode !== this._mode()) || (this._mode() === 'whatsapp' && receipt.simulation === true)) return;
       try {
         const matches = this.store.findAlertsByMessageId ? this.store.findAlertsByMessageId(receipt.messageId) : this._list('alerts').filter(alert => alert.messageId === receipt.messageId);
         for (const alert of matches) {
-          if (alert.messageId !== receipt.messageId || alert.status === 'cancelled') continue;
+          if (alert.messageId !== receipt.messageId || alert.status === 'cancelled' || (alert.integrationMode && alert.integrationMode !== this._mode())) continue;
           const delivered = ['delivered', 'read'].includes(receipt.status) || ['whatsapp-delivered', 'whatsapp-read'].includes(receipt.confirmationScope);
-          this._save('alerts', { ...alert, status: delivered || alert.status === 'delivered' ? 'delivered' : 'confirmed', resultAt: alert.resultAt || this.now(), lastAcceptedAt: alert.lastAcceptedAt || receipt.acceptedAt || this.now(), acceptedAt: alert.acceptedAt || receipt.acceptedAt || this.now(), confirmationScope: alert.confirmationScope === 'whatsapp-read' ? 'whatsapp-read' : delivered ? receipt.confirmationScope || (receipt.status === 'read' ? 'whatsapp-read' : 'whatsapp-delivered') : alert.confirmationScope || receipt.confirmationScope || 'whatsapp-server', ...(delivered ? { deliveredAt: alert.deliveredAt || receipt.deliveredAt || this.now() } : {}), ...(receipt.readAt ? { readAt: alert.readAt || receipt.readAt } : {}), error: null, errorCode: null, technicalError: null, retryEligible: false });
+          this._save('alerts', { ...alert, status: delivered || alert.status === 'delivered' ? 'delivered' : 'confirmed', resultAt: alert.resultAt || this.now(), lastAcceptedAt: alert.lastAcceptedAt || this.now(), acceptedAt: alert.acceptedAt || receipt.acceptedAt || this.now(), confirmationScope: alert.confirmationScope === 'whatsapp-read' ? 'whatsapp-read' : delivered ? receipt.confirmationScope || (receipt.status === 'read' ? 'whatsapp-read' : 'whatsapp-delivered') : alert.confirmationScope || receipt.confirmationScope || 'whatsapp-server', ...(delivered ? { deliveredAt: alert.deliveredAt || receipt.deliveredAt || this.now() } : {}), ...(receipt.readAt ? { readAt: alert.readAt || receipt.readAt } : {}), error: null, errorCode: null, technicalError: null, retryEligible: false });
           this._trace(alert, 'receipt', delivered ? 'ALERT_DELIVERED' : 'ALERT_CONFIRMED', delivered ? 'A integração confirmou entrega ao dispositivo.' : 'A integração confirmou recebimento pelo servidor.', 'Registro conciliado sem novo envio.', alert.attempts || 0);
         }
         this.emit('change');
@@ -278,6 +284,95 @@ class AlertService extends EventEmitter {
     return { occurrenceId: value.id, traceId: value.traceId, notification, alerts };
   }
 
+  _destinationState() {
+    const value = this.store.getSetting(`destinationAlertGroups:${this._mode()}`, {});
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  }
+
+  _saveDestinationState(groups) {
+    // The summary book is operational state, not erasable history. Keep it
+    // mode-scoped and bounded; queued notices retain their own durable records.
+    const cutoff = this.now() - 30 * 86400000;
+    const entries = Object.entries(groups).filter(([, group]) => group && (group.lastAt || 0) >= cutoff).sort((a, b) => b[1].lastAt - a[1].lastAt).slice(0, 512);
+    try { this.store.setSetting(`destinationAlertGroups:${this._mode()}`, Object.fromEntries(entries)); }
+    catch (error) { this.scheduler?.blockOnPersistenceFailure(); throw error; }
+  }
+
+  _destinationSummaryInterval() {
+    const policy = this.store.getSetting('destinationAlertPolicy', {});
+    const seconds = Number(policy.summaryIntervalSeconds);
+    return Math.max(60, Math.min(86400, Number.isFinite(seconds) ? seconds : 900)) * 1000;
+  }
+
+  _dispatchDestination(incident) {
+    const notification = this._get('notifications', `${incident.id}:critical`);
+    this._local(incident, 'critical', incident.summary ? 'Resumo de falhas por grupo' : 'Grupo indisponível para envio', `${incident.campaignName}: ${incident.groupName} — ${incident.reason}`);
+    if (!notification) this._trace(incident, 'occurrence', incident.code, 'Falha do destino registrada separadamente do resultado do aviso privado.', incident.connectionAvailable ? 'Demais grupos elegíveis continuam; destino com falha requer revisão.' : 'Conexão geral indisponível; aviso privado permanece pendente.', 0, { groupId: incident.groupId, operationId: incident.operationId || null, recurrences: incident.recurrences || 0 });
+    const text = alertText({ ...incident, timezone: this.store.getSetting('timezone', 'America/Sao_Paulo') });
+    const alerts = (incident.recipientSnapshot || []).map(recipient => this._queue(incident, recipient, 'whatsapp', text)).filter(Boolean);
+    this.emit('change');
+    return { occurrenceId: incident.id, traceId: incident.traceId, alerts };
+  }
+
+  destinationFailure(event) {
+    if (this.closed || !event || typeof event.campaignId !== 'string' || typeof event.groupId !== 'string') return null;
+    const campaign = this.store.getCampaign(event.campaignId);
+    if (!campaign) return null;
+    const group = this.store.getGroup?.(event.groupId) || this.store.listGroups?.().find(value => value.id === event.groupId);
+    const code = codeOf(event.code, 'GROUP_SEND_FAILED');
+    const key = createHash('sha256').update(JSON.stringify([event.campaignId, event.groupId, code])).digest('hex');
+    const operationId = event.operationId || event.jobId || null;
+    const operationKey = operationId ? createHash('sha256').update(String(operationId)).digest('hex') : null;
+    const groups = this._destinationState();
+    let bucket = groups[key];
+    if (operationKey && bucket?.operationKeys?.includes(operationKey)) return { occurrenceId: bucket.first.id, duplicate: true, alerts: [] };
+    // A stop-all occurrence must not become a backlog on resume. A genuinely
+    // new failure after explicit resume is a new occurrence, not forever mute.
+    if (bucket?.first?.automationSuppressed && !this._stopped()) bucket = null;
+    const item = campaign.items?.find(value => value.id === event.itemId);
+    const at = Number.isFinite(event.at) ? event.at : this.now();
+    const data = { campaignId: campaign.id, campaignName: safeDescription(campaign.name), groupId: event.groupId, groupName: safeDescription(group?.name || event.groupName || 'Nome indisponível'), itemLabel: safeDescription(event.itemLabel || (item?.text || item?.caption || '').split('\n').find(line => line.trim()) || item?.name || 'Item não identificado'), code, reason: safeDescription(event.reason || 'Motivo não identificado. Consulte o erro técnico no diagnóstico.'), connectionAvailable: event.connectionAvailable === true && this.adapter?.status?.state === 'connected', event: 'destination', integrationMode: this._mode(), simulation: this._mode() === 'simulated', operationId, automationSuppressed: this._stopped() };
+    if (!bucket) {
+      const id = randomUUID();
+      const first = { ...data, id, traceId: event.traceId || operationId || id, at, recipientSnapshot: this._recipients(campaign) };
+      bucket = { first, firstQueued: false, lastAt: at, lastSummaryAt: this.now(), recurrences: 0, operationKeys: operationKey ? [operationKey] : [], latest: data };
+    } else {
+      bucket = { ...bucket, lastAt: at, recurrences: (bucket.recurrences || 0) + (this._stopped() ? 0 : 1), operationKeys: [...(bucket.operationKeys || []), ...(operationKey ? [operationKey] : [])].slice(-256), latest: this._stopped() ? bucket.latest : data };
+    }
+    groups[key] = bucket;
+    this._saveDestinationState(groups);
+    if (!bucket.firstQueued) {
+      const result = this._dispatchDestination(bucket.first);
+      bucket.firstQueued = true;
+      this._saveDestinationState(groups);
+      queueMicrotask(() => { void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure()); });
+      return result;
+    }
+    queueMicrotask(() => { void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure()); });
+    return { occurrenceId: bucket.first.id, grouped: true, recurrences: bucket.recurrences, alerts: [] };
+  }
+
+  _flushDestinationSummaries() {
+    const groups = this._destinationState();
+    let changed = false;
+    for (const bucket of Object.values(groups)) {
+      if (!bucket?.first?.id) continue;
+      if (!bucket.firstQueued) { this._dispatchDestination(bucket.first); bucket.firstQueued = true; changed = true; }
+      if (this._stopped() || bucket.first.automationSuppressed) continue;
+      if (!bucket.pendingSummary && bucket.recurrences > 0 && this.now() - bucket.lastSummaryAt >= this._destinationSummaryInterval()) {
+        const id = randomUUID();
+        bucket.pendingSummary = { ...bucket.first, ...bucket.latest, id, traceId: id, summary: true, at: bucket.first.at, lastAt: bucket.lastAt, recurrences: bucket.recurrences, recipientSnapshot: this._recipients(this.store.getCampaign(bucket.first.campaignId)) };
+        bucket.recurrences = 0;
+        bucket.lastSummaryAt = this.now();
+        // Save the summary identity and consumed count before queueing so a
+        // crash cannot generate a second occurrence for the same interval.
+        this._saveDestinationState(groups);
+      }
+      if (bucket.pendingSummary) { this._dispatchDestination(bucket.pendingSummary); bucket.pendingSummary = null; changed = true; }
+    }
+    if (changed) this._saveDestinationState(groups);
+  }
+
   _queue(incident, recipient, channel, text) {
     if (this._stopped() || incident.automationSuppressed === true || this._get('notifications', `${incident.id}:${incident.event || 'critical'}`)?.automationSuppressed === true) return null;
     // Deterministic key survives restarts and settings changes. Phone numbers
@@ -343,7 +438,7 @@ class AlertService extends EventEmitter {
   flush() {
     if (this.flushing) return this.flushing;
     if (this.closed || this._stopped() || this.store.persistenceFailed || this.scheduler?.persistenceFailed) return Promise.resolve();
-    this.flushing = this._flush().finally(() => { this.flushing = null; });
+    this.flushing = Promise.resolve().then(() => { this._flushDestinationSummaries(); return this._flush(); }).finally(() => { this.flushing = null; });
     return this.flushing;
   }
 
@@ -358,18 +453,62 @@ class AlertService extends EventEmitter {
 
   async _flush() {
     if (this.scheduler?.runExternalSubmission) {
-      try { return await this.scheduler.runExternalSubmission(() => this._flushBatch()); }
+      const attemptMs = this._attemptTimeoutMs();
+      // The FIFO slot contains a bounded batch, while each network operation
+      // gets its own shorter deadline. One stalled notice cannot occupy the
+      // slot indefinitely or turn every following notice into uncertain work.
+      const batchMs = 50 * (attemptMs * 2 + Math.max(3, this.adapter?.minimumSpacingSeconds || 3) * 1000) + 5000;
+      try { return await this.scheduler.runExternalSubmission(context => this._flushBatch(context), { timeoutMs: batchMs }); }
       catch (error) {
         // Cancelling an automatic queue is an intentional operator action,
         // not a disk fault. Do not latch a persistence failure on stop-all.
         if (error?.code === 'AUTOMATION_STOPPED') return;
+        if (error?.code === 'SUBMISSION_TIMEOUT') {
+          for (const alert of this._list('alerts', { status: 'sending' })) {
+            const uncertain = this._save('alerts', { ...alert, status: 'uncertain', resultAt: this.now(), retryEligible: false, errorCode: 'ALERT_SEND_TIMEOUT', error: 'Tempo limite excedido. O envio pode ter ocorrido; revise antes de repetir.' });
+            this._trace(uncertain, 'failure', 'ALERT_SEND_TIMEOUT', uncertain.error, 'Fila liberada; nenhum reenvio automático.', alert.attempts || 0);
+          }
+          this.emit('change');
+          return;
+        }
         throw error;
       }
     }
     return this._flushBatch();
   }
 
-  async _flushBatch() {
+  _attemptTimeoutMs() {
+    if (this.scheduler?.getAttemptTimeoutMs) return this.scheduler.getAttemptTimeoutMs();
+    return Math.max(5, Math.min(300, Number(this.store.getSetting('submissionTimeoutSeconds', 30)) || 30)) * 1000;
+  }
+
+  _boundedAlertAttempt(task, options = {}) {
+    if (this.scheduler?.runBoundedAttempt) return this.scheduler.runBoundedAttempt(task, { timeoutMs: this._attemptTimeoutMs(), ...options });
+    return task({ signal: options.signal, beforeSubmit: () => {
+      if (options.signal?.aborted) throw Object.assign(new Error('Tentativa encerrada antes do envio.'), { code: 'SUBMISSION_ABORTED', submitted: false, definitive: true, safeToRetry: false });
+    } });
+  }
+
+  _lateAlertProof(alert, result, mode) {
+    if (this.closed || mode !== this._mode() || this.store.persistenceFailed || this.scheduler?.persistenceFailed) return;
+    const current = this._get('alerts', alert.id);
+    if (!current || current.status === 'cancelled' || current.messageId !== alert.messageId || !['accepted', 'confirmed', 'delivered', 'read'].includes(result?.status)) return;
+    const delivered = current.status === 'delivered' || ['delivered', 'read'].includes(result.status) || ['whatsapp-delivered', 'whatsapp-read'].includes(result.confirmationScope);
+    const proof = this._save('alerts', { ...current, status: delivered ? 'delivered' : 'confirmed', messageId: result.messageId || current.messageId, acceptedAt: current.acceptedAt || result.acceptedAt || this.now(), lastAcceptedAt: current.lastAcceptedAt || this.now(), resultAt: current.resultAt || this.now(), confirmationScope: current.confirmationScope === 'whatsapp-read' ? 'whatsapp-read' : result.confirmationScope || (current.channel === 'webhook' ? 'channel-accepted' : delivered ? result.status === 'read' ? 'whatsapp-read' : 'whatsapp-delivered' : 'whatsapp-server'), ...(delivered ? { deliveredAt: current.deliveredAt || result.deliveredAt || this.now() } : {}), ...(result.readAt ? { readAt: current.readAt || result.readAt } : {}), retryEligible: false, error: null, errorCode: null, technicalError: null, reconciledAt: this.now() });
+    this._trace(proof, 'receipt', delivered ? 'ALERT_DELIVERED' : 'ALERT_CONFIRMED', 'Resposta tardia da mesma tentativa conciliada com a confirmação disponível.', 'Registro atualizado; nenhuma segunda submissão.', current.attempts || 0);
+    this.emit('change');
+  }
+
+  _lateAlertError(alert, error, mode) {
+    if (this.closed || mode !== this._mode() || this.store.persistenceFailed || this.scheduler?.persistenceFailed || (error?.definitive !== true && error?.submitted !== false)) return;
+    const current = this._get('alerts', alert.id);
+    if (!current || current.status !== 'uncertain' || current.messageId !== alert.messageId) return;
+    const failed = this._save('alerts', { ...current, status: 'failed', errorCode: codeOf(error.code, 'ALERT_SEND_ERROR'), error: 'A resposta tardia confirmou a falha desta tentativa. Nenhum reenvio automático foi realizado.', technicalError: technicalDescription(error), lastFailureAt: this.now(), resultAt: this.now(), retryEligible: true, reconciledAt: this.now() });
+    this._trace(failed, 'failure', failed.errorCode, failed.error, 'Uma nova tentativa exige ação manual.', current.attempts || 0, { technicalError: failed.technicalError });
+    this.emit('change');
+  }
+
+  async _flushBatch({ signal, beforeSubmit: batchBeforeSubmit = () => {} } = {}) {
     if (this._stopped()) return;
     const stopRevision = this.stopRevision;
     const adapter = this.adapter;
@@ -382,7 +521,7 @@ class AlertService extends EventEmitter {
     try {
       await this.scheduler?.waitForIdle?.();
       for (const snapshot of pending) {
-        if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || this.scheduler?.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode()) break;
+        if (signal?.aborted || this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || this.scheduler?.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode()) break;
         const alert = this._get('alerts', snapshot.id);
         if (alert?.status !== 'pending' || (alert.nextAttemptAt || 0) > this.now()) continue;
         if ((alert.integrationMode && alert.integrationMode !== mode) || (mode === 'whatsapp' && alert.simulation === true)) continue;
@@ -396,7 +535,7 @@ class AlertService extends EventEmitter {
         const minimum = Math.max(3, adapter.minimumSpacingSeconds || 3) * 1000;
         const last = this.scheduler?.lastSubmissionAt;
         if (alert.channel === 'whatsapp' && last != null) await this.sleep(Math.max(0, minimum - (this.now() - last)));
-        if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || (alert.channel === 'whatsapp' && adapter.status.state !== 'connected')) continue;
+        if (signal?.aborted || this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || (alert.channel === 'whatsapp' && adapter.status.state !== 'connected')) continue;
         const attempt = (alert.attempts || 0) + 1;
         this._save('alerts', { ...alert, attempts: attempt, lastAttemptAt: this.now() });
         if (this.store.persistenceFailed || this.scheduler?.persistenceFailed) break;
@@ -405,10 +544,10 @@ class AlertService extends EventEmitter {
           let result;
           if (alert.channel === 'whatsapp') {
             this._validateRecipient(alert);
-            const resolved = adapter.resolveRecipient ? await adapter.resolveRecipient(alert.number,{traceId:alert.traceId||alert.occurrenceId||alert.id}) : null;
+            const resolved = adapter.resolveRecipient ? await this._boundedAlertAttempt(context => { batchBeforeSubmit(); context.beforeSubmit(); return adapter.resolveRecipient(alert.number, { traceId: alert.traceId || alert.occurrenceId || alert.id, signal: context.signal }); }, { signal }) : null;
             const targetId = typeof resolved === 'string' ? resolved : resolved?.jid || null;
             if (resolved && ((resolved.mode && resolved.mode !== mode) || (mode === 'whatsapp' && resolved.simulation === true))) throw Object.assign(new Error('Destinatário pertence a outro modo de execução.'), { code: 'RECIPIENT_MODE_MISMATCH', definitive: true });
-            if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter.status.state !== 'connected') {
+            if (signal?.aborted || this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter.status.state !== 'connected') {
               const latest = this._get('alerts', alert.id);
               if (latest?.status === 'pending') this._save('alerts', { ...latest, attempts: Math.max(0, attempt - 1) });
               continue;
@@ -420,30 +559,32 @@ class AlertService extends EventEmitter {
             this._trace(sending, 'recipient', 'ALERT_RECIPIENT_RESOLVED', resolved?.isSelf ? 'Destinatário resolvido como a própria conta conectada.' : 'Destinatário privado resolvido pela integração.', 'Autorização atualizada. Iniciando submissão; envio ainda não confirmado.', attempt, { authorization: 'approved' });
             if (this.scheduler) this.scheduler.lastSubmissionAt = this.now();
             submitted = true;
-            result = await adapter.sendPrivate(alert.number, alert.text, { clientMessageId: alert.messageId, traceId: alert.traceId || alert.occurrenceId || alert.id, beforeSubmit: () => {
+            result = await this._boundedAlertAttempt(context => adapter.sendPrivate(alert.number, alert.text, { clientMessageId: alert.messageId, traceId: alert.traceId || alert.occurrenceId || alert.id, signal: context.signal, beforeSubmit: () => {
+              batchBeforeSubmit(); context.beforeSubmit();
               if (this._stopped() || stopRevision !== this.stopRevision) throw Object.assign(new Error('Envio interrompido antes da submissão pelo comando parar tudo.'), { code: 'AUTOMATION_STOPPED', definitive: true, submitted: false, safeToRetry: false });
               if (this.closed || this.store.persistenceFailed || this.scheduler?.persistenceFailed) throw Object.assign(new Error('Processamento de alertas indisponível antes da submissão.'), { code: 'ALERT_PROCESSING_UNAVAILABLE', definitive: true, submitted: false, safeToRetry: false });
               if (adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter !== this.adapter || adapter.status.state !== 'connected') throw Object.assign(new Error('A conexão mudou antes de enviar o alerta. Nenhuma mensagem foi enviada.'), { code: 'WA_RECIPIENT_CONNECTION_CHANGED', definitive: true, submitted: false, safeToRetry: true });
               const latest = this._get('alerts', alert.id);
               if (latest?.status !== 'sending' || latest.messageId !== alert.messageId || latest.number !== alert.number) throw Object.assign(new Error('O alerta foi cancelado ou alterado antes da submissão.'), { code: 'ALERT_SUBMISSION_CHANGED', definitive: true, submitted: false, safeToRetry: false });
               this._validateRecipient(latest);
-            } });
+            } }), { signal, onLateResult: proof => this._lateAlertProof(alert, proof, mode), onLateError: error => this._lateAlertError(alert, error, mode) });
           } else {
             const config = this.store.getSetting('independentAlertChannel', null);
             if (!config?.enabled || !/^https:\/\//i.test(config.url || '')) throw Object.assign(new Error('Canal independente indisponível.'), { safeToRetry: true, definitive: true });
-            const secret = await this.secretGet(config.secretId || 'independentAlertChannel');
-            if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this._get('alerts', alert.id)?.status !== 'pending') continue;
+            const secret = await this._boundedAlertAttempt(() => this.secretGet(config.secretId || 'independentAlertChannel'), { signal });
+            if (signal?.aborted || this.closed || this._stopped() || stopRevision !== this.stopRevision || this._get('alerts', alert.id)?.status !== 'pending') continue;
             if (!secret) throw Object.assign(new Error('Credencial do canal ausente.'), { definitive: true });
             this._save('alerts', { ...this._get('alerts', alert.id), status: 'sending', submittedAt: this.now() });
             submitted = true;
-            result = await this.sendWebhook({ url: config.url, secret, message: alert.text, occurrenceId: alert.occurrenceId, originalAt: alert.originalAt, idempotencyKey: alert.messageId });
+            result = await this._boundedAlertAttempt(context => { batchBeforeSubmit(); context.beforeSubmit(); return this.sendWebhook({ url: config.url, secret, message: alert.text, occurrenceId: alert.occurrenceId, originalAt: alert.originalAt, idempotencyKey: alert.messageId, signal: context.signal }); }, { signal, onLateResult: proof => this._lateAlertProof(alert, proof, mode), onLateError: error => this._lateAlertError(alert, error, mode) });
           }
           const current = this._get('alerts', alert.id);
-          const confirmed = ['confirmed', 'delivered', 'read'].includes(result?.status) || ['confirmed', 'delivered'].includes(current.status);
+          const confirmed = ['accepted', 'confirmed', 'delivered', 'read'].includes(result?.status) || ['confirmed', 'delivered'].includes(current.status);
           const delivered = current.status === 'delivered' || ['delivered', 'read'].includes(result?.status) || (confirmed && ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope));
           const saved = this._save('alerts', { ...current, status: delivered ? 'delivered' : confirmed ? 'confirmed' : 'uncertain', resultAt: current.resultAt || this.now(), messageId: result?.messageId || alert.messageId, ...(confirmed ? { lastAcceptedAt: current.lastAcceptedAt || this.now(), acceptedAt: current.acceptedAt || this.now() } : {}), confirmationScope: confirmed ? alert.channel === 'webhook' ? 'channel-accepted' : delivered ? current.confirmationScope || result.confirmationScope || (result?.status === 'read' ? 'whatsapp-read' : 'whatsapp-delivered') : result?.confirmationScope || current.confirmationScope || 'whatsapp-server' : null, ...(delivered ? { deliveredAt: current.deliveredAt || result?.deliveredAt || this.now() } : {}), errorCode: confirmed ? null : 'ALERT_SEND_UNCERTAIN', retryEligible: false, error: confirmed ? null : 'Resultado de alerta incerto; revisão necessária.', technicalError: null });
           this._trace(saved, 'result', confirmed ? delivered ? 'ALERT_DELIVERED' : 'ALERT_CONFIRMED' : 'ALERT_SEND_UNCERTAIN', confirmed ? delivered ? 'A integração confirmou entrega ao dispositivo.' : 'A integração confirmou recebimento pelo servidor.' : 'A integração não comprovou o envio do aviso.', confirmed ? 'Resultado confirmado; nenhum reenvio.' : 'Alerta separado para revisão; nenhum reenvio automático.', attempt);
         } catch (error) {
+          if (error?.code === 'SUBMISSION_TIMEOUT' && !submitted) error = Object.assign(new Error('Tempo limite excedido antes de submeter o alerta; nenhuma mensagem foi enviada.'), { code: 'ALERT_RECIPIENT_TIMEOUT', definitive: true, safeToRetry: true, submitted: false });
           const acknowledged = this._get('alerts', alert.id);
           if (['confirmed', 'delivered'].includes(acknowledged?.status)) {
             // A real receipt may race a timeout/rejection of the request
@@ -468,10 +609,11 @@ class AlertService extends EventEmitter {
           const autoRetry = error?.safeToRetry === true || (!submitted && error?.definitive !== true && error?.safeToRetry !== false);
           const status = autoRetry && attempt < max ? 'pending' : definitive ? 'failed' : 'uncertain';
           const errorCode = codeOf(error?.code, 'ALERT_SEND_ERROR');
-          const explanations = { RECIPIENT_NOT_REGISTERED: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', WA_RECIPIENT_NOT_FOUND: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', RECIPIENT_NUMBER_INVALID: 'O telefone precisa conter código do país, DDD e número.', WA_RECIPIENT_INVALID: 'O telefone precisa conter código do país, DDD e número.', RECIPIENT_SELF_UNAVAILABLE: 'A integração ainda não identificou o número da própria conta. Reconecte e tente novamente.', WA_RECIPIENT_TIMEOUT: 'O WhatsApp não respondeu à consulta do destinatário. Confira a internet e tente novamente após o intervalo.', WA_RECIPIENT_OFFLINE: 'A conexão caiu antes de resolver o destinatário. O envio não ocorreu.', WA_RECIPIENT_UNSUPPORTED: 'A integração conectada não oferece a consulta de destinatários exigida. Atualize o aplicativo e reconecte o WhatsApp.', WA_RECIPIENT_MISMATCH: 'O WhatsApp retornou uma conta diferente do número solicitado. Confira o número e a sessão; o destino não foi substituído.', WA_RECIPIENT_AMBIGUOUS: 'O WhatsApp retornou mais de uma conta possível para o telefone. O destino não foi escolhido por suposição. Confira o número e reconecte.', WA_RECIPIENT_CONNECTION_CHANGED: 'A conexão mudou durante a identificação do destinatário. Nenhuma mensagem foi enviada; uma nova tentativa limitada pode ocorrer após reconectar.', WA_RECIPIENT_LOOKUP_TEMPORARY: 'Falha temporária na consulta do destinatário. Confira a internet e aguarde a tentativa limitada.', WA_RECIPIENT_LOOKUP_REJECTED: 'O WhatsApp recusou a consulta do destinatário. Confira a conexão e eventuais restrições.', ALERT_RECIPIENT_DISABLED: 'O destinatário foi removido, desativado, teve o telefone alterado ou está vinculado a um usuário sem acesso ativo. Confira o cadastro.', RECIPIENT_MODE_MISMATCH: 'O destinatário pertence a outro modo. Confira a conexão selecionada.', ALERT_PROCESSING_UNAVAILABLE: 'O processamento de alertas foi interrompido. Confira o diagnóstico e o armazenamento antes de tentar novamente.', ALERT_SUBMISSION_CHANGED: 'O alerta foi alterado ou cancelado antes da submissão. Nenhum envio foi realizado.' };
+          const explanations = { SUBMISSION_TIMEOUT: 'O tempo limite da tentativa foi excedido. O envio pode ter ocorrido; a fila foi liberada e não haverá reenvio automático. Revise a operação.', ALERT_RECIPIENT_TIMEOUT: 'A identificação do destinatário excedeu o tempo limite antes da submissão. Nenhuma mensagem foi enviada; uma tentativa limitada pode ocorrer após o intervalo.', RECIPIENT_NOT_REGISTERED: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', WA_RECIPIENT_NOT_FOUND: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', RECIPIENT_NUMBER_INVALID: 'O telefone precisa conter código do país, DDD e número.', WA_RECIPIENT_INVALID: 'O telefone precisa conter código do país, DDD e número.', RECIPIENT_SELF_UNAVAILABLE: 'A integração ainda não identificou o número da própria conta. Reconecte e tente novamente.', WA_RECIPIENT_TIMEOUT: 'O WhatsApp não respondeu à consulta do destinatário. Confira a internet e tente novamente após o intervalo.', WA_RECIPIENT_OFFLINE: 'A conexão caiu antes de resolver o destinatário. O envio não ocorreu.', WA_RECIPIENT_UNSUPPORTED: 'A integração conectada não oferece a consulta de destinatários exigida. Atualize o aplicativo e reconecte o WhatsApp.', WA_RECIPIENT_MISMATCH: 'O WhatsApp retornou uma conta diferente do número solicitado. Confira o número e a sessão; o destino não foi substituído.', WA_RECIPIENT_AMBIGUOUS: 'O WhatsApp retornou mais de uma conta possível para o telefone. O destino não foi escolhido por suposição. Confira o número e reconecte.', WA_RECIPIENT_CONNECTION_CHANGED: 'A conexão mudou durante a identificação do destinatário. Nenhuma mensagem foi enviada; uma nova tentativa limitada pode ocorrer após reconectar.', WA_RECIPIENT_LOOKUP_TEMPORARY: 'Falha temporária na consulta do destinatário. Confira a internet e aguarde a tentativa limitada.', WA_RECIPIENT_LOOKUP_REJECTED: 'O WhatsApp recusou a consulta do destinatário. Confira a conexão e eventuais restrições.', ALERT_RECIPIENT_DISABLED: 'O destinatário foi removido, desativado, teve o telefone alterado ou está vinculado a um usuário sem acesso ativo. Confira o cadastro.', RECIPIENT_MODE_MISMATCH: 'O destinatário pertence a outro modo. Confira a conexão selecionada.', ALERT_PROCESSING_UNAVAILABLE: 'O processamento de alertas foi interrompido. Confira o diagnóstico e o armazenamento antes de tentar novamente.', ALERT_SUBMISSION_CHANGED: 'O alerta foi alterado ou cancelado antes da submissão. Nenhum envio foi realizado.' };
           const explanation = explanations[errorCode] || (status === 'pending' ? 'Falha anterior à submissão; tentativa limitada pendente.' : status === 'failed' ? 'Alerta falhou. Confira a conexão, o país/DDD do número e o cadastro do destinatário.' : 'Resultado de alerta incerto; revisão necessária antes de repetir.');
           const technicalError = technicalDescription(error);
-          const failed = this._save('alerts', { ...this._get('alerts', alert.id), status, resultAt: status === 'pending' ? null : this.now(), lastFailureAt: this.now(), nextAttemptAt: this.now() + Math.max(3, Math.min(3600, Number(policy.delaySeconds) || 15), adapter.minimumSpacingSeconds || 3) * 1000, errorCode, retryEligible: status === 'failed' && definitive, error: explanation, technicalError });
+          const delaySeconds = Math.min(3600, Math.max(3, Number(policy.delaySeconds) || 15) * Math.pow(2, Math.max(0, attempt - 1)));
+          const failed = this._save('alerts', { ...this._get('alerts', alert.id), status, resultAt: status === 'pending' ? null : this.now(), lastFailureAt: this.now(), nextAttemptAt: this.now() + Math.max(delaySeconds, adapter.minimumSpacingSeconds || 3) * 1000, errorCode, retryEligible: status === 'failed' && definitive, error: explanation, technicalError });
           this._trace(failed, 'failure', errorCode, explanation, status === 'pending' ? 'Nova tentativa limitada agendada.' : status === 'failed' && definitive ? 'Envio não ocorreu. Uma nova tentativa manual pode ser solicitada.' : 'Revisão do alerta necessária.', attempt, { technicalError });
         }
         this.emit('change');

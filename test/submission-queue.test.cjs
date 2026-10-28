@@ -44,7 +44,7 @@ test('external submissions use FIFO and hold a due campaign until both requests 
   firstReleased.resolve();await secondEntered.promise;assert.deepEqual(events,['first:start','first:finish','second:start']);
   await f.scheduler.tick();assert.equal(f.adapter.sent.length,0);
   secondReleased.resolve();assert.deepEqual(await Promise.all([first,second]),['first','second']);assert.equal(maximum,1);assert.equal(f.scheduler.submissionHolds,0);
-  await f.scheduler.tick();assert.equal(f.adapter.sent.length,1);assert.equal(f.store.listJobs({status:'confirmed'}).length,1);
+  await f.scheduler.tick();assert.equal(f.adapter.sent.length,1);assert.equal(f.store.listJobs({status:'accepted'}).length,1);
 });
 
 test('an already submitted campaign finishes before either external request starts',{timeout:10000},async t=>{
@@ -56,7 +56,7 @@ test('an already submitted campaign finishes before either external request star
   const second=f.scheduler.runExternalSubmission(async()=>{events.push('alert:start');return 'alert';});
   await turn();assert.deepEqual(events,['campaign:start']);assert.equal(f.scheduler.busy,true);
   campaignReleased.resolve();await Promise.all([round,first,second]);
-  assert.deepEqual(events,['campaign:start','campaign:finish','search:start','alert:start']);assert.equal(f.scheduler.submissionHolds,0);assert.equal(f.store.listJobs({status:'confirmed'}).length,1);
+  assert.deepEqual(events,['campaign:start','campaign:finish','search:start','alert:start']);assert.equal(f.scheduler.submissionHolds,0);assert.equal(f.store.listJobs({status:'accepted'}).length,1);
 });
 
 test('a failed external callback releases its hold and does not poison subsequent requests or campaigns',{timeout:10000},async t=>{
@@ -66,7 +66,7 @@ test('a failed external callback releases its hold and does not poison subsequen
   const rejection=assert.rejects(first,/Falha antes da submissão/);
   const second=f.scheduler.runExternalSubmission(async()=>{events.push('next');return 'ok';});
   await rejection;assert.equal(await second,'ok');assert.deepEqual(events,['failed','next']);assert.equal(f.scheduler.submissionHolds,0);
-  await f.scheduler.tick();assert.equal(f.store.listJobs({status:'confirmed'}).length,1);
+  await f.scheduler.tick();assert.equal(f.store.listJobs({status:'accepted'}).length,1);
 });
 
 test('shutdown waits for the running request and explicitly rejects queued work without removing its durable ledger',{timeout:10000},async t=>{

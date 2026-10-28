@@ -1,5 +1,5 @@
 const {createHash}=require('node:crypto');
-const CONFIG_FIELDS=['name','mode','intervalMinutes','spacingSeconds','schedule','dailyRoundLimit','dailySendLimit','groupIds','items','groupOverrides','ownerId','responsibleUserIds','alertRecipientIds','retryPolicy'];
+const CONFIG_FIELDS=['name','mode','intervalMinutes','spacingSeconds','schedule','dailyRoundLimit','dailySendLimit','groupIds','items','groupOverrides','ownerId','responsibleUserIds','alertRecipientIds','retryPolicy','messageSpacingSeconds','sendTimeoutSeconds','maxRounds','endAt','sourceGroupId','sourceDateKey','sourceManaged','sourceTimezone'];
 function canonical(value){
   if(Array.isArray(value))return value.map(canonical);
   if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])]));

@@ -138,7 +138,7 @@ test('desconexão libera envio pendente como incerto sem aguardar um transporte 
   assert.equal(f.adapter.pendingAcks.size, 0);
 });
 
-test('tempo de submissão encerra transporte travado e registra resultado incerto sem retentativa', async t => {
+test('tempo de submissão libera resultado incerto sem encerrar outros destinos e reconcilia ACK tardio', async t => {
   const f = await fixture(t, { submissionTimeoutMs: 20 });
   const previous = f.socket;
   let ended = 0;
@@ -146,14 +146,16 @@ test('tempo de submissão encerra transporte travado e registra resultado incert
   f.setSendBehavior(() => new Promise(() => {}));
   assert.deepEqual(await f.adapter.send('a@g.us', { type: 'text', text: 'Teste', clientMessageId: 'submission-timeout' }),
     { status: 'uncertain', messageId: 'submission-timeout' });
-  assert.equal(ended, 1);
-  assert.equal(f.adapter.status.state, 'disconnected');
-  assert.equal(f.adapter.socket, null);
+  assert.equal(ended, 0);
+  assert.equal(f.adapter.status.state, 'connected');
+  assert.equal(f.adapter.socket, previous);
   assert.equal(f.adapter.pendingAcks.size, 0);
   let receipts = 0;
   f.adapter.on('receipt', () => { receipts++; });
   previous.ws.emit('CB:ack,class:message', { attrs: { id: 'submission-timeout' } });
-  assert.equal(receipts, 0, 'an ended generation cannot change the recorded outcome');
+  previous.ws.emit('CB:ack,class:message', { attrs: { id: 'submission-timeout' } });
+  assert.equal(receipts, 1, 'late acceptance changes evidence once without a second send');
+  assert.equal((await f.adapter.reconcile('submission-timeout')).accepted, true);
 });
 
 test('reconectar cria outro transporte e preserva a sessão cifrada', async t => {

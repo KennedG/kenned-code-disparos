@@ -1,6 +1,6 @@
 {
   "name": "kenned-code-disparos",
-  "version": "2.3.3",
+  "version": "2.3.2",
   "description": "Kenned Code Disparos: campanhas autorizadas e buscas de ofertas pelo WhatsApp",
   "main": "src/main.cjs",
   "author": "Kenned Code Disparos",
@@ -50,7 +50,7 @@
       ],
       "icon": "assets/icon.ico",
       "signExecutable": false,
-      "artifactName": "Kenned-Code-Disparos-Setup-${version}-${arch}.${ext}"
+      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Origem-${arch}.exe"
     },
     "nsis": {
       "script": "scripts/installer.nsi",
@@ -71,5 +71,6 @@
       "pt-BR",
       "en-US"
     ]
-  }
+  },
+  "releaseRevision": "origem-r1"
 }

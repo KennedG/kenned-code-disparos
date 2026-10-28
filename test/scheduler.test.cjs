@@ -77,7 +77,7 @@ test('creating a campaign never activates it; 15 authorized destinations preserv
   assert.equal(f.calls[1].item.caption, 'Legenda');
   assert.equal(new Set(f.store.listJobs().map(j => j.id)).size, 45);
   assert.equal(new Set(f.store.listJobs().map(j => j.messageId)).size, 45);
-  assert(f.store.listJobs().every(j => j.status === 'confirmed'));
+  assert(f.store.listJobs().every(j => j.status === 'accepted'));
   assert.equal(f.store.getCampaign('c1').nextRunAt, at(5, 9, 10));
 });
 
@@ -156,7 +156,7 @@ test('pause cancels pending destinations, allows the in-flight result to settle,
   await f.scheduler.pause('c1');
   assert.equal(f.store.listJobs({ status: 'cancelled' }).length, 1);
   release(); await run;
-  assert.equal(f.calls.length, 1); assert.equal(f.store.listJobs({ status: 'confirmed' }).length, 1);
+  assert.equal(f.calls.length, 1); assert.equal(f.store.listJobs({ status: 'accepted' }).length, 1);
   f.adapter.send = async (groupId, item) => { f.calls.push({ groupId, item }); return { status: 'confirmed', messageId: item.clientMessageId }; };
   await f.scheduler.resume('c1'); await f.scheduler.tick();
   assert.deepEqual(f.calls.map(c => c.groupId), ['g1', 'g2']);
@@ -207,7 +207,7 @@ test('a persistence failure after transport settlement blocks all later submissi
   const update = f.store.updateJob.bind(f.store);
   let failed = false;
   f.store.updateJob = (id, patch) => {
-    if (patch.status === 'confirmed' && !failed) { failed = true; throw new Error('disk write failure'); }
+    if (patch.status === 'accepted' && !failed) { failed = true; throw new Error('disk write failure'); }
     return update(id, patch);
   };
   await f.scheduler.activate('c1'); await f.scheduler.tick();
@@ -290,7 +290,7 @@ test('waitForIdle settles the in-flight result before callers replace persistent
   await Promise.resolve(); assert.equal(idle, false);
   release(); await run; await waiting;
   assert.equal(idle, true);
-  assert.equal(f.store.listJobs({ status: 'confirmed' }).length, 1);
+  assert.equal(f.store.listJobs({ status: 'accepted' }).length, 1);
   assert.equal(f.store.listJobs({ status: 'cancelled' }).length, 1);
   assert.equal(f.scheduler.busy, false);
 });
@@ -306,22 +306,22 @@ test('disconnection pauses active campaigns and prevents pending sends or discon
   await assert.rejects(f.scheduler.resume('c1'), /Conecte/);
 });
 
-test('uncertain outcomes pause immediately and are never retried; late server receipt reconciles', async () => {
-  const f = fixture({ sender: ({ item }) => ({ status: 'uncertain', messageId: item.clientMessageId }) });
+test('uncertain outcome does not block other destinations and is not repeated; late server receipt reconciles', async () => {
+  const f = fixture({ sender: ({ groupId, item }) => ({ status: groupId === 'g1' ? 'uncertain' : 'confirmed', messageId: item.clientMessageId }) });
   await f.scheduler.activate('c1'); await f.scheduler.tick();
-  assert.equal(f.calls.length, 1); assert.equal(f.store.getCampaign('c1').state, 'paused');
-  f.clock.value += 3600000; await f.scheduler.tick(); assert.equal(f.calls.length, 1);
-  await assert.rejects(f.scheduler.resume('c1'), /resultado incerto/);
+  assert.equal(f.calls.length, 2); assert.equal(f.store.getCampaign('c1').state, 'active');
+  f.clock.value += 3600000; await f.scheduler.tick(); assert.equal(f.calls.length, 3);
+  assert.equal(f.calls.filter(call => call.groupId === 'g1').length, 1);
   const uncertain = f.store.listJobs({ status: 'uncertain' })[0];
   f.adapter.emit('receipt', { status: 'confirmed', messageId: uncertain.messageId });
-  assert.equal(f.store.getJob(uncertain.id).status, 'confirmed');
-  assert.equal(f.store.getCampaign('c1').state, 'paused');
+  assert.equal(f.store.getJob(uncertain.id).status, 'accepted');
+  assert.equal(f.store.getCampaign('c1').state, 'active');
 });
 
 test('ambiguous exceptions have one attempt and do not expose adapter secrets in history', async () => {
   const f = fixture({ sender: () => { throw new Error('session secret PRIVATE_KEY'); } });
   await f.scheduler.activate('c1'); await f.scheduler.tick();
-  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls.length, 2);
   const job = f.store.listJobs({ status: 'uncertain' })[0];
   assert.equal(job.attempts, 1); assert(!job.error.includes('PRIVATE_KEY'));
 });
@@ -332,11 +332,12 @@ test('only definitive pre-submission failures get bounded retries using the same
     return { status: 'confirmed', messageId: item.clientMessageId };
   } });
   await f.scheduler.activate('c1'); await f.scheduler.tick();
-  assert.deepEqual(f.calls.map(c => c.groupId), ['g1', 'g1', 'g1']);
+  assert.deepEqual(f.calls.map(c => c.groupId), ['g1', 'g1', 'g1', 'g2']);
   assert.equal(new Set(f.calls.slice(0, 3).map(c => c.item.clientMessageId)).size, 1);
   assert.equal(f.store.listJobs({ status: 'failed' })[0].attempts, 3);
-  assert.equal(f.store.listJobs({ status: 'confirmed' }).length, 0);
-  assert.equal(f.store.getCampaign('c1').state, 'stopped', 'Exhausted safe retries now stop the campaign and cancel remaining destinations');
+  assert.equal(f.store.listJobs({ status: 'accepted' }).length, 1);
+  assert.equal(f.store.getCampaign('c1').state, 'active', 'Other eligible destinations remain active after a group exhausts retries');
+  assert.equal(f.store.getCampaign('c1').destinationHealth.g1.suspended, true);
   assert(f.sleeps.every(ms => ms >= 3000));
 });
 
@@ -444,7 +445,9 @@ test('restart marks in-flight work uncertain and stale queued work cancelled wit
   assert.equal(f.store.getJob('old-sending').status, 'uncertain');
   assert.equal(f.store.getJob('old-queued').status, 'cancelled');
   assert.equal(f.store.getCampaign('c1').state, 'paused');
-  await assert.rejects(restarted.resume('c1'), /resultado incerto/);
+  await restarted.resume('c1');
+  assert.equal(f.calls.length, 0, 'Resuming does not replay an uncertain or cancelled old task');
+  assert.equal(f.store.getCampaign('c1').state, 'active');
 });
 
 test('activation rejects unauthorized, mixed integration groups, invalid limits, duplicate destinations and missing media', async () => {
@@ -468,27 +471,28 @@ test('summary includes content, authorized groups, frequency, individual setting
   for (const expected of ['Olá 😊', 'Grupo g1', '10 min', '3 s', 'Estimativa máxima:', '20 min', 'sem suspensão']) assert(summary.includes(expected), expected);
 });
 
-test('campaign retry policy controls attempts and delay; exhausted failures emit one durable incident', async () => {
+test('campaign retry policy controls attempts and delay; exhausted failures emit one durable incident per destination', async () => {
   const f = fixture({ changes: { retryPolicy: { maxAttempts: 2, delaySeconds: 8 }, ownerId: 'owner-1' }, sender: () => { throw Object.assign(new Error('SECRET_TOKEN'), { safeToRetry: true, code: 'WA_TEMPORARY' }); } });
   const incidents = [], diagnostics = [];
   f.store.addDiagnostic = value => { diagnostics.push(copy(value)); return value; };
-  f.scheduler.on('incident', value => { assert.equal(f.store.getCampaign('c1').lastError.id, value.id); incidents.push(copy(value)); });
+  f.scheduler.on('destinationFailure', value => { assert.equal(f.store.getCampaign('c1').destinationHealth[value.groupId].suspended, true); assert.equal(f.store.getCampaign('c1').destinationHealth[value.groupId].code, value.code); incidents.push(copy(value)); });
   await f.scheduler.activate('c1'); await f.scheduler.tick(); await f.scheduler.tick();
-  assert.equal(f.calls.length, 2); assert.deepEqual(f.sleeps, [8000]);
-  assert.equal(f.store.getCampaign('c1').state, 'stopped');
-  assert.equal(f.store.listJobs({ status: 'cancelled' }).length, 1);
-  assert.equal(incidents.length, 1); assert.equal(incidents[0].kind, 'fatal');
-  assert.equal(incidents[0].code, 'WA_TEMPORARY'); assert.equal(incidents[0].pending, 1);
-  assert.equal(diagnostics.length, 2); assert.equal(diagnostics[1].attempts, 2);
+  assert.equal(f.calls.length, 4); assert.deepEqual(f.sleeps, [8000, 3000, 8000]);
+  assert.equal(f.store.getCampaign('c1').state, 'paused', 'All destinations exhausted; no tasks remain eligible');
+  assert.equal(f.store.listJobs({ status: 'failed' }).length, 2);
+  assert.equal(incidents.length, 2); assert.deepEqual(incidents.map(x => x.groupId), ['g1', 'g2']);
+  assert.equal(incidents[0].code, 'WA_TEMPORARY');
+  assert.equal(diagnostics.length, 4); assert.equal(diagnostics[1].attempts, 2);
   assert(!JSON.stringify({ incidents, diagnostics }).includes('SECRET_TOKEN'));
 });
 
-test('a known definitive nonretryable error stops once; an ambiguous error remains uncertain', async () => {
+test('a known definitive nonretryable item error is recorded once per task and does not abort unrelated tasks', async () => {
   const f = fixture({ sender: () => { throw Object.assign(new Error('invalid media'), { safeToRetry: false, definitive: true, code: 'WA_VALIDATION' }); } });
   const incidents = []; f.scheduler.on('incident', x => incidents.push(x));
   await f.scheduler.activate('c1'); await f.scheduler.tick();
-  assert.equal(f.calls.length, 1); assert.equal(f.store.listJobs({ status: 'failed' }).length, 1);
-  assert.equal(f.store.getCampaign('c1').state, 'stopped'); assert.equal(incidents[0].code, 'WA_VALIDATION');
+  assert.equal(f.calls.length, 2); assert.equal(f.store.listJobs({ status: 'failed' }).length, 2);
+  assert.equal(f.store.getCampaign('c1').state, 'active'); assert.equal(incidents.length, 0);
+  assert(f.store.listJobs().every(job => job.attempts === 1));
 });
 
 test('a temporary failure which succeeds within the configured policy preserves campaign progression', async () => {
@@ -499,7 +503,7 @@ test('a temporary failure which succeeds within the configured policy preserves 
   const incidents = []; f.scheduler.on('incident', x => incidents.push(x));
   await f.scheduler.activate('c1'); await f.scheduler.tick();
   assert.deepEqual(f.calls.map(x => x.groupId), ['g1', 'g1', 'g2']);
-  assert.equal(f.store.listJobs({ status: 'confirmed' }).length, 2); assert.equal(incidents.length, 0);
+  assert.equal(f.store.listJobs({ status: 'accepted' }).length, 2); assert.equal(incidents.length, 0);
 });
 
 test('idempotent timer startup and a private-alert submission hold cannot duplicate campaign work', async () => {
