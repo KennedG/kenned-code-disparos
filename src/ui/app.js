@@ -170,9 +170,15 @@
     if(!force&&state.page==='sources'&&sourceUI.shouldPreserveDOM())return;
     if(!force&&state.page==='opportunities'&&opportunityUI.shouldPreserveDOM())return;
     if (!force && state.page==='buscas' && buscasUI.shouldPreserveDOM()) {buscasUI.updateStatus();return;}
+    if(!force && document.activeElement?.closest?.('#main form'))return;
     const focused=document.activeElement?.id;
     const selection=focused==='page-search'?document.activeElement.selectionStart:null;
-    $('#main').innerHTML = renderers[state.page]();
+    const main = $('#main');
+    const disclosureKey=node=>node.id||node.getAttribute('data-override-card')||node.querySelector(':scope > summary')?.textContent.trim()||'';
+    const disclosures=new Map();for(const node of main.querySelectorAll('details')){const key=disclosureKey(node);if(!disclosures.has(key))disclosures.set(key,[]);disclosures.get(key).push(node.open);}
+    const scrollTop=main.scrollTop,samePage=main.dataset.renderedPage===state.page;
+    main.innerHTML=renderers[state.page]();main.dataset.renderedPage=state.page;
+    if(samePage){for(const node of main.querySelectorAll('details')){const saved=disclosures.get(disclosureKey(node));if(saved?.length)node.open=saved.shift();}main.scrollTop=scrollTop;}
     if(state.page==='settings'&&!can('settings.edit'))for(const el of $$('input,textarea,select,[type=submit]',$('#settings-form')))el.disabled=true;
     if(focused==='page-search' && $('#page-search')){$('#page-search').focus();$('#page-search').setSelectionRange(selection,selection);}
   }
@@ -595,8 +601,8 @@
     if(action.startsWith('vitrine-'))return vitrineUI?.onAction(action,el);
     switch(action) {
       case 'open-support':await call('openSupport');break;
-      case 'toggle-sidebar':state.sidebarCollapsed=!state.sidebarCollapsed;if(state.sidebarCollapsed)state.moreTools=false;try{localStorage.setItem('kenned.sidebarCollapsed',String(state.sidebarCollapsed));}catch{}render(true);break;
-      case 'toggle-more-tools':if(licenseOnly())break;state.moreTools=!state.moreTools;render(true);break;
+      case 'toggle-sidebar':state.sidebarCollapsed=!state.sidebarCollapsed;if(state.sidebarCollapsed)state.moreTools=false;try{localStorage.setItem('kenned.sidebarCollapsed',String(state.sidebarCollapsed));}catch{}render();break;
+      case 'toggle-more-tools':if(licenseOnly())break;state.moreTools=!state.moreTools;render();break;
       case 'auth-recovery': state.authScreen='recovery';state.authKey=null;render();break;
       case 'auth-login': state.authScreen='login';state.authKey=null;render();break;
       case 'logout': await call('logout');closeModal();buscasUI.reset();libraryUI.reset();remindersUI.reset();contactIntakeUI.reset();sourceUI.reset();opportunityUI.reset();vitrineUI?.reset();state.moreTools=false;state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.authScreen=null;state.settingsDirty=false;state.page='dashboard';await refresh();break;

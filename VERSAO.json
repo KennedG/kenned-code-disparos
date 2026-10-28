@@ -1,8 +1,8 @@
 {
-  "tag": "v2.3.2-r8",
-  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Privado-R8-x64.exe",
-  "installerSha256": "1a39762b9e6e64d327293314f1fdbead888933ce56e9ee698119415921009213",
+  "tag": "v2.3.2-r9",
+  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Interface-R9-x64.exe",
+  "installerSha256": "e82d56c6e787eebff6b0880f8e1fd37a87a74f243e9dfbd2a13879d2683212d2",
   "sourceRecoveredFromInstaller": false,
-  "packagedSourceFilesAudited": 123,
-  "latestRecommended": false
+  "packagedSourceFilesAudited": 124,
+  "latestRecommended": true
 }
