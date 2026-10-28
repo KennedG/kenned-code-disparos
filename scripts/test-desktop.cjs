@@ -38,15 +38,15 @@ async function desktopHarness({locked=true,argv=[],settings={},dataOverride=true
     constructor(){state.sound=this;}
     handle(payload,prefs){state.lastSound={payload,prefs};return {soundStatus:'disabled'};}
     async test(prefs){state.testPrefs=prefs;return {soundStatus:prefs.volume===0?'silent':'completed'};}
-    mute(id){state.muted=id;}shutdown(){state.soundStopped=true;}
+    mute(id){state.muted=id;}muteAll(){state.allSoundsMuted=true;}shutdown(){state.soundStopped=true;}
   }
   class TestNotification extends EventEmitter {
     constructor(options){super();this.options=options;state.notifications.push(this);}static isSupported(){return state.nativeSupported;}show(){this.requested=true;}
   }
   const powerMonitor=new EventEmitter();
-  const electron={app,BrowserWindow:Window,ipcMain:{handle:(name,fn)=>state.handlers.set(name,fn),on:(name,fn)=>state.listeners.set(name,fn)},dialog:{showMessageBox:async(_,payload)=>{state.dialogs.push(payload);return {response:state.dialogResponse??2};},showOpenDialog:async()=>({canceled:true}),showSaveDialog:async()=>({canceled:true}),showErrorBox:(_,message)=>{state.startupError=message;}},Tray:class extends EventEmitter{constructor(){super();state.tray=this;}setToolTip(value){state.trayTooltip=value;}setContextMenu(menu){this.menu=menu;}destroy(){this.destroyed=true;}},Menu:{buildFromTemplate:value=>value,setApplicationMenu(){}},nativeImage:{createFromPath:()=>({})},shell:{openPath:async()=>''},powerMonitor,safeStorage:{isEncryptionAvailable:()=>true,encryptString:value=>Buffer.from(value),decryptString:buffer=>buffer.toString()},protocol:{registerSchemesAsPrivileged(value){state.schemes=value;},handle:(name,fn)=>state.protocols.set(name,fn)},net:{isOnline:()=>state.online,fetch:async url=>({url})},Notification:TestNotification};
+  const electron={app,BrowserWindow:Window,ipcMain:{handle:(name,fn)=>state.handlers.set(name,fn),on:(name,fn)=>state.listeners.set(name,fn)},dialog:{showMessageBox:async(_,payload)=>{state.dialogs.push(payload);return {response:state.dialogResponse??2};},showOpenDialog:async()=>({canceled:true}),showSaveDialog:async()=>({canceled:true}),showErrorBox:(_,message)=>{state.startupError=message;}},Tray:class extends EventEmitter{constructor(){super();state.tray=this;}setToolTip(value){state.trayTooltip=value;}setContextMenu(menu){this.menu=menu;}destroy(){this.destroyed=true;}},Menu:{buildFromTemplate:value=>value,setApplicationMenu(){}},nativeImage:{createFromPath:()=>({})},shell:{openPath:async()=>'',openExternal:async url=>{state.openedExternal=url;}},powerMonitor,safeStorage:{isEncryptionAvailable:()=>true,encryptString:value=>Buffer.from(value),decryptString:buffer=>buffer.toString()},protocol:{registerSchemesAsPrivileged(value){state.schemes=value;},handle:(name,fn)=>state.protocols.set(name,fn)},net:{isOnline:()=>state.online,fetch:async url=>({url})},Notification:TestNotification};
   const filename=path.resolve(__dirname,'../src/main.cjs'),baseRequire=createRequire(filename);
-  const localRequire=name=>name==='electron'?electron:name==='node:worker_threads'?{Worker:class{constructor(filename,options){state.workers++;state.workerData=plain(options.workerData);}}}:name==='./core/worker-client.cjs'?{WorkerClient:Client}:name==='./core/sound.cjs'?{SoundController}:name==='./core/license-client.cjs'?{LicenseClient:class extends EventEmitter{getStatus(){return {allowed:true,status:'active',plan:'monthly',remainingMs:86400000,offlineRemainingMs:86400000};}async initialize(){return this.getStatus();}async tick(){return this.getStatus();}async shutdown(){}}}:name==='./core/license-host.cjs'?{LicenseIdentityHost:class{}}:baseRequire(name);
+  const localRequire=name=>name==='electron'?electron:name==='node:worker_threads'?{Worker:class{constructor(filename,options){state.workers++;state.workerData=plain(options.workerData);}}}:name==='./core/worker-client.cjs'?{WorkerClient:Client}:name==='./core/sound.cjs'?{SoundController}:name==='./core/license-client.cjs'?{LicenseClient:class extends EventEmitter{constructor(){super();state.licensing=this;}getStatus(){return state.licenseStatus||{allowed:true,status:'active',plan:'monthly',remainingMs:86400000,offlineRemainingMs:86400000};}async initialize(){return this.getStatus();}async tick(){return this.getStatus();}async shutdown(){}}}:name==='./core/license-host.cjs'?{LicenseIdentityHost:class{}}:baseRequire(name);
   const intervals=[];
   vm.runInNewContext(fs.readFileSync(filename,'utf8'),{require:localRequire,__dirname:path.dirname(filename),process:{env:dataOverride?{MEGA_DATA_DIR:dir}:{},platform:'win32',argv,execPath:'C:\\Kenned Code Disparos.exe'},setTimeout,clearTimeout,setInterval:(fn,delay)=>{const timer={fn,delay,unref(){}};intervals.push(timer);return timer;},clearInterval:timer=>{if(timer)timer.cleared=true;},Response,URL,Promise,Buffer,Date},{filename});
   if(locked)await eventually(()=>state.windows.length===2||state.startupError);
@@ -149,6 +149,16 @@ async function testActualAudioRenderer(){
   await state.play({id:'missing-file',sound:'custom',volume:0.5});assert.deepEqual(state.ended.at(-1),{id:'missing-file',success:false});
 }
 
+async function testExpiryAndExplicitSupport(){
+ const h=await desktopHarness();try{
+   assert.equal(h.state.openedExternal,undefined,'Nenhum contato abre automaticamente.');
+   await h.state.host('openSupport',{url:'https://invalid.example'});assert.equal(h.state.openedExternal,'https://wa.me/5562994033173','Contato fixo; parâmetros não alteram o destino.');
+   h.state.licenseStatus={allowed:false,status:'expired',reasonCode:'LICENSE_EXPIRED'};h.state.licensing.emit('change',h.state.licenseStatus);assert.equal(h.state.allSoundsMuted,true);
+   const result=await h.state.host('localAlert',{id:'after-expiry',event:'critical'});assert.equal(result.nativeStatus,'suppressed');assert.equal(result.soundStatus,'disabled');assert.equal(h.state.notifications.length,0);
+   const audio=await h.state.protocols.get('mega-audio')({url:'mega-audio://asset/expired'});assert.equal(audio.status,403);
+   h.state.licenseStatus={allowed:true,status:'offline',reasonCode:'LICENSE_NETWORK'};assert.equal((await h.state.host('localAlert',{id:'valid-grace',event:'critical'})).nativeStatus,'requested');
+ }finally{await h.close();}
+}
 function testOwnershipManifest(){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-owned-test-'));
   try{
@@ -163,4 +173,4 @@ function testOwnershipManifest(){
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 }
 
-(async()=>{testOwnershipManifest();await testSingleInstanceAndIpcBoundary();await testNativeNotificationAcknowledgement();await testLifecycleAndNetwork();await testBrandingAndLegacyProfile();await testActualAudioRenderer();console.log('Desktop: 6 fluxos passaram (instância/IPC/bandeja, retorno das notificações, suspensão/rede/encerramento, manifesto, nova identidade com perfil legado preservado e renderizador real de áudio com ganho/volume). Facade nativa; exibição e áudio físicos no Windows não verificados.');})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{testOwnershipManifest();await testSingleInstanceAndIpcBoundary();await testNativeNotificationAcknowledgement();await testLifecycleAndNetwork();await testBrandingAndLegacyProfile();await testActualAudioRenderer();await testExpiryAndExplicitSupport();console.log('Desktop: 7 fluxos passaram (instância/IPC/bandeja, notificações, suspensão/rede, manifesto, identidade/perfil preservados, áudio/volume, vencimento e contato explícito com o desenvolvedor). Fachada nativa; exibição e áudio físicos no Windows não verificados.');})().catch(error=>{console.error(error);process.exitCode=1;});

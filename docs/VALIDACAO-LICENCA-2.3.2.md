@@ -2,13 +2,15 @@
 
 Este documento distingue implementação, teste automatizado, teste contra serviço publicado e execução física no Windows. Resultados só devem ser marcados como aprovados depois de executar o cenário correspondente. O licenciamento não comprova recebimento de mensagens pelo WhatsApp.
 
+**Política atual reformulado-r1:** após vencimento confirmado, somente licença e contato com o desenvolvedor ficam disponíveis. Os resultados históricos descritos abaixo são da implementação anterior do mecanismo; não comprovam por si sós o bloqueio total de consulta/exportação introduzido nesta revisão. A validação dessa regra consta no relatório final da entrega reformulada.
+
 ## Matriz de riscos e verificações
 
 | Cenário | Evidência necessária |
 |---|---|
 | Primeiro registro, sem chave | Horário do servidor e vencimento exatamente 72 horas depois; nenhum pedido de aprovação. |
 | Reinstalação / perfil local apagado | Mesmo equipamento retorna o teste original ou bloqueia identidade inconsistente; não recebe mais 72 horas. |
-| Expiração | Novo envio e nova automação bloqueados no backend e no último ponto antes do envio; dados/exportação preservados. |
+| Expiração | Vencimento confirmado bloqueia envios, automações, consulta, exportação e ferramentas; somente licença e contato com desenvolvedor ficam disponíveis. Dados permanecem armazenados e TV mostra estado neutro. |
 | Licença mensal/anual | Plano do cadastro oficial, começo na primeira ativação e vencimento de calendário; comprovante verificado. |
 | Mês curto / ano bissexto | Resultados conhecidos para 31/01, 31/03 e 29/02, com calendário de Brasília, horário preservado e último dia válido. |
 | Concorrência | Dois dispositivos ou dois pedidos da mesma chave não consomem nem acrescentam o prazo duas vezes. |

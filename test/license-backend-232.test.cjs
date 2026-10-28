@@ -47,7 +47,7 @@ test('expiration stops campaign and reminders, renewal never resumes them automa
   const owner=f.service.snapshot().auth.user;
   const reminder=await f.service.call('saveReminder',{title:'Lembrete persistente',time:'23:59',repeat:'daily',recipientId:`user:${owner.id}`,enabled:true});assert.equal(reminder.state,'active');
   f.license.set({...expired,expiresAt:Date.now()-1});await f.service.systemCall('licenseChanged');
-  let state=f.service.snapshot();assert.equal(state.license.autoResumeRequired,true);assert.equal(state.automation.stopped,true);assert.equal(state.campaigns[0].state,'stopped');assert.equal(state.reminders.items[0].state,'paused');
+  let state=f.service.snapshot();assert.equal(state.license.autoResumeRequired,true);assert.equal(state.licenseOnly,true);assert.equal(state.campaigns,undefined);assert.equal(state.reminders,undefined);const saved=await createStore(f.dir);try{assert.equal(saved.getSetting('automationState').stopped,true);assert.equal(saved.getCampaign(first.id).state,'stopped');assert.equal(saved.getEntity('reminders',reminder.id).state,'paused');}finally{saved.close();}
   await assert.rejects(f.service.call('activateReminder',{id:reminder.id}),error=>error.code==='LICENSE_EXPIRED');
   await assert.rejects(f.service.call('testAlert'),error=>error.code==='LICENSE_EXPIRED');
   await f.service.call('licenseActivate',{key:'ISOLATED-FIXTURE-KEY'});
@@ -58,18 +58,22 @@ test('expiration stops campaign and reminders, renewal never resumes them automa
   const latest=state.campaigns[0];await f.service.call('activateCampaign',{id:latest.id,configRevision:latest.configRevision});assert.equal(f.service.snapshot().campaigns[0].state,'active');
 });
 
-test('expired licence preserves contact, template, captured offers and allows permission-checked Excel and complete backup export',async t=>{
+test('confirmed expiration preserves all data but blocks readonly, Excel and backup until renewal',async t=>{
   const f=await fixture(t);await setup(f);await enableSearch(f);
   const contact=await f.service.call('saveContact',{name:'Cadastro preservado',phone:'5562999990003'});
   const model=await f.service.call('saveTemplate',{name:'Modelo salvo',items:[{type:'text',text:'Descrição salva com emoji 📱'}]});
   await f.service.call('testSearchSimulation',{kind:'offer',messageId:'ORIGINAL-PRESERVED',senderNumber:'5562999991111',supplierName:'Fornecedor declarado',groupId:'sim-01@simulation',text:'iPhone 15 Pro Max 256GB Azul seminovo R$ 3.850,00',timestamp:Date.now()-60000});
   const result=await f.service.call('runSearch',{query:'iPhone 15 Pro Max 256GB'});assert.equal(result.results.length,1);
   f.license.set({...expired,expiresAt:Date.now()-1});await f.service.systemCall('licenseChanged');
-  const state=f.service.snapshot();assert.ok(state.contacts.some(item=>item.id===contact.id));assert.ok(state.templates.some(item=>item.id===model.id));assert.equal((await f.service.call('searchOffers',{limit:20})).total,1);
-  await assert.rejects(f.service.call('runSearch',{query:'iPhone 15 Pro Max',deliver:true}),error=>error.code==='LICENSE_EXPIRED');
-  const workbook=path.join(f.dir,'user-export.xlsx');f.saveTo(workbook);const exported=await f.service.call('searchExportExcel',{runId:result.runId,selection:'all'});assert.equal(exported.saved,true);assert.ok(fs.statSync(workbook).size>1000);
-  const backup=path.join(f.dir,'user-backup.mega.json');f.saveTo(backup);await f.service.call('backup');assert.ok(fs.statSync(backup).size>100);
-  const value=JSON.parse(fs.readFileSync(backup,'utf8'));assert.equal(JSON.stringify(value).includes('Cadastro preservado'),true);assert.equal(JSON.stringify(value).includes('Modelo salvo'),true);
+  const state=f.service.snapshot();assert.equal(state.licenseOnly,true);assert.equal(state.contacts,undefined);assert.equal(state.templates,undefined);
+  await assert.rejects(f.service.call('searchOffers',{limit:20}),{code:'LICENSE_EXPIRED'});
+  await assert.rejects(f.service.call('runSearch',{query:'iPhone 15 Pro Max',deliver:true}),{code:'LICENSE_EXPIRED'});
+  const workbook=path.join(f.dir,'user-export.xlsx');f.saveTo(workbook);await assert.rejects(f.service.call('searchExportExcel',{runId:result.runId,selection:'all'}),{code:'LICENSE_EXPIRED'});assert.equal(fs.existsSync(workbook),false);
+  const backup=path.join(f.dir,'user-backup.mega.json');f.saveTo(backup);await assert.rejects(f.service.call('backup'),{code:'LICENSE_EXPIRED'});assert.equal(fs.existsSync(backup),false);
+  await f.service.call('licenseActivate',{key:'ISOLATED-FIXTURE-KEY'});
+  const renewed=f.service.snapshot();assert.ok(renewed.contacts.some(item=>item.id===contact.id));assert.ok(renewed.templates.some(item=>item.id===model.id));assert.equal((await f.service.call('searchOffers',{limit:20})).total,1);
+  f.saveTo(workbook);const exported=await f.service.call('searchExportExcel',{runId:result.runId,selection:'all'});assert.equal(exported.saved,true);assert.ok(fs.statSync(workbook).size>1000);
+  f.saveTo(backup);await f.service.call('backup');assert.ok(fs.statSync(backup).size>100);const value=JSON.parse(fs.readFileSync(backup,'utf8'));assert.equal(JSON.stringify(value).includes('Cadastro preservado'),true);assert.equal(JSON.stringify(value).includes('Modelo salvo'),true);
   await f.service.call('logout');await assert.rejects(f.service.call('backup'),/login/i);await assert.rejects(f.service.call('searchExportExcel',{runId:result.runId,selection:'all'}),/login/i);
 });
 

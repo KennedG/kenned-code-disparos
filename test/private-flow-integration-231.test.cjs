@@ -296,7 +296,7 @@ test('deactivated user linked to a responsible is excluded consistently from ale
 });
 
 
-test('licence expiration at the actual adapter submission boundary blocks private alert while authorised control replies remain available', async t => {
+test('confirmed licence expiration at actual adapter boundary blocks alert, private controls and readonly until renewal', async t => {
   const f = await fixture(t);
   const recipient = await f.service.call('saveAlertRecipient', { name: 'Destinatário isolado', phone: PERSONAL });
   let prepared = false;
@@ -306,25 +306,28 @@ test('licence expiration at the actual adapter submission boundary blocks privat
     f.license.set({ allowed: false, status: 'expired', reasonCode: 'LICENSE_EXPIRED', reason: 'A licença venceu durante a resolução do destinatário.', expiresAt: Date.now()-1 });
   };
   f.adapter.on('transportDiagnostic', expire);
-  const result = await f.service.call('testAlertRecipient', { id: recipient.id });
-  f.adapter.off('transportDiagnostic', expire);
+  try { await assert.rejects(f.service.call('testAlertRecipient', { id: recipient.id }), { code: 'LICENSE_EXPIRED' }); }
+  finally { f.adapter.off('transportDiagnostic', expire); }
   assert.equal(prepared, true);
   assert.equal(f.submissions.length, 0, 'A licence check before socket.sendMessage must block the prepared message');
-  assert.ok(['failed','cancelled','uncertain'].includes(result.status));
-  assert.equal(f.service.snapshot().license.allowed, false);
+  assert.equal(f.service.snapshot().license.allowed, false); assert.equal(f.service.snapshot().licenseOnly, true); assert.equal(f.service.snapshot().automation, undefined);
+  await assert.rejects(f.diagnostics(), { code: 'LICENSE_EXPIRED' });
+  await assert.rejects(f.service.call('resumeAutomation'), { code: 'LICENSE_EXPIRED' });
+  f.emit('!mega ajuda'); await nextTurn(); await nextTurn(); await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(f.submissions.length, 0, 'Confirmed expiry also blocks an authorised private administrative reply');
+  await f.service.call('licenseActivate', { key: 'ISOLATED-PRIVATE-BOUNDARY-RENEWAL' });
   assert.equal(f.service.snapshot().automation.stopped, true);
-  const diagnostic = await f.diagnostics();
-  assert.ok(diagnostic.items.some(row => row.stage === 'license.blocked' && row.code === 'LICENSE_EXPIRED'));
-  const {reply} = await adminReply(f, '!mega ajuda');
-  assert.equal(reply.target, `${PERSONAL}@s.whatsapp.net`);
-  assert.match(reply.content.text, /!mega/);
-  await assert.rejects(f.service.call('resumeAutomation'), error => error.code === 'LICENSE_EXPIRED');
+  assert.ok(f.service.snapshot().alertRecipients.some(value => value.id === recipient.id));
+  const diagnostic = await f.diagnostics(); assert.ok(diagnostic.items.some(row => row.stage === 'license.blocked' && row.code === 'LICENSE_EXPIRED'));
+  const alerts = await f.service.call('alertsPage', { limit: 100 });
+  assert.ok(alerts.items.length > 0); assert.ok(alerts.items.every(value => !['accepted','delivered','confirmed'].includes(value.status)), 'The blocked alert must not be misreported as sent');
+  const { reply } = await adminReply(f, '!mega ajuda'); assert.equal(reply.target, `${PERSONAL}@s.whatsapp.net`); assert.match(reply.content.text, /!mega/);
 });
 
 
-test('expired-licence administrative reply scope cannot authorise an unrelated nested automatic submission', async t => {
+test('unconfirmed licensing outage reply scope cannot authorise an unrelated nested automatic submission', async t => {
   const f = await fixture(t);
-  f.license.set({ allowed:false, status:'expired', reasonCode:'LICENSE_EXPIRED', reason:'Licença expirada.', expiresAt:Date.now()-1 });
+  f.license.set({ allowed:false, status:'network_required', reasonCode:'LICENSE_CONNECTION_REQUIRED', reason:'Serviço temporariamente indisponível; sem confirmação de vencimento.' });
   await f.service.systemCall('licenseChanged');
   let nestedError = null;
   const nested = record => {
@@ -337,5 +340,7 @@ test('expired-licence administrative reply scope cannot authorise an unrelated n
   f.adapter.off('transportDiagnostic',nested);
   assert.equal(reply.target,`${PERSONAL}@s.whatsapp.net`);
   assert.equal(f.submissions.length,1);
-  assert.equal(nestedError?.code,'LICENSE_EXPIRED');
+  assert.equal(nestedError?.code,'LICENSE_CONNECTION_REQUIRED');
+  assert.equal(f.service.snapshot().license.totalBlocked,false);
+  assert.equal(f.service.snapshot().automation.stopped,true);
 });

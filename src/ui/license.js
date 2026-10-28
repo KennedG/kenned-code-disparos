@@ -10,6 +10,7 @@ window.KennedLicenseUI = {
     const state = { license: null, receivedAt: 0, busy: false, blocked: null, authenticatedId: null, refreshingClock: false, error: '', errorCode: '' };
     const live = () => state.license || ctx.data()?.license || {};
     const clock = () => performance.now();
+    const expired = () => live().totalBlocked === true || live().allowed === false && (live().status === 'expired' || ['LICENSE_EXPIRED','LICENSE_TRIAL_EXPIRED','TRIAL_EXPIRED'].includes(live().reasonCode));
     const remaining = () => Math.max(0, Number(live().remainingMs || 0) - Math.max(0, clock() - state.receivedAt));
     const duration = milliseconds => {
       const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
@@ -21,6 +22,7 @@ window.KennedLicenseUI = {
     const button = (action, text, style = '') => `<button type="button" class="button ${style}" data-action="license-${action}" ${state.busy ? 'disabled' : ''}>${e(text)}</button>`;
     function warning() {
       const license = live();
+      if (expired()) return 'Renove sua licença para continuar utilizando o Kenned Code Disparos. Seus dados estão preservados.';
       if (license.allowed === false) return license.reason || 'As operações de envio estão bloqueadas. Ative uma licença ou valide a conexão com o serviço.';
       if (license.status === 'offline' || license.reason && license.allowed === true) return `${license.reason || 'Sem contato com o serviço.'} Validação offline limitada a ${format(license.offlineUntil)} e ao vencimento.`;
       if (remaining() > 0 && remaining() <= (license.plan === 'trial' || license.status === 'trial' ? 86400000 : 3 * 86400000)) return 'Seu prazo está perto do fim. A renovação antecipada acrescenta o período ao vencimento atual.';
@@ -35,10 +37,10 @@ window.KennedLicenseUI = {
     }
     function preservation() {
       const stopped = ctx.data()?.automation?.stopped === true;
-      return `<p class="soft-text">Campanhas, contatos, mídias, modelos e históricos permanecem salvos quando o prazo termina. Configurações, consulta e exportação continuam disponíveis conforme suas permissões.</p>${live().autoResumeRequired || stopped ? `<div class="warning-note">Após ativar ou renovar, os envios permanecem pausados. Revise a programação e confirme a retomada do sistema e das campanhas que deseja usar.</div>${live().allowed === true && ctx.can('automation.control') ? button('resume', 'Revisar e retomar o sistema', 'primary') : ''}` : ''}<div class="settings-actions">${ctx.can('settings.edit') ? '<button type="button" class="button" data-action="backup">Exportar backup dos meus dados</button>' : ''}${ctx.can('history.export') ? '<button type="button" class="button ghost" data-action="export-history">Exportar históricos</button>' : ''}</div>`;
+      return `<p class="soft-text">Campanhas, contatos, mídias, modelos e históricos permanecem salvos quando o prazo termina. Após o vencimento confirmado, somente a aba Licença fica acessível até a renovação.</p>${live().autoResumeRequired || stopped ? `<div class="warning-note">Após ativar ou renovar, os envios permanecem pausados. Revise a programação e confirme a retomada do sistema e das campanhas que deseja usar.</div>${live().allowed === true && ctx.can('automation.control') ? button('resume', 'Revisar e retomar o sistema', 'primary') : ''}` : ''}<div class="settings-actions">${!expired() && ctx.can('settings.edit') ? '<button type="button" class="button" data-action="backup">Exportar backup dos meus dados</button>' : ''}${!expired() && ctx.can('history.export') ? '<button type="button" class="button ghost" data-action="export-history">Exportar históricos</button>' : ''}</div>`;
     }
     function renderPage() {
-      return `<section id="license-page"><div class="page-heading"><div><div class="eyebrow">ACESSO AO APLICATIVO</div><h1>Ativar licença</h1><p class="subtitle">Teste gratuito, ativação automática e renovação sem perder seus dados.</p></div></div><div class="license-layout"><section class="panel"><div class="panel-header"><h2>Sua licença</h2></div><div class="panel-body"><div data-license-page-facts>${facts()}</div><div data-license-page-warning>${warning() ? `<div class="warning-note">${e(warning())}</div>` : ''}</div><p class="soft-text">O prazo mensal ou anual começa na primeira ativação bem-sucedida. Repetir a mesma chave não acrescenta tempo. O teste restante não reduz o período pago.</p>${form()}</div></section><section class="panel"><div class="panel-header"><h2>Seus dados e a retomada</h2></div><div class="panel-body">${preservation()}<p class="field-hint">O horário de validade é controlado pelo serviço de licenciamento. A validação offline dura até 72 horas e nunca ultrapassa o vencimento.</p>${live().serverConfigured === false ? '<div class="warning-note">O endereço do serviço de licenciamento ainda não está configurado. Não é possível validar uma chave neste estado.</div>' : ''}</div></section></div></section>`;
+      return `<section id="license-page"><div class="page-heading"><div><div class="eyebrow">ACESSO AO APLICATIVO</div><h1>${expired() ? '🔒 Sua licença expirou' : 'Ativar licença'}</h1><p class="subtitle">${expired() ? 'Renove sua licença para continuar utilizando o Kenned Code Disparos. Seus dados estão preservados.' : 'Teste gratuito, ativação automática e renovação sem perder seus dados.'}</p></div></div><div class="license-layout"><section class="panel"><div class="panel-header"><h2>Sua licença</h2></div><div class="panel-body"><div data-license-page-facts>${facts()}</div><div data-license-page-warning>${warning() ? `<div class="warning-note">${e(warning())}</div>` : ''}</div><p class="soft-text">O prazo mensal ou anual começa na primeira ativação bem-sucedida. Repetir a mesma chave não acrescenta tempo. O teste restante não reduz o período pago.</p>${form()}</div></section><section class="panel"><div class="panel-header"><h2>Seus dados e a retomada</h2></div><div class="panel-body">${preservation()}<div class="license-support"><h3>Guilherme Kenned</h3><p>WhatsApp: (62) 99403-3173</p><button type="button" class="button primary" data-action="open-support" title="https://wa.me/5562994033173">Falar com o desenvolvedor</button><p class="field-hint">O WhatsApp abre somente quando você clicar. Nenhuma mensagem é enviada automaticamente.</p></div><p class="field-hint">O horário de validade é controlado pelo serviço de licenciamento. A validação offline dura até 72 horas e nunca ultrapassa o vencimento.</p>${live().serverConfigured === false ? '<div class="warning-note">O endereço do serviço de licenciamento ainda não está configurado. Não é possível validar uma chave neste estado.</div>' : ''}</div></section></div></section>`;
     }
     function renderPanel() {
       return `<section id="settings-license" class="panel"><div class="panel-header"><h2>Licença do aplicativo</h2>${button('open', 'Ativar ou renovar', 'primary')}</div><div class="panel-body">${facts()}${warning() ? `<div class="warning-note">${e(warning())}</div>` : ''}<p class="field-hint">Teste e ativações usam o horário do serviço. Renovar não reinicia automaticamente campanhas pausadas.</p></div></section>`;
@@ -55,7 +57,7 @@ window.KennedLicenseUI = {
     function updateChrome() {
       const license = live(), pill = $('#license-indicator'), banner = $('#license-banner');
       if (pill) { pill.hidden = !state.license; pill.classList.toggle('license-blocked', license.allowed === false); pill.innerHTML = `${e(labels[license.status] || 'Licença')} ${license.expiresAt ? `· <span data-license-remaining>${e(duration(remaining()))}</span>` : ''}`; pill.title = `Vencimento: ${format(license.expiresAt)}`; }
-      if (banner) { const message = warning(); banner.hidden = !message; banner.classList.toggle('license-blocked', license.allowed === false); banner.innerHTML = message ? `<div><strong>${license.allowed === false ? 'AUTOMAÇÕES BLOQUEADAS PELA LICENÇA' : 'Aviso de licença'}</strong><small>${e(message)}</small></div>${button('open', license.allowed === false ? 'Ativar licença' : 'Ver licença', 'small primary')}` : ''; }
+      if (banner) { const message = warning(); banner.hidden = !message; banner.classList.toggle('license-blocked', license.allowed === false); banner.innerHTML = message ? `<div><strong>${expired() ? 'LICENÇA EXPIRADA — ACESSO BLOQUEADO' : license.allowed === false ? 'AUTOMAÇÕES BLOQUEADAS PELA LICENÇA' : 'Aviso de licença'}</strong><small>${e(message)}</small></div>${button('open', license.allowed === false ? 'Ativar licença' : 'Ver licença', 'small primary')}` : ''; }
       const settingsPanel = $('#settings-license'); if (settingsPanel) settingsPanel.outerHTML = renderPanel();
       const pageFacts = $('[data-license-page-facts]'); if (pageFacts) pageFacts.innerHTML = facts();
       const pageWarning = $('[data-license-page-warning]'); if (pageWarning) pageWarning.innerHTML = warning() ? `<div class="warning-note">${e(warning())}</div>` : '';
@@ -68,7 +70,7 @@ window.KennedLicenseUI = {
     }
     function open() {
       state.error = ''; state.errorCode = '';
-      if (ctx.auth()?.authenticated) { ctx.navigate('license'); return; }
+      if (expired() || ctx.auth()?.authenticated) { ctx.navigate('license'); return; }
       ctx.showModal('license', 'Ativar licença', 'Sua ativação é validada automaticamente pelo serviço.', facts() + form(), '<span class="soft-text">Seus dados permanecem no computador.</span><button type="button" class="button ghost" data-action="close-modal">Voltar ao acesso</button>', true);
     }
     function errorNotice(error, submittedKey = '') {
@@ -104,7 +106,7 @@ window.KennedLicenseUI = {
         catch (error) { errorNotice(error); } finally { state.busy = false; ctx.render(true); }
       }
     }
-    function assertAction(action) { if (live().allowed === false && blockedActions.has(action)) throw new Error(live().reason || 'Ative uma licença antes de iniciar novos envios. Seus dados estão preservados.'); }
+    function assertAction(action) { if (expired() && !action.startsWith('license-') && !['open-support','window-minimize','window-quit','toggle-sidebar','vitrine-exit'].includes(action)) throw new Error('Sua licença expirou. Renove para acessar o aplicativo; seus dados estão preservados.'); if (live().allowed === false && blockedActions.has(action)) throw new Error(live().reason || 'Ative uma licença antes de iniciar novos envios. Seus dados estão preservados.'); }
     const interval = setInterval(() => {
       if (!state.license) return;
       for (const target of document.querySelectorAll('[data-license-remaining]')) target.textContent = duration(remaining());

@@ -6,15 +6,16 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: mega-media:; media-src 'self' mega-media:; connect-src 'none'; object-src 'none'; base-uri 'none'">
   <title>Kenned Code Disparos</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="vitrine.css">
 </head>
 <body data-theme="light">
   <div id="auth-root" class="auth-root" hidden></div>
   <div class="app-shell">
     <aside class="sidebar">
-      <a class="brand" href="#" aria-label="Kenned Code Disparos, painel"><span class="brand-symbol">K</span><span>Kenned Code<span class="brand-second">Disparos</span></span></a>
+      <div class="sidebar-brand-row"><a class="brand" href="#" aria-label="Kenned Code Disparos, painel"><span class="brand-symbol">K</span><span>Kenned Code<span class="brand-second">Disparos</span></span></a><button id="sidebar-collapse" class="icon-button" data-action="toggle-sidebar" title="Recolher menu lateral" aria-label="Recolher menu lateral" aria-expanded="true"><span aria-hidden="true">‹</span></button></div>
       <span class="sidebar-label">ÁREA DE TRABALHO</span>
       <nav id="navigation" aria-label="Navegação principal"></nav>
-      <div class="sidebar-bottom"><button id="license-indicator" class="license-indicator" data-action="license-open" hidden></button><div class="local-badge"><span class="status-dot"></span> Dados salvos neste computador</div><div class="sidebar-version">Kenned Code Disparos <span id="version">2.3.2</span></div></div>
+      <div class="sidebar-bottom"><button id="license-indicator" class="license-indicator" data-action="license-open" hidden></button><button class="nav-item support-button" data-action="open-support" title="Falar com o desenvolvedor no WhatsApp: +55 62 99403-3173" aria-label="Falar com o desenvolvedor no WhatsApp"><span class="nav-icon" aria-hidden="true">☏</span><span class="nav-text">Falar com o desenvolvedor</span></button><div class="local-badge"><span class="status-dot"></span> Dados salvos neste computador</div><div class="sidebar-version">Kenned Code Disparos <span id="version">2.3.2</span></div></div>
     </aside>
     <div class="workspace">
       <header class="topbar"><div><span class="topbar-label">Sua central de campanhas</span><div id="connection-pill" class="connection-pill">Carregando conexão…</div></div><div class="topbar-actions"><div id="user-bar" class="user-bar"></div><button id="theme-toggle" class="icon-button" data-action="toggle-theme" title="Alternar tema" aria-label="Alternar tema"></button><button class="stop-button" data-action="stop-all"><span class="stop-square"></span> PARAR TODOS OS ENVIOS</button></div></header>
@@ -34,6 +35,9 @@
   <script src="contact-intake.js"></script>
   <script src="license.js"></script>
   <script src="source-campaigns.js"></script>
+  <script src="opportunities.js"></script>
+  <script src="navigation.js"></script>
+  <script src="vitrine.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

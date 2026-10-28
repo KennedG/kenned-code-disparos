@@ -20,10 +20,12 @@ const {SearchService}=require('../core/search-service.cjs');
 const {TemplateService}=require('../core/template-service.cjs');
 const {ReminderService}=require('../core/reminders.cjs');
 const {SourceCampaignService,sanitizeSourcePublication}=require('../core/source-campaigns.cjs');
+const {OpportunityService}=require('../core/opportunity-service.cjs');
+const {VitrineService}=require('../core/vitrine.cjs');
 const {ContactIntake}=require('../core/contact-intake.cjs');
 const {AutomationControl}=require('../core/automation-control.cjs');
 const {writeRecordsJSON}=require('../core/export-records.cjs');
-const {publicLicenseStatus,unavailableLicenseService,licenseError}=require('../core/license-policy.cjs');
+const {publicLicenseStatus,unavailableLicenseService,licenseError,confirmedLicenseExpiry}=require('../core/license-policy.cjs');
 
 const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook','systemAlertRecipientIds','alertRetryPolicy','submissionTimeoutSeconds','destinationAlertPolicy'];
 const DEFAULTS={alertRetryPolicy:{maxAttempts:3,delaySeconds:15},reconnect:{enabled:false,maxAttempts:3,delaySeconds:15,autoResume:false},notifications:{nativeEnabled:true},sound:{enabled:true,volume:65,sound:'soft',customAudioId:null,events:['disconnect','critical'],repeat:false,intervalSeconds:30,maxRepeats:3,quiet:{enabled:false,start:'22:00',end:'08:00'}},retention:{days:90,maxEntries:20000,maxMegabytes:64},webhook:{enabled:false,url:''}};
@@ -38,32 +40,43 @@ const asText=(value,max)=>String(value??'').slice(0,max);
 async function createAppService({dir,safeStorage,host=async()=>{throw new Error('Recurso nativo indisponível.');},version='2.3.2',runtimePlatform='win32',now=()=>Date.now(),licenseService}={}){
   const licensing=licenseService||unavailableLicenseService();
   if(typeof licensing.initialize==='function')await licensing.initialize();
-  const store=await createStore(dir,{upgradeVersion:`${version}-origem-r1`});seed(store);store.recoverInterrupted();
+  const store=await createStore(dir,{upgradeVersion:`${version}-reformulado-r1`});seed(store);store.recoverInterrupted();
   if(store.getSetting('submissionTimeoutSeconds')===undefined)store.setSetting('submissionTimeoutSeconds',30);
   if(store.getSetting('destinationAlertPolicy')===undefined)store.setSetting('destinationAlertPolicy',{summaryIntervalSeconds:900});
   for(const [key,value] of Object.entries(DEFAULTS))if(store.getSetting(key)===undefined)store.setSetting(key,value);
   const media=new MediaManager(store),events=new EventEmitter();
   let channelUrl='';try{const value=await host('secretGet',{key:'webhookUrl'});if(typeof value==='string')channelUrl=value;}catch{}
   const auth=new AuthService({store,clock:now});
-  let adapter,scheduler,commands,alerts,searches,reminders,sources,contacts,templates,automation,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,licenseTimer=null,licenseStopOperation=null,licenseStopLatched=false,licenseCapturePaused=false,groupSync=null,groupSyncSource=null,groupLoadError=null;
+  let adapter,scheduler,commands,alerts,searches,reminders,sources,opportunities,vitrine,contacts,templates,automation,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,licenseTimer=null,licenseStopOperation=null,licenseStopLatched=false,licenseCapturePaused=false,groupSync=null,groupSyncSource=null,groupLoadError=null;
   const controlReplyScope=new AsyncLocalStorage();
   const cleanupTokens=new Map();
   const nativeTasks=new Set();
   const audioDir=path.join(dir,'audio');fs.mkdirSync(audioDir,{recursive:true});
   const settings=()=>{const result=Object.fromEntries(SETTINGS.map(k=>[k,store.getSetting(k)]));result.sound={...result.sound,customAudioName:(store.getSetting('audioAssets',[])||[]).find(a=>a.id===result.sound.customAudioId)?.name||''};if(result.webhook)result.webhook={...result.webhook,url:can('settings.edit')&&channelUrl?channelUrl:result.webhook.url};return result;};
-  const licenseStatus=()=>publicLicenseStatus(licensing.getStatus(),{resumeRequired:store.getSetting('licenseResumeRequired',false)===true});
+  let licenseExpiryLatched=store.getSetting('licenseConfirmedExpired',false)===true;
+  const licenseStatus=()=>{const status=publicLicenseStatus(licensing.getStatus(),{resumeRequired:store.getSetting('licenseResumeRequired',false)===true});
+    const previous=licenseExpiryLatched;if(confirmedLicenseExpiry(status))licenseExpiryLatched=true;else if(status.allowed)licenseExpiryLatched=false;
+    if(previous!==licenseExpiryLatched)try{store.setSetting('licenseConfirmedExpired',licenseExpiryLatched);}catch{scheduler?.blockOnPersistenceFailure();}
+    return licenseExpiryLatched&&!status.allowed&&!confirmedLicenseExpiry(status)?{...status,totalBlocked:true,status:'expired',reasonCode:'LICENSE_EXPIRED',reason:'A última validação confirmou o vencimento. Renove ou valide uma licença vigente para liberar o aplicativo. Seus dados foram preservados.'}:status;};
+  const expiredLicenseActions=new Set(['snapshot','authStatus','licenseStatus','licenseActivate','licenseRefresh','windowMinimize','windowQuit','openSupport','vitrinePublic']);
+  const minimalAuth=()=>{const s=auth.status();return {authenticated:s.authenticated===true,setupRequired:s.setupRequired===true,user:null,permissions:[],lockedByLicense:true};};
+  const minimalSettings=()=>({theme:store.getSetting('theme','dark'),sound:{enabled:false},notifications:{nativeEnabled:false}});
+  function assertNotExpired(operation){const status=licenseStatus();if(confirmedLicenseExpiry(status)){stopForLicense(status);throw licenseError(status,operation);}return status;}
+  const nativeHost=host;
+  host=async(action,payload={})=>{const exempt=['windowMinimize','windowQuit','openSupport'].includes(action);if(!exempt)assertNotExpired(`native.${action}`);const result=await nativeHost(action,payload);if(!exempt)assertNotExpired(`native.${action}`);return result;};
   function stopForLicense(status=licenseStatus(),force=false){
     if(status.allowed&&!force||!automation||licenseStopLatched)return licenseStopOperation;
     // Latch synchronously before callbacks/network awaits. Renewal leaves this
     // persisted stop in place until an authorised operator explicitly resumes.
     licenseStopLatched=true;
+    vitrine?.handleLicenseExpired();
     try{store.setSetting('licenseResumeRequired',true);}catch{scheduler?.blockOnPersistenceFailure();}
     const reason=status.reason||'Teste ou licença indisponível; ative ou valide para realizar novos envios.';
     try{store.addDiagnostic({id:randomUUID(),at:now(),stage:'license.blocked',code:status.reasonCode||'LICENSE_REQUIRED',level:'warning',description:reason,action:'Novas automações e envios bloqueados; dados preservados.',guidance:'Abra Licença para ativar ou validar. Depois confirme a retomada e ative individualmente as campanhas desejadas.'});}catch{if(store.persistenceFailed)scheduler?.blockOnPersistenceFailure();}
     const stopped=automation.stop({source:'license',reason});
     licenseCapturePaused=true;
     const suspended=searches?.suspendCapture('license_unavailable');
-    licenseStopOperation=Promise.allSettled([stopped,suspended,sources?.suspendCapture()]).then(()=>{broadcast(true);});
+    licenseStopOperation=Promise.allSettled([stopped,suspended,sources?.suspendCapture(),opportunities?.suspendCapture()]).then(()=>{broadcast(true);});
     return licenseStopOperation;
   }
   function assertLicense(operation){
@@ -85,8 +98,8 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
       const original=source[name];source[name]=function(...args){
         const options=args[index]||{},previous=options.beforeSubmit,control=controlReplyScope.getStore();
         const controlOnly=!!control&&control.adapter===source&&['reply','sendSearchText'].includes(name)&&args[0]===control.chatId&&args[1]===control.text&&options.clientMessageId===control.messageId&&options.replyContext===control.context;
-        if(!controlOnly)assertLicense(`whatsapp.${name}`);
-        args[index]={...options,beforeSubmit:()=>{if(previous)previous();if(!controlOnly)assertLicense(`whatsapp.${name}`);}};
+        assertNotExpired(`whatsapp.${name}`);if(!controlOnly)assertLicense(`whatsapp.${name}`);
+        args[index]={...options,beforeSubmit:()=>{if(previous)previous();assertNotExpired(`whatsapp.${name}`);if(!controlOnly)assertLicense(`whatsapp.${name}`);}};
         return original.apply(this,args);
       };
     }
@@ -94,16 +107,24 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   const makeAdapter=()=>guardAdapter(store.getSetting('integrationMode','simulated')==='whatsapp'?new WhatsAppAdapter({store,credentialsDir:path.join(dir,'credentials'),safeStorage}):new SimulatedAdapter({store}));
   const can=(permission,campaign)=>auth.can(permission,campaign);
-  const assert=(permission,campaign)=>auth.assert(permission,campaign);
+  const assert=(permission,campaign)=>{assertNotExpired(permission);return auth.assert(permission,campaign);};
   const user=()=>auth.currentUser();
   const campaigns=()=>store.listCampaigns().filter(c=>can('campaign.view',c));
   const campaignIds=()=>campaigns().map(c=>c.id);
   const scopeIds=()=>user()?.isOwner||auth.status().campaignScope==='all'?undefined:store.listCampaigns().filter(c=>(c.ownerId||c.ownerUserId)===user()?.id).map(c=>c.id);
   function assertGlobal(permission,requirements=[]){assert(permission);if(!user()?.isOwner&&auth.status().campaignScope!=='all')throw new Error('Esta operação altera ou exporta dados de todo o aplicativo e exige acesso a todas as campanhas.');for(const p of requirements){assert(p);if(p.startsWith('campaign.'))for(const c of store.listCampaigns())assert(p,c);}}
   const assertModeChange=()=>assertGlobal('settings.edit',['connection.manage','campaign.stop']);
-  const assertBackup=()=>assertGlobal('settings.edit',['campaign.view','media.view','groups.view','contacts.view','notifications.view','reminder.view']);
-  const assertRestore=()=>assertGlobal('settings.edit',['connection.manage','users.edit','campaign.view','campaign.create','campaign.edit','campaign.delete','campaign.stop','groups.edit','media.create','media.delete','contacts.create','contacts.delete','notifications.manage','reminder.view','reminder.create','reminder.edit','reminder.delete','reminder.control']);
+  const assertBackup=()=>assertGlobal('settings.edit',['campaign.view','media.view','groups.view','contacts.view','notifications.view','reminder.view','opportunity.view']);
+  const assertRestore=()=>assertGlobal('settings.edit',['connection.manage','users.edit','campaign.view','campaign.create','campaign.edit','campaign.delete','campaign.stop','groups.edit','media.create','media.delete','contacts.create','contacts.delete','notifications.manage','reminder.view','reminder.create','reminder.edit','reminder.delete','reminder.control','opportunity.manage','opportunity.respond']);
   const assertSearchActor=()=>{const actor=user();if(!actor)throw new Error('Faça login para continuar.');return actor.id;};
+  const opportunityVisible=()=>can('opportunity.view')&&(user()?.isOwner===true||auth.status().campaignScope==='all');
+  const opportunityActor=permission=>{assertGlobal(`opportunity.${permission}`);return user().id;};
+  function opportunityPermission(actorId,action='manage'){
+    auth.assertFor(actorId,`opportunity.${action}`);
+    const actor=store.getEntity('users',actorId),role=actor&&store.getEntity('roles',actor.roleId);
+    if(!role?.isOwner&&(actor?.campaignScope||role?.campaignScope||'own')!=='all')throw Object.assign(new Error('O módulo OPORTUNIDADES exige acesso a todas as campanhas.'),{code:'AUTH_DENIED'});
+    return true;
+  }
   const getCampaign=(id,permission='campaign.view')=>{const c=store.getCampaign(id);if(!c)throw new Error('Campanha não encontrada.');assert(permission,c);return c;};
   const audit=(action,details={})=>store.addAudit({id:randomUUID(),at:now(),userId:user()?.id||null,userName:user()?.name||null,action,...details});
   const curatedError=(action,error)=>{
@@ -156,18 +177,19 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   const safeSourceResult=value=>value?.publication?{...value,publication:sanitizeSourcePublication(value.publication)}:sanitizeSourcePublication(value);
   function snapshot(){
+    const license=licenseStatus();if(confirmedLicenseExpiry(license))return {auth:minimalAuth(),license,version,buildRevision:'reformulado-r1',maintenance,connection:null,settings:minimalSettings(),licenseOnly:true};
     const status=auth.status(),base={auth:status,license:licenseStatus(),version,maintenance,storageMode:store.getStorageMode(),settings:{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()},campaigns:[],groups:[],media:[],templates:[],contacts:[],alertRecipients:[],campaignUsers:[],history:[],metrics:{confirmed:0,failed:0,uncertain:0,activeCampaigns:0,selectedGroups:0,nextRunAt:null}};
     if(!status.authenticated)return {...base,connection:null};
     const cs=campaigns(),ids=cs.map(c=>c.id),storageError=store.persistenceFailed||scheduler.persistenceFailed?'Armazenamento indisponível: envios bloqueados. Corrija o espaço ou as permissões e reabra o aplicativo.':null;
     const metrics=store.getMetrics?store.getMetrics({campaignIds:scopeIds()}):{confirmed:0,failed:0,uncertain:0};
     let recent=[];if(can('history.view'))recent=historyPage({limit:50,offset:0}).items||[];
     const publicSettings=can('settings.view')?settings():{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()};
-    return {...base,auth:status,buildRevision:'origem-r1',sources:sourceState(),campaignOps:campaignOperations(cs),schemaCompatibility:can('settings.view')?store.schemaCompatibility:null,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,groupLoadError:can('groups.view')?groupLoadError:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,upgradeBackup:can('settings.view')?store.upgradeBackup:null,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items.filter(n=>!n.ownerOnly||user()?.isOwner):[],pendingContacts:can('contacts.view')?contacts?.listPendingContacts({limit:50},user()?.id):{items:[],total:0},reminders:can('reminder.view')?reminders?.list(user()?.id):null,automation:automation?.getState()};
+    return {...base,auth:status,buildRevision:'reformulado-r1',sources:sourceState(),opportunities:opportunityVisible()?opportunities?.getState(user()?.id):null,campaignOps:campaignOperations(cs),schemaCompatibility:can('settings.view')?store.schemaCompatibility:null,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,groupLoadError:can('groups.view')?groupLoadError:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,upgradeBackup:can('settings.view')?store.upgradeBackup:null,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items.filter(n=>!n.ownerOnly||user()?.isOwner):[],pendingContacts:can('contacts.view')?contacts?.listPendingContacts({limit:50},user()?.id):{items:[],total:0},reminders:can('reminder.view')?reminders?.list(user()?.id):null,automation:automation?.getState()};
   }
   function broadcast(immediate=false){
     if(closed)return;
-    if(immediate){clearTimeout(updateTimer);updateTimer=null;events.emit('update',snapshot());events.emit('nativeEvent',{type:'settings',payload:settings()});return;}
-    if(!updateTimer)updateTimer=setTimeout(()=>{updateTimer=null;if(!closed){events.emit('update',snapshot());events.emit('nativeEvent',{type:'settings',payload:settings()});}},500);
+    if(immediate){clearTimeout(updateTimer);updateTimer=null;events.emit('update',snapshot());events.emit('nativeEvent',{type:'settings',payload:confirmedLicenseExpiry(licenseStatus())?minimalSettings():settings()});return;}
+    if(!updateTimer)updateTimer=setTimeout(()=>{updateTimer=null;if(!closed){events.emit('update',snapshot());events.emit('nativeEvent',{type:'settings',payload:confirmedLicenseExpiry(licenseStatus())?minimalSettings():settings()});}},500);
   }
   const enqueue=task=>{const result=tail.then(task);tail=result.catch(()=>{});return result;};
   async function nativeAlert(payload){
@@ -179,13 +201,14 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   function bindAdapter(){
     const source=adapter;
-    source.on('status',status=>{broadcast();if(status.state==='connected')syncGroups(source).catch(()=>{});});
+    source.on('status',status=>{broadcast();if(status.state==='connected'&&!confirmedLicenseExpiry(licenseStatus()))syncGroups(source).catch(()=>{});});
     source.on('transportDiagnostic',record=>{
       if(source!==adapter||closed)return;
       try{store.addDiagnostic({...record,id:randomUUID(),at:record.at||now(),userId:record.userId||null,description:record.description||'Etapa do transporte WhatsApp.',action:record.action||'Rastreamento da integração.',level:record.level||'info'});broadcast();}catch{if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();}
     });
 
     source.on('incoming',ctx=>{
+      if(confirmedLicenseExpiry(licenseStatus())){stopForLicense();return;}
       if(source===adapter&&!maintenance){try{contacts?.handleIncoming(ctx);}catch(error){store.addDiagnostic({id:randomUUID(),at:now(),stage:'contacts.intake',code:'CONTACT_INTAKE_FAILED',description:'Não foi possível registrar o primeiro contato.',action:'Confira o armazenamento e as permissões do aplicativo.'});}}
       const emergency=ctx.type==='text'&&/^!mega\s+(?:parar\s+tudo|pausar\s+\S+)\s*$/i.test(String(ctx.text||''));
       if(source!==adapter||(maintenance&&!emergency))return;
@@ -195,12 +218,13 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     source.on('receipt',()=>broadcast());
   }
   async function syncGroups(source=adapter){
+    assertNotExpired('groups.sync');
     if(groupSync&&groupSyncSource===source)return groupSync;
     const mode=store.getStorageMode(),traceId=randomUUID();groupSyncSource=source;
     const operation=(async()=>{
       try{
         const groups=await source.listGroups();
-        if(source!==adapter||mode!==store.getStorageMode())return [];
+        assertNotExpired('groups.sync');if(source!==adapter||mode!==store.getStorageMode())return [];
         const values=store.replaceGroups(groups);searches?.refreshGroups?.();groupLoadError=null;broadcast();return values;
       }catch(error){
         if(source===adapter&&mode===store.getStorageMode()){
@@ -219,10 +243,10 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(!id)return null;const entry=(store.getSetting('audioAssets',[])||[]).find(a=>a.id===id);if(!entry)return null;
     try{const real=fs.realpathSync(entry.path);if(!real.startsWith(fs.realpathSync(audioDir)+path.sep))return null;return real;}catch{return null;}
   }
-  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');await sources?.suspendCapture();return await task();}finally{maintenance=false;if(licenseStatus().allowed&&!licenseCapturePaused){searches?.resumeCapture();if(!automation.isStopped())sources?.resumeCapture();}broadcast();}}
+  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');await sources?.suspendCapture();await opportunities?.suspendCapture();return await task();}finally{maintenance=false;if(licenseStatus().allowed&&!licenseCapturePaused){searches?.resumeCapture();if(!automation.isStopped()){sources?.resumeCapture();opportunities?.resumeCapture();}}broadcast();}}
   async function switchMode(mode){
     await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await alerts.waitForIdle?.();await reminders?.waitForIdle?.();if(groupSync)await groupSync.catch(()=>{});adapter.removeAllListeners();
-    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);reminders?.setAdapter(adapter);sources?.setAdapter(adapter);automation?.syncMode();contacts?.invalidateContacts();bindAdapter();
+    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);reminders?.setAdapter(adapter);sources?.setAdapter(adapter);opportunities?.setAdapter(adapter);automation?.syncMode();contacts?.invalidateContacts();bindAdapter();
     cleanupTokens.clear();groupLoadError=null;
     licenseStopLatched=false;if(!licenseStatus().allowed||store.getSetting('licenseResumeRequired',false))await stopForLicense(licenseStatus(),true);
     if(mode==='simulated'){await adapter.connect();await syncGroups(adapter);}
@@ -288,7 +312,24 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     return {simulation:true,description:'Teste local com dados fictícios; nenhum envio pelo WhatsApp.',messages:fixtures.length,replies:(adapter.sent?.slice(before)||[]).filter(entry=>entry.search===true),state:searches.getState(actorId)};
   }
   const actions={
-    snapshot:async()=>snapshot(),authStatus:async()=>auth.status(),
+    vitrineState:async()=>vitrine.getState(assertSearchActor()),
+    vitrineSave:async p=>{const actor=assertSearchActor(),result=vitrine.save(p,actor);audit('vitrine.draftSaved',{count:result.items.length});return result;},
+    vitrinePreview:async p=>vitrine.preview(p,assertSearchActor()),
+    vitrinePublish:async p=>{const result=vitrine.publish(p,assertSearchActor());audit('vitrine.published',{count:result.count});return result;},
+    vitrinePublic:async()=>{if(!confirmedLicenseExpiry(licenseStatus()))assert('vitrine.view');return vitrine.getPublic();},
+    vitrineWithdraw:async p=>{const result=vitrine.withdraw(p,assertSearchActor());audit('vitrine.withdrawn',{id:p.id});return result;},
+    snapshot:async()=>snapshot(),authStatus:async()=>confirmedLicenseExpiry(licenseStatus())?minimalAuth():auth.status(),
+    opportunityState:async()=>opportunities.getState(opportunityActor('view')),
+    opportunityConfigSave:async p=>{const actor=opportunityActor('manage'),config=p.config||p;assert('groups.view');for(const id of config.campaignIds||[])getCampaign(id);if(config.enabled===true)assertLicense('opportunity.capture');if(config.automatic===true||config.mode==='automatic'){assert('opportunity.respond');assertLicense('opportunity.send');}return opportunities.saveConfig(config,actor);},
+    opportunityPage:async p=>opportunities.list(p,opportunityActor('view')),
+    opportunityDetail:async p=>opportunities.getDetail(p.id,opportunityActor('view')),
+    opportunityPreview:async p=>opportunities.preview(p,opportunityActor('respond')),
+    opportunitySendManual:async p=>{const actor=opportunityActor('respond'),result=opportunities.respondManual(p,actor);audit('opportunity.manualSend',{opportunityId:p.id});return result;},
+    opportunityAction:async p=>{const permission=['close','outsideAnswer'].includes(p.action)?'respond':'manage',actor=opportunityActor(permission),result=opportunities.action(p,actor);audit('opportunity.action',{opportunityId:p.id,operation:p.action});return result;},
+    opportunityConfirmAvailability:async p=>{const actor=opportunityActor('manage'),result=opportunities.confirmAvailable(p,actor);audit('opportunity.availability',{offerId:p.offerId});return result;},
+    opportunityReconcile:async p=>opportunities.reconcile(p,opportunityActor('respond')),
+    opportunityRetryUncertain:async p=>{const actor=opportunityActor('respond'),result=opportunities.retryUncertain(p,actor);audit('opportunity.retry',{taskId:p.id});return result;},
+    opportunityEvaluate:async p=>{const actor=opportunityActor('view');if(p.send===true)throw Object.assign(new Error('Esta avaliação não realiza envios. Use a prévia e confirme a resposta manual.'),{code:'OPPORTUNITY_EVALUATION_ONLY'});const selection=p.id?{ids:[p.id]}:p;const result=await opportunities.evaluateAll(selection,actor);return {...result,results:result.items};},
     sourceConfigGet:async()=>{assert('campaign.view');return sourceState();},
     sourceConfigSave:async p=>{assertGlobal('settings.edit',['groups.view','campaign.create','media.create']);const config=p.config||p;if(config.enabled===true)assertLicense('source.capture');return sources.saveConfig(config,user().id);},
     sourcePublications:async p=>{assert('campaign.view');const filter={limit:Math.min(200,Math.max(1,Number(p.limit)||50)),offset:Math.max(0,Number(p.offset)||0)};
@@ -297,6 +338,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     sourceRetryMedia:async p=>{sourcePublication(p.id);assert('media.create');return sanitizeSourcePublication(await sources.retryPublication(p.id));},
     sourceReviewPublication:async p=>{sourcePublication(p.id);if(p.mediaId)assert('media.create');const result=sources.reviewPublication(p.id,{caption:p.caption,text:p.text,include:p.include,mediaId:p.mediaId},user().id);audit('source.review',{publicationId:p.id});return safeSourceResult(result);},
     sourceRemovePublication:async p=>{sourcePublication(p.id);const result=sources.removePublication(p.id,{actorId:user().id});audit('source.remove',{publicationId:p.id});return safeSourceResult(result);},
+    sourceResumeGroup:async p=>{assertGlobal('settings.edit',['groups.view','campaign.create','media.create']);assertLicense('source.capture');if(p.campaignId)getCampaign(p.campaignId,'campaign.edit');const result=await sources.resumeGroup({groupId:p.groupId,campaignId:p.campaignId,confirm:p.confirm},user().id);audit('source.resumeGroup',{groupId:p.groupId,campaignId:p.campaignId||null});return result;},
     sourceReorderItems:async p=>{getCampaign(p.campaignId,'campaign.edit');audit('source.reorder',{campaignId:p.campaignId});return sources.reorderItems(p.campaignId,p.itemIds);},
     sourceApplyConfigTemplate:async p=>{getCampaign(p.campaignId,'campaign.edit');assert('settings.view');const result=sources.applyConfigTemplate(p.campaignId);audit('source.applyTemplate',{campaignId:p.campaignId});return result;},
     sourceGroupPublications:async p=>{if(!Array.isArray(p.ids)||p.ids.length>100)throw new Error('Selecione de 2 a 100 fotos.');for(const id of p.ids)sourcePublication(id);return sources.groupPublications(p.ids,{caption:p.caption},user().id);},
@@ -371,7 +413,16 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
       if(shouldResume){assert('campaign.start',saved);await scheduler.resume(saved.id);}audit(old?'campaign.edit':'campaign.create',{campaignId:saved.id});return store.getCampaign(saved.id);
     },
     duplicateCampaign:async p=>{const c=getCampaign(p.id);assert('campaign.create');const copy=store.saveCampaign({...c,id:randomUUID(),ownerId:user().id,name:`${c.name.slice(0,105)} (cópia)`,state:'draft',nextRunAt:null,roundIndex:0,lastError:null,items:c.items.map(i=>({...i,id:randomUUID()}))});audit('campaign.duplicate',{campaignId:copy.id});return copy;},
-    deleteCampaign:async p=>{const c=getCampaign(p.id,'campaign.delete');await scheduler.pause(c.id);await scheduler.waitForIdle();assert('campaign.delete',c);if(store.queryJobs({campaignId:c.id,status:'uncertain',limit:1}).total)throw new Error('Revise os envios incertos desta campanha antes de excluí-la.');store.deleteCampaign(c.id);audit('campaign.delete',{campaignId:c.id});return true;},
+    deleteCampaign:async p=>{
+      const c=getCampaign(p.id,'campaign.delete'),sourceDays=store.exportSourceData().days.filter(d=>d.campaignId===c.id),isSourceCampaign=c.sourceManaged===true||sourceDays.length>0,sourceGroups=new Set(store.getSourceGroupsLinkedToCampaign(c.id));
+      const uncertain=store.queryJobs({campaignId:c.id,status:'uncertain',limit:1}).total,inFlight=store.queryJobs({campaignId:c.id,status:'sending',limit:1}).total;
+      if(uncertain&&!isSourceCampaign)throw new Error('Revise os envios incertos desta campanha antes de excluí-la.');
+      if(sourceGroups.size){const names=[...sourceGroups].map(id=>store.getGroup(id)?.name||id).join(', '),answer=await host('showMessageBox',{type:'warning',title:'Excluir campanha vinculada',message:`Esta campanha recebe publicações automaticamente do grupo ${names}. Ao excluir, a importação desse grupo será pausada até você vincular ou criar outra campanha.`,detail:`As tarefas ainda não iniciadas serão canceladas e a campanha não será recriada automaticamente.${inFlight?' Há um envio em andamento que pode não ser cancelável; o resultado será preservado, sem novas tentativas.':''}${uncertain?' Existem resultados incertos, que podem ter sido enviados. Eles permanecem no histórico e não serão reenviados.':''}`,buttons:['Cancelar','Excluir e pausar importação'],defaultId:0,cancelId:0});if(answer.response!==1)return {cancelled:true};}
+      if(isSourceCampaign&&!sourceGroups.size&&(inFlight||uncertain)){const answer=await host('showMessageBox',{type:'warning',title:'Excluir campanha de origem anterior',message:'Excluir esta campanha preservando os resultados dos envios já iniciados?',detail:'O vínculo atual do grupo continuará funcionando. Envios já iniciados podem não ser canceláveis e resultados incertos não serão reenviados automaticamente.',buttons:['Cancelar','Excluir campanha'],defaultId:0,cancelId:0});if(answer.response!==1)return {cancelled:true};}
+      assert('campaign.delete',getCampaign(c.id));await scheduler.pause(c.id,'Campanha excluída; tarefas pendentes canceladas.');if(!isSourceCampaign)await scheduler.waitForIdle();
+      const result=store.transaction(()=>{const paused=store.pauseSourceForCampaign(c.id,{at:now(),actorId:user().id,reason:'Pausada — campanha excluída. Crie ou vincule outra campanha para retomar.'});vitrine.handleCampaignDeleted(c.id);opportunities.invalidateCampaign?.(c.id);store.deleteCampaign(c.id);audit('campaign.delete',{campaignId:c.id,sourceGroupsPaused:paused.groupIds,inFlight,uncertain});return paused;});
+      sources.cancelCampaignCapture?.(c.id);for(const groupId of result.groupIds)sources.cancelGroupCapture(groupId);return true;
+    },
     previewCampaign:async p=>({summary:scheduler.getSummary(getCampaign(p.id).id),campaign:getCampaign(p.id)}),
     activateCampaign:async p=>{const c=getCampaign(p.id,'campaign.start');checkRevision(c,p);await scheduler.activate(c.id);audit('campaign.start',{campaignId:c.id});return store.getCampaign(c.id);},
     resumeCampaign:async p=>{const c=getCampaign(p.id,'campaign.start');checkRevision(c,p);await scheduler.resume(c.id);audit('campaign.resume',{campaignId:c.id});return store.getCampaign(c.id);},
@@ -437,41 +488,55 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     importAudio:async()=>{assert('settings.edit');const r=await host('showOpenDialog',{title:'Selecionar som de alerta',properties:['openFile'],filters:[{name:'Áudio',extensions:['wav','mp3','ogg']}]});if(r.canceled)return {cancelled:true};assert('settings.edit');const original=r.filePaths[0],stat=fs.statSync(original),ext=path.extname(original).toLowerCase();if(!stat.isFile()||stat.size<1||stat.size>20*1024*1024||!['.wav','.mp3','.ogg'].includes(ext))throw new Error('Escolha WAV, MP3 ou OGG de até 20 MB.');const id=randomUUID(),filename=path.join(audioDir,`${id}${ext}`);await fs.promises.copyFile(original,filename);const entry={id,name:path.basename(original),path:filename,size:stat.size,createdAt:now()};store.setSetting('audioAssets',[...(store.getSetting('audioAssets',[])||[]),entry]);audit('settings.importAudio');return {id,name:entry.name,size:entry.size};},
     testSound:async p=>{assert('settings.edit');const prefs=validateSound(p.preferences||p.sound||store.getSetting('sound'));return host('testSound',{preferences:prefs,audioPath:audioPath(prefs.customAudioId)});},
     testSimulation:async p=>{assert('settings.edit');if(adapter.status.mode!=='simulated'&&store.getSetting('integrationMode')!=='simulated')throw new Error('Disponível somente no modo simulado.');const senderNumber=cleanPhone(p.senderNumber||user().phone);if(![user().phone,...(user().authorizedPhones||[])].includes(senderNumber))throw new Error('O teste aceita somente um número vinculado ao usuário conectado.');const before=adapter.replies?.length||0;const context=adapter.injectIncoming({messageId:randomUUID(),senderNumber,verified:true,isGroup:!!p.isGroup,forwarded:!!p.forwarded,fromMe:false,chatId:`${senderNumber}@s.whatsapp.net`,text:String(p.text||''),type:'text',timestamp:now()});await commands.handle(context);const replies=adapter.replies?.slice(before)||[];return replies.length?{text:replies.map(r=>r.text).join('\n\n'),replies}:{text:'Comando ignorado; confira a autorização.'};},
-    windowMinimize:async()=>host('windowMinimize',{}),windowQuit:async()=>host('windowQuit',{})
+    openSupport:async()=>host('openSupport',{}),windowMinimize:async()=>host('windowMinimize',{}),windowQuit:async()=>host('windowQuit',{})
   };
-  const publicUnprotected=new Set(['snapshot','authStatus','setupOwner','login','recoverPassword','windowMinimize','windowQuit','licenseStatus','licenseActivate','licenseRefresh']);
-  const immediate=new Set(['sourceConfigGet','sourcePublications','manualRetryJob','campaignReconcileUncertain','destinationRecheck','snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory','searchRecipientStatus','searchResultPage','searchListDeliveryStatus','tracePage','listReminders','reminderHistory','listPendingContacts','automationStatus','resumeAutomation','licenseStatus','licenseActivate','licenseRefresh']);
+  const publicUnprotected=new Set(['snapshot','authStatus','setupOwner','login','recoverPassword','windowMinimize','windowQuit','openSupport','licenseStatus','licenseActivate','licenseRefresh','vitrinePublic']);
+  const immediate=new Set(['vitrineState','vitrinePublic','vitrinePreview','vitrineWithdraw','opportunityState','opportunityPage','opportunityDetail','opportunityPreview','opportunityEvaluate','opportunityAction','opportunityConfigSave','sourceConfigGet','sourcePublications','manualRetryJob','campaignReconcileUncertain','destinationRecheck','snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory','searchRecipientStatus','searchResultPage','searchListDeliveryStatus','tracePage','listReminders','reminderHistory','listPendingContacts','automationStatus','resumeAutomation','licenseStatus','licenseActivate','licenseRefresh']);
   const licensedActions=new Set(['manualRetryJob','sourceRetryMedia','sourceImportHistory','activateCampaign','resumeCampaign','searchSendList','testSearchRecipient','retrySearchDelivery','testReminder','activateReminder','testAlertRecipient','testAlert','retryAlert','importSearchHistory']);
-  const silentReads=new Set(['snapshot','authStatus','sourceConfigGet','sourcePublications','mediaPath']);
+  const silentReads=new Set(['vitrineState','vitrinePublic','vitrinePreview','snapshot','authStatus','sourceConfigGet','sourcePublications','mediaPath','opportunityState','opportunityPage','opportunityDetail','opportunityPreview','opportunityEvaluate']);
   events.call=async(action,payload={})=>{
     if(closed)throw new Error('Aplicativo encerrado.');if(!Object.hasOwn(actions,action))throw new Error('Ação não autorizada.');
+    if(!expiredLicenseActions.has(action))assertNotExpired(action);
     if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');
     if(maintenance&&!immediate.has(action))throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');
-    const invoke=async()=>{if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');if(maintenance&&!immediate.has(action))throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');if(licensedActions.has(action)||action==='runSearch'&&payload.deliver===true||action==='saveReminder'&&(payload.reminder||payload).enabled===true)assertLicense(action);return actions[action](payload||{});};
+    const invoke=async()=>{if(!expiredLicenseActions.has(action))assertNotExpired(action);if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');if(maintenance&&!immediate.has(action))throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');if(licensedActions.has(action)||action==='runSearch'&&payload.deliver===true||action==='saveReminder'&&(payload.reminder||payload).enabled===true)assertLicense(action);const result=await actions[action](payload||{});if(!expiredLicenseActions.has(action))assertNotExpired(action);return result;};
     try{const result=await (immediate.has(action)?invoke():enqueue(invoke));if(!silentReads.has(action))broadcast();return result;}catch(error){if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();curatedError(action,error);broadcast();throw error;}
   };
   events.snapshot=snapshot;
   events.systemCall=async(action,payload={})=>{
     if(action==='licenseChanged'){await stopForLicense();broadcast(true);return licenseStatus();}
+    if(action==='shutdown')return events.shutdown();
+    if(action==='settings'&&confirmedLicenseExpiry(licenseStatus()))return minimalSettings();
+    if(action!=='nativeNotificationResult')assertNotExpired(`internal.${action}`);
     if(action==='networkState'){if(typeof payload.online!=='boolean')throw new Error('Estado da rede inválido.');await alerts.networkStateChanged(payload);return true;}
     if(action==='nativeNotificationResult'){const record=store.getEntity('notifications',payload.id);if(record&&['shown','failed','disabled','unsupported'].includes(payload.status))store.saveNotification({...record,nativeStatus:payload.status,nativeResultAt:now()});broadcast();return true;}
     if(action==='suspend'){for(const c of store.listCampaigns())if(c.state==='active')await scheduler.pause(c.id,'Computador suspenso; retome após conferir a conexão.');broadcast();return true;}
     if(action==='resume'){broadcast();return true;}
     if(action==='settings')return settings();
     if(action==='emergencyStop'){await automation.stop({source:'native-emergency'});store.addAudit({id:randomUUID(),at:now(),action:'campaign.stopAll.native',userId:null,userName:'Parada de emergência local'});broadcast();return true;}
-    if(action==='shutdown')return events.shutdown();
     throw new Error('Ação interna não autorizada.');
   };
-  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);clearInterval(licenseTimer);licensing.off?.('change',licenseChanged);await licenseStopOperation;await scheduler?.stopAll();await searches?.shutdown();await sources?.stop();await reminders?.stop();await adapter?.disconnect();commands?.close?.();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
+  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);clearInterval(licenseTimer);licensing.off?.('change',licenseChanged);await licenseStopOperation;await scheduler?.stopAll();await searches?.shutdown();await sources?.stop();await opportunities?.stop();await reminders?.stop();await adapter?.disconnect();commands?.close?.();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
   adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now,licenseGuard:()=>assertLicense('campaign.send')});automation=new AutomationControl({store,scheduler,now,beforeResume:()=>{assertLicense('automation.resume');store.setSetting('licenseResumeRequired',false);licenseStopLatched=false;}});
   media.auth=auth;templates=new TemplateService({store,auth,media,now});contacts=new ContactIntake({store,auth,now});
-  commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,automationControl:automation,sendAdminReply:(context,text,options)=>scheduler.runExternalSubmission(attempt=>controlReplyScope.run({adapter,chatId:context.chatId,text,messageId:options.clientMessageId,context},()=>adapter.reply(context.chatId,text,{...options,signal:attempt.signal,beforeSubmit:attempt.beforeSubmit,replyContext:context})),{manual:true,controlOnly:true}),statusProvider:()=>({connection:adapter.status,license:licenseStatus(),campaigns:store.getMetrics(),queue:store.getMetrics().pending,search:searches?.getState(store.listEntities('users').find(u=>u.roleId==='role-owner')?.id)?.monitor,alerts:{pending:store.queryEntities('alerts',{status:'pending'}).total,failed:store.queryEntities('alerts',{status:'failed'}).total},reminders:reminders?.status(),source:sources?.metrics(),automation:automation.getState()}),now});
+  vitrine=new VitrineService({store,media,now,isLicensed:()=>licenseStatus().allowed&&!store.persistenceFailed,assertAccess:(action,actorId,campaign)=>{if(action==='source'){auth.assertFor(actorId,'campaign.view',campaign);auth.assertFor(actorId,'media.view');return true;}auth.assertFor(actorId,`vitrine.${action}`);if(action==='manage'){const actor=store.getEntity('users',actorId),role=actor&&store.getEntity('roles',actor.roleId);if(!role?.isOwner&&(actor?.campaignScope||role?.campaignScope||'own')!=='all')throw Object.assign(new Error('Gerenciar a vitrine exige acesso a todas as campanhas.'),{code:'AUTH_DENIED'});}return true;}});
+  commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,automationControl:automation,licenseGuard:operation=>assertNotExpired(operation),sendAdminReply:(context,text,options)=>scheduler.runExternalSubmission(attempt=>controlReplyScope.run({adapter,chatId:context.chatId,text,messageId:options.clientMessageId,context},()=>adapter.reply(context.chatId,text,{...options,signal:attempt.signal,beforeSubmit:attempt.beforeSubmit,replyContext:context})),{manual:true,controlOnly:true}),statusProvider:()=>({connection:adapter.status,license:licenseStatus(),campaigns:store.getMetrics(),queue:store.getMetrics().pending,search:searches?.getState(store.listEntities('users').find(u=>u.roleId==='role-owner')?.id)?.monitor,alerts:{pending:store.queryEntities('alerts',{status:'pending'}).total,failed:store.queryEntities('alerts',{status:'failed'}).total},reminders:reminders?.status(),source:sources?.metrics(),opportunities:store.getOpportunityMetrics?.(),automation:automation.getState()}),now});
   alerts=new AlertService({store,scheduler,adapter,now,isAutomationStopped:automationUnavailable,secretGet:async key=>host('secretGet',{key}),sendWebhook:async({secret,message,occurrenceId,originalAt,idempotencyKey})=>{assertLicense('alert.webhook');if(automation.isStopped())throw Object.assign(new Error('Envios automáticos interrompidos.'),{code:'AUTOMATION_STOPPED',definitive:true,submitted:false,safeToRetry:false});if(!channelUrl)throw Object.assign(new Error('Canal independente não configurado.'),{definitive:true});const parsed=new URL(channelUrl);if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw Object.assign(new Error('Canal HTTPS inválido.'),{definitive:true});const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);try{assertLicense('alert.webhook');if(automation.isStopped())throw Object.assign(new Error('Envios automáticos interrompidos.'),{code:'AUTOMATION_STOPPED',definitive:true,submitted:false,safeToRetry:false});const response=await fetch(parsed.href,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${secret}`,'idempotency-key':idempotencyKey},body:JSON.stringify({message,occurrenceId,originalAt}),signal:controller.signal,redirect:'error'});if(!response.ok)throw Object.assign(new Error('WEBHOOK_HTTP_FAILURE'),{definitive:true,code:'WEBHOOK_HTTP_FAILURE'});return {status:'confirmed',messageId:idempotencyKey};}finally{clearTimeout(timer);}}});
   searches=new SearchService({store,adapter,authService:auth,now,scheduler,host,mediaManager:media,automationGuard:()=>!automationUnavailable()});
   reminders=new ReminderService({store,auth,scheduler,adapter,now,isAutomationStopped:automationUnavailable,onCriticalIncident:incident=>alerts.recordSystemIncident(incident)});
   sources=new SourceCampaignService({store,mediaManager:media,adapter,safeStorage,now,isAutomationStopped:automationUnavailable,assertCanCapture:actorId=>{assertLicense('source.capture');auth.assertFor(actorId,'campaign.create');auth.assertFor(actorId,'media.create');auth.assertFor(actorId,'settings.edit');return true;}});
+  opportunities=new OpportunityService({store,adapter,scheduler,now,isAutomationStopped:automationUnavailable,
+    assertCanCapture:actorId=>{assertLicense('opportunity.capture');opportunityPermission(actorId,'manage');auth.assertFor(actorId,'groups.view');return true;},
+    assertCanOperate:(actorId,action)=>{assertNotExpired(`opportunity.${action}`);opportunityPermission(actorId,action);if(action==='respond')assertLicense('opportunity.send');return true;},
+    assertOwnerPermissions:actorId=>{opportunityPermission(actorId,'manage');opportunityPermission(actorId,'respond');auth.assertFor(actorId,'campaign.view');assertLicense('opportunity.send');return true;},
+    onLocalAlert:async payload=>{const globalSound=store.getSetting('sound',DEFAULTS.sound),moduleSound=payload.sound||{};
+      const preferences={...globalSound,...moduleSound,enabled:globalSound.enabled!==false&&moduleSound.enabled!==false,events:['opportunity'],repeat:false,quiet:{...moduleSound.quiet,timezone:moduleSound.quiet?.timezone||'America/Sao_Paulo'}};
+      const task=host('localAlert',{...payload,event:'opportunity',preferences,soundPreferences:preferences,nativeEnabled:store.getSetting('notifications',DEFAULTS.notifications).nativeEnabled!==false,audioPath:audioPath(preferences.customAudioId)}).catch(()=>({nativeStatus:'failed',soundStatus:'failed'}));
+      nativeTasks.add(task);try{return await task;}finally{nativeTasks.delete(task);}
+    }});
+  automation.register('opportunities',()=>{opportunities.suspendCapture();return opportunities.cancelAutomatic();});
   automation.register('source',()=>sources.suspendCapture());automation.register('search',()=>searches.stopPending());automation.register('alerts',()=>alerts.stopPending());automation.register('reminders',()=>reminders.stopAll({source:'global-stop'}));
-  automation.on('change',()=>{if(!automation.isStopped()&&licenseStatus().allowed&&!store.getSetting('licenseResumeRequired',false)&&licenseCapturePaused&&!maintenance){licenseCapturePaused=false;searches.resumeCapture();}if(!automation.isStopped()&&licenseStatus().allowed&&!maintenance)sources.resumeCapture();broadcast();});reminders.on('change',()=>broadcast());contacts.on('change',()=>broadcast());
+  automation.on('change',()=>{if(!automation.isStopped()&&licenseStatus().allowed&&!store.getSetting('licenseResumeRequired',false)&&licenseCapturePaused&&!maintenance){licenseCapturePaused=false;searches.resumeCapture();}if(!automation.isStopped()&&licenseStatus().allowed&&!maintenance){sources.resumeCapture();opportunities.resumeCapture();}broadcast();});reminders.on('change',()=>broadcast());contacts.on('change',()=>broadcast());
   contacts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});
   if(!licenseStatus().allowed||store.getSetting('licenseResumeRequired',false))await stopForLicense(licenseStatus(),true);
   let lastLicenseFingerprint='';
@@ -479,11 +544,11 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   licensing.on?.('change',licenseChanged);
   licenseTimer=setInterval(licenseChanged,1000);licenseTimer.unref?.();
   reminders.start();
-  searches.on('change',()=>broadcast());searches.start();sources.on('change',()=>broadcast());sources.start();
+  searches.on('change',()=>broadcast());searches.start();sources.on('change',()=>broadcast());opportunities.on('change',()=>broadcast());sources.start();opportunities.start();
   scheduler.on('destinationFailure',event=>{try{const result=alerts.destinationFailure(event);if(result?.catch)result.catch(error=>curatedError('alerts.destinationFailure',error));}catch(error){curatedError('alerts.destinationFailure',error);}broadcast();});
   alerts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});alerts.on('change',()=>broadcast());scheduler.on('change',()=>broadcast());bindAdapter();alerts.start();scheduler.start();
   retentionTimer=setInterval(()=>{try{store.applyRetention?.(store.getSetting('retention',DEFAULTS.retention));}catch{if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();}},60000);retentionTimer.unref?.();
-  if(store.getSetting('integrationMode')==='simulated'){await adapter.connect();await syncGroups(adapter);}
+  if(store.getSetting('integrationMode')==='simulated'&&!confirmedLicenseExpiry(licenseStatus())){await adapter.connect();await syncGroups(adapter);}
   return events;
 }
 

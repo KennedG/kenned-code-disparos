@@ -1,11 +1,11 @@
 # Licenciamento — Kenned Code Disparos 2.3.2
 
-Esta versão mantém a linha 2.3 baseada no código verificado da 2.3.0, sem módulos de vendas, caixa ou financeiro. O licenciamento controla o direito de executar operações; não substitui usuários, permissões de BUSCAS e administração, nem altera o destinatário das respostas privadas.
+Esta versão mantém a linha 2.3 baseada no código verificado da 2.3.0, sem módulos de vendas, caixa ou financeiro. O licenciamento controla o direito de executar operações; não substitui usuários, permissões de BUSCAS e administração, nem altera o destinatário das respostas privadas. Na revisão **reformulado-r1**, vencimento confirmado permite somente ativação/verificação da licença e contato com o desenvolvedor; essa regra substitui a antiga disponibilidade de consulta e exportação depois de vencer.
 
 ## Como funciona para o cliente
 
 1. Instale o aplicativo e abra com acesso à internet. O primeiro registro do dispositivo inicia automaticamente um teste de **72 horas**, sem chave ou aprovação do distribuidor. O horário utilizado é o do serviço de licenciamento.
-2. Consulte **Configurações → Licença** para ver o plano, o estado, o tempo restante e o vencimento exato. A validação inicial requer internet: o aplicativo não cria um teste local independente quando o serviço estiver indisponível.
+2. Consulte a aba **Licença** para ver o plano, o estado, o tempo restante e o vencimento exato. A validação inicial requer internet: o aplicativo não cria um teste local independente quando o serviço estiver indisponível.
 3. Para continuar após o teste, cole a chave recebida em **Ativar licença** e clique em **Ativar**. A primeira ativação bem-sucedida inicia o período pago inteiro; o teste restante não é descontado.
 4. Para renovar, use uma nova chave. Antes de vencer, o novo período começa no vencimento atual; depois de vencer, começa no horário da renovação. Repetir a mesma chave não acrescenta prazo novamente.
 5. Depois de renovar, revise e retome explicitamente os envios que deseja executar. Campanhas antigas não são retomadas automaticamente.
@@ -16,7 +16,7 @@ Uma chave mensal acrescenta **um mês de calendário** e uma anual acrescenta **
 
 A primeira ativação exige contato seguro com o serviço. Após uma validação bem-sucedida, um comprovante assinado permite até **72 horas** sem novo contato, limitado também ao vencimento do teste ou da licença. A tolerância não adiciona dias ao contrato. Falha de internet e resposta negativa do servidor têm estados diferentes.
 
-Ao vencer, ou quando a validade não puder ser comprovada com segurança, o aplicativo bloqueia novos envios e automações. Os registros, contatos, campanhas, modelos, arquivos, lembretes, usuários, responsáveis e controle operacional continuam armazenados. A área de licença e a exportação autorizada dos dados permanecem acessíveis. Um envio já submetido ao WhatsApp pode não ser cancelável; seu resultado deve ser revisado antes de repetir.
+Quando a validade não puder ser comprovada com segurança, o aplicativo bloqueia novos envios e automações. Ao confirmar o vencimento do teste ou da licença, bloqueia também consulta, edição, exportação e demais recursos: ficam disponíveis somente a tela de licença e o botão de contato com o desenvolvedor. Os registros, contatos, campanhas, modelos, arquivos, lembretes, usuários, responsáveis e controle operacional continuam armazenados. A TV deixa de exibir ofertas enquanto bloqueada. O botão de suporte abre a conversa externa com o desenvolvedor mediante clique; não envia uma mensagem automaticamente nem libera o aplicativo. Um envio já submetido ao WhatsApp pode não ser cancelável; seu resultado deve ser revisado antes de repetir após renovar.
 
 Não altere o relógio do Windows para prolongar o período. O aplicativo confere o horário de servidor e checkpoints locais protegidos; uma regressão relevante de relógio exige nova validação online. Suspensão e reinicialização não criam uma nova tolerância. Reabrir o aplicativo no mesmo ciclo do Windows pode usar o comprovante offline válido. Após reiniciar o próprio Windows, é exigida validação online, porque o contador de tempo do sistema foi reiniciado; isso impede ampliar a tolerância congelando o relógio enquanto o computador está desligado. As automações também precisam do computador ligado, sem suspensão, e de conexão válida ao WhatsApp.
 
@@ -45,7 +45,7 @@ Não compartilhe a pasta administrativa com todos os usuários e não inclua ess
 
 ## Atualização e recuperação
 
-Encerre o aplicativo pela bandeja e copie o perfil inteiro `%APPDATA%\Mega Disparos` para um local privado antes de instalar a nova versão. O identificador legado e a pasta do perfil são mantidos para preservar dados. Confira cadastros e controles operacionais antes de retomar os envios. Consulte também [Atualização e recuperação da linha 2.3](ATUALIZACAO-2.3.1.md).
+Encerre o aplicativo pela bandeja e copie o perfil inteiro `%APPDATA%\Mega Disparos`, incluindo mídias, para um local privado antes de instalar a nova versão. Preserve `%LOCALAPPDATA%\KennedCodeDisparos-Licensing` e a âncora `HKCU\Software\KennedCodeDisparos\Licensing` no mesmo dispositivo. O identificador legado e a pasta do perfil são mantidos para preservar dados. Credenciais protegidas por DPAPI permanecem vinculadas ao usuário e equipamento Windows correspondentes; não são portáteis para outro computador. Confira cadastros e controles operacionais antes de retomar os envios. Consulte [Atualização e recuperação desta revisão](ATUALIZACAO-2.3.2-REFORMULADO.md).
 
 O backup das campanhas não transfere uma licença para outro computador. Reinstalar a mesma versão ou restaurar dados não reinicia o teste nem aumenta o contrato no servidor. Para recuperar a versão anterior, preserve primeiro o perfil atual, reinstale o instalador guardado e restaure a cópia completa anterior, com os envios pausados. Confirmações de envio posteriores ao backup precisam ser revisadas para evitar repetição.
 

@@ -40,3 +40,8 @@ test('different alerts never play concurrently and playback failures are reporte
   controller.handle({id:'one',event:'critical'},{});controller.handle({id:'two',event:'disconnect'},{});assert.deepEqual(calls,['one']);complete();await settle();assert.deepEqual(calls,['one','two']);complete();await settle();assert.equal(max,1);controller.shutdown();
   const broken=new SoundController({play:async()=>{throw new Error('Codec indisponível');}});assert.equal((await broken.test({sound:'custom'})).soundStatus,'failed');broken.shutdown();
 });
+test('licence stop silences every queued/repeating alert without disabling renewed playback',async()=>{
+ const {controller,calls,timers}=fixture();controller.handle({id:'before-expiry',event:'critical'},{repeat:true});await settle();assert.equal(timers.size,1);
+ controller.muteAll();assert.equal(timers.size,0);assert.equal(controller.closed,false);assert.equal(controller.queue.length,0);
+ assert.equal(controller.handle({id:'before-expiry',event:'critical'},{}).soundStatus,'suppressed');controller.handle({id:'after-renewal',event:'critical'},{});await settle();assert.equal(calls.length,2);controller.shutdown();
+});

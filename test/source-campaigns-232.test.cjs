@@ -342,7 +342,7 @@ test('portable deleted-campaign day remains an explicit tombstone and never sile
   const portable = f.store.exportSourceData(); assert.equal(portable.days[0].campaignDeleted, true);
   const restored = f.store.importSourceData(portable); assert.equal(restored.enabled, false); assert.equal(f.store.getSourceDay(GROUP, record.dateKey).campaignId, record.campaignId);
   f.service.saveConfig({ enabled: true }, 'owner-test'); const received = f.service.handlePublication(f.publication('AFTER_DAY_DELETE')); await f.service.waitForIdle();
-  assert.equal(received.publication.status, 'failed'); assert.equal(received.publication.code, 'SOURCE_CAMPAIGN_REMOVED'); assert.equal(f.store.listCampaigns().length, 0); assert.equal(f.calls.length, 1);
+  assert.equal(received.ignored, true); assert.equal(f.service.getConfig().capturePaused, true); assert.equal(f.service.getConfig().captureLink.code, 'SOURCE_CAMPAIGN_REMOVED'); assert.equal(f.store.listCampaigns().length, 0); assert.equal(f.calls.length, 1);
 });
 
 test('portable restoration never reuses local encrypted media credentials for a different image revision', async t => {
@@ -366,4 +366,56 @@ test('capture queue capacity is independent per integration mode and retains pen
   assert.equal(first.publication.status, 'pending'); assert.equal(first.publication.code, null); assert.equal(f.service.queue.size, 65); assert.equal(f.store.listSourcePublications().total, 1);
   f.store.setSetting('integrationMode', 'whatsapp'); assert.equal(f.store.listSourcePublications().total, 65); assert.equal([...f.service.queue.values()].filter(entry => entry.mode === 'whatsapp').length, 64);
   assert.equal(f.store.getSourcePublication(simulatedGroup, 'SIMULATED_FIRST'), undefined); assert.equal(f.calls.length, 0);
+});
+
+
+test('campaign deletion pauses the source group persistently and never recreates on a later day or reconnect', async t => {
+  const f = await fixture(t), first = f.service.handlePublication(f.publication('DELETE-DAY')).publication; await f.service.waitForIdle();
+  const paused = f.store.transaction(() => { const result = f.store.pauseSourceForCampaign(first.campaignId, { at: f.clock.value, actorId: 'owner-test' }); f.store.deleteCampaign(first.campaignId); return result; }); f.service.cancelGroupCapture(GROUP);
+  assert.deepEqual(paused.groupIds, [GROUP]); assert.equal(f.store.getSourceLink(GROUP).status, 'paused'); assert.equal(f.store.getSourcePublication(first.id).status, 'removed'); assert.equal(f.adapter.captureConfig.enabled, false);
+  f.service.saveConfig({ enabled: false }, 'owner-test'); f.service.saveConfig({ enabled: true }, 'owner-test'); assert.equal(f.service.getConfig().capturePaused, true);
+  f.clock.value += 86400000; f.adapter.emit('status', { state: 'connected' }); assert.equal(f.service.handlePublication(f.publication('NEXT-DAY')).ignored, true);
+  await f.reopen(); assert.equal(f.service.handlePublication(f.publication('AFTER-RESTART')).ignored, true); await f.service.waitForIdle(); assert.equal(f.store.listCampaigns().length, 0); assert.equal(f.calls.length, 1);
+});
+test('deleting while media is downloading aborts promptly and late bytes cannot recreate or import an item', async t => {
+  let release; const f = await fixture(t, { download: () => new Promise(resolve => { release = resolve; }) });
+  const record = f.service.handlePublication(f.publication('LATE-DELETION')).publication; for (let n = 0; !release && n < 50; n++) await new Promise(resolve => setImmediate(resolve)); assert.equal(typeof release, 'function');
+  f.store.transaction(() => { f.store.pauseSourceForCampaign(record.campaignId, { at: f.clock.value }); f.store.deleteCampaign(record.campaignId); }); const cancelled = f.service.cancelGroupCapture(GROUP); assert.equal(cancelled.aborted, 1);
+  await f.service.waitForIdle(); assert.equal(f.calls[0].config.signal.aborted, true); assert.equal(f.store.getSourcePublication(record.id).status, 'removed'); assert.equal(f.store.listCampaigns().length, 0); assert.equal(f.store.listMedia().length, 0);
+  release({ buffer: Buffer.from('late-deleted-image'), name: 'late.jpg', mime: 'image/jpeg' }); await new Promise(resolve => setImmediate(resolve)); assert.equal(f.store.listCampaigns().length, 0); assert.equal(f.store.listMedia().length, 0); assert.equal(f.store.getSourcePublication(record.id).status, 'removed');
+  assert.throws(() => f.service.retryPublication(record.id), { code: 'SOURCE_CAPTURE_PAUSED' }); assert.equal(f.service.handlePublication(f.publication('NEW-WHILE-PAUSED')).ignored, true);
+});
+test('explicit resume creates a new draft with a new generation and only captures publications since its timestamp', async t => {
+  const f = await fixture(t), original = f.service.handlePublication(f.publication('OLD-EPOCH')).publication; await f.service.waitForIdle(); const firstId = original.campaignId;
+  f.store.transaction(() => { f.store.pauseSourceForCampaign(firstId, { at: f.clock.value }); f.store.deleteCampaign(firstId); }); f.service.cancelGroupCapture(GROUP); f.clock.value += 60000;
+  assert.throws(() => f.service.resumeGroup({ groupId: GROUP }, 'owner-test'), { code: 'SOURCE_RESUME_CONFIRM_REQUIRED' });
+  const resumed = f.service.resumeGroup({ groupId: GROUP, confirm: true }, 'owner-test'); assert.notEqual(resumed.campaign.id, firstId); assert.equal(resumed.campaign.state, 'draft'); assert.deepEqual(resumed.campaign.items, []); assert.equal(resumed.link.generation, 1); assert.equal(resumed.captureFrom, f.clock.value); assert.equal(resumed.importedOldMessages, false);
+  assert.equal(f.service.handlePublication(f.publication('STALE-EVENT', { originalTimestamp: f.clock.value - 1 })).ignored, true); assert.equal(f.service.handlePublication(f.publication('OLD-EPOCH', { originalTimestamp: original.originalAt })).ignored, true);
+  const next = f.service.handlePublication(f.publication('NEW-EPOCH')).publication; await f.service.waitForIdle(); assert.equal(f.store.getSourcePublication(next.id).campaignId, resumed.campaign.id); assert.equal(f.store.getCampaign(resumed.campaign.id).items.length, 1); assert.equal(f.store.getSourcePublication(original.id).status, 'removed'); assert.deepEqual(f.store.getSourceDay(GROUP, original.dateKey).previousCampaignIds, [firstId]);
+  await f.reopen(); assert.equal(f.service.getConfig().capturePaused, false); assert.equal(f.service.handlePublication(f.publication('NEW-EPOCH')).duplicate, true); assert.equal(f.store.listCampaigns().length, 1);
+});
+test('explicit resume accepts an inactive ordinary campaign and compatible current-day source', async t => {
+  const f = await fixture(t), first = f.service.handlePublication(f.publication('TO-LINK')).publication; await f.service.waitForIdle();
+  f.store.pauseSourceGroup(GROUP, { at: f.clock.value }); f.service.cancelGroupCapture(GROUP); const initial = f.store.getCampaign(first.campaignId);
+  const ordinary = f.store.saveCampaign({ id: 'ordinary-link-target', name: 'Campanha normal', state: 'draft', groupIds: [], items: [] });
+  const ordinaryLinked=f.service.resumeGroup({ groupId: GROUP, campaignId: ordinary.id, confirm: true }, 'owner-test'); assert.equal(ordinaryLinked.campaign.id,ordinary.id); assert.equal(ordinaryLinked.campaign.name,ordinary.name); assert.equal(ordinaryLinked.campaign.sourceManaged,true); assert.equal(ordinaryLinked.importedOldMessages,false);
+  f.store.saveCampaign({ ...initial, state: 'active' }); assert.throws(() => f.service.resumeGroup({ groupId: GROUP, campaignId: initial.id, confirm: true }, 'owner-test'), { code: 'SOURCE_RESUME_CAMPAIGN_INVALID' });
+  f.store.saveCampaign({ ...initial, state: 'draft' }); f.clock.value += 1000; const result = f.service.resumeGroup({ groupId: GROUP, campaignId: initial.id, confirm: true }, 'owner-test'); assert.equal(result.campaign.id, initial.id); assert.equal(f.store.getSourceLink(GROUP).status, 'active'); assert.equal(f.store.getSourceLink(GROUP).captureFrom, f.clock.value);
+});
+test('campaign deletion and persistent pause roll back together if deletion fails', async t => {
+  const f = await fixture(t), first = f.service.handlePublication(f.publication('ROLLBACK')).publication; await f.service.waitForIdle();
+  assert.throws(() => f.store.transaction(() => { f.store.pauseSourceForCampaign(first.campaignId, { at: f.clock.value }); f.store.deleteCampaign(first.campaignId); throw new Error('TEST_DELETE_TRANSACTION_FAILED'); }), /TEST_DELETE_TRANSACTION_FAILED/);
+  assert.equal(f.store.getSourceLink(GROUP).status, 'active'); assert(f.store.getCampaign(first.campaignId)); assert.equal(f.store.getSourcePublication(first.id).status, 'ready'); assert(f.service.handlePublication(f.publication('AFTER-ROLLBACK')).accepted); await f.service.waitForIdle(); assert.equal(f.store.getCampaign(first.campaignId).items.length, 2);
+});
+test('legacy missing link is detected once, paused across dates, and cannot silently resurrect a deleted campaign', async t => {
+  const f = await fixture(t), first = f.service.handlePublication(f.publication('LOST-LINK')).publication; await f.service.waitForIdle(); f.store.deleteCampaign(first.campaignId);
+  for (let n = 0; n < 5; n++) assert.equal(f.service.handlePublication(f.publication(`LOST-${n}`)).ignored, true);
+  const link = f.store.getSourceLink(GROUP); assert.equal(link.status, 'paused'); assert.equal(link.code, 'SOURCE_CAMPAIGN_REMOVED'); assert.equal(f.store.getSourcePublication(first.id).status, 'removed'); const at = link.pausedAt;
+  f.clock.value += 86400000; assert.equal(f.service.handlePublication(f.publication('LOST-NEXT-DATE')).ignored, true); assert.equal(f.store.getSourceLink(GROUP).pausedAt, at); assert.equal(f.store.listCampaigns().length, 0); assert.equal(f.store.listSourcePublications().total, 1);
+});
+test('portable backup preserves old campaign tombstones after explicit daily relink and never restores active capture', async t => {
+  const f = await fixture(t), first = f.service.handlePublication(f.publication('BACKUP-OLD')).publication; await f.service.waitForIdle();
+  f.store.transaction(() => { f.store.pauseSourceForCampaign(first.campaignId, { at: f.clock.value }); f.store.deleteCampaign(first.campaignId); }); f.service.cancelGroupCapture(GROUP); f.clock.value += 1000;
+  const resumed = f.service.resumeGroup({ groupId: GROUP, confirm: true }, 'owner-test'); const next = f.service.handlePublication(f.publication('BACKUP-NEW')).publication; await f.service.waitForIdle();
+  const portable = f.store.exportSourceData(); assert.deepEqual(portable.days[0].previousCampaignIds, [first.campaignId]); assert.equal(portable.links[0].campaignId, resumed.campaign.id); const restored = f.store.importSourceData(portable); assert.equal(restored.automaticResume, false); assert.equal(f.store.getSourceConfig().enabled, false); assert.equal(f.store.getSourcePublication(first.id).status, 'removed'); assert.equal(f.store.getSourcePublication(next.id).campaignId, resumed.campaign.id);
 });

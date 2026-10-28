@@ -66,7 +66,7 @@ class SourceCampaignService extends EventEmitter {
     this.store = store; this.media = mediaManager; this.safeStorage = safeStorage; this.now = now; this.isAutomationStopped = isAutomationStopped; this.assertCanCapture = assertCanCapture;
     this.concurrency = Math.min(2, Math.max(1, Number(concurrency) || 1));
     this.adapter = adapter; this.started = false; this.closed = false; this.suspended = false; this.inFlight = new Set(); this.tasks = new Set(); this.controllers = new Set();
-    this.queue = new Map(); this.pumpScheduled = false;
+    this.queue = new Map(); this.controllerRecords = new Map(); this.pumpScheduled = false;
     this.publicationListener = context => this._receive(() => this.handlePublication(context));
     this.updateListener = context => this._receive(() => this.handleUpdate(context));
     this.deleteListener = context => this._receive(() => this.handleDelete(context));
@@ -80,14 +80,59 @@ class SourceCampaignService extends EventEmitter {
   }
   _receive(work) { try { const result = work(); if (result?.catch) result.catch(error => this._error(error)); } catch (error) { this._error(error); } }
   _error(error) { try { this._trace(null, 'failure', error.code || 'SOURCE_CAPTURE_ERROR', String(error.message || 'Falha de captura.').slice(0, 500), 'Abra a campanha de origem e revise o item.'); } catch { this.captureBlockedReason = 'SOURCE_STORAGE_UNAVAILABLE'; } this.emit('change'); }
-  getConfig() { return normalizeConfig({}, this.store.getSourceConfig(), this.now()); }
+  getConfig() { const config = normalizeConfig({}, this.store.getSourceConfig(), this.now()); const captureLink = config.groupId ? this.store.getSourceLink?.(config.groupId) || null : null; return { ...config, captureLink, capturePaused: captureLink?.status === 'paused', pausedReason: captureLink?.status === 'paused' ? captureLink.reason : null }; }
+  _ensureLink(config = this.getConfig()) {
+    if (!config.groupId) return null; let link = this.store.getSourceLink(config.groupId);
+    if (!link) { const day = this.store.getLatestSourceDay(config.groupId); link = this.store.setSourceLink({ groupId: config.groupId, status: 'active', campaignId: day?.campaignId || null, generation: 0, captureFrom: config.enabledAt || 0, createdAt: this.now() }); }
+    if (link.status === 'active' && link.campaignId) { const campaign = this.store.getCampaign(link.campaignId); if (!campaign || campaign.sourceManaged !== true || campaign.sourceGroupId !== config.groupId) return this._pauseLink(config.groupId, { campaignId: link.campaignId, code: !campaign ? 'SOURCE_CAMPAIGN_REMOVED' : 'SOURCE_DAY_CAMPAIGN_INVALID', reason: !campaign ? 'A campanha vinculada foi excluída; retome a origem explicitamente para criar ou vincular outro rascunho.' : 'O vínculo da origem aponta para uma campanha incompatível; revise a configuração antes de retomar.' }).link; }
+    return link;
+  }
+  _pauseLink(groupId, options = {}) { const result = this.store.pauseSourceGroup(groupId, { at: this.now(), ...options }); this.cancelGroupCapture(groupId); if (result.changed) this._trace({ groupId, campaignId: result.link.campaignId }, 'paused', result.link.code, result.link.reason, 'Use Retomar acompanhamento para criar ou vincular um rascunho; mensagens antigas não serão importadas.'); this._configureAdapter(); this.emit('change'); return result; }
+  cancelGroupCapture(groupId) { let aborted = 0, queued = 0; for (const [controller, record] of this.controllerRecords) if (record.groupId === groupId && record.mode === this._mode()) { controller.abort(); aborted++; } for (const [id, entry] of this.queue) if (entry.mode === this._mode() && (entry.context?.chatId || entry.context?.groupId) === groupId) { this.queue.delete(id); queued++; } this._configureAdapter(); this.emit('change'); return { aborted, queued }; }
+  cancelCampaignCapture(campaignId) {
+    if (typeof campaignId !== 'string' || !campaignId || campaignId.length > 512) throw fault('Campanha de origem inválida.', 'SOURCE_CAMPAIGN_NOT_FOUND');
+    const mode = this._mode(); let aborted = 0, queued = 0;
+    for (const [controller, record] of this.controllerRecords) {
+      if (record.mode !== mode) continue;
+      const publication = record.publicationId && this.store.getSourcePublication(record.publicationId);
+      if (record.campaignId !== campaignId && publication?.campaignId !== campaignId) continue;
+      if (!controller.signal.aborted) { controller.abort(); aborted++; }
+    }
+    for (const [id, entry] of this.queue) {
+      if (entry.mode !== mode || this.store.getSourcePublication(id)?.campaignId !== campaignId) continue;
+      this.queue.delete(id); queued++;
+    }
+    // Call after the persistent deletion transaction. Only this campaign's
+    // contexts are discarded; a newer campaign of the same origin keeps its
+    // binding, downloads, and capture configuration unchanged.
+    if (aborted || queued) { this._schedulePump(); this.emit('change'); }
+    return { aborted, queued };
+  }
+  _recordAllowed(record) { const config = this.getConfig(); if (!this._isCaptureAllowed(config) || config.groupId !== record.groupId) return false; const link = this.store.getSourceLink(record.groupId); return !link || (record.captureGeneration || 0) === link.generation && (record.historical === true ? config.importFrom && record.originalAt >= config.importFrom && record.originalAt <= config.importUntil : record.originalAt >= link.captureFrom); }
+  resumeGroup(input = {}, actorId) {
+    if (input.confirm !== true) throw fault('Confirme a retomada da captura. Somente novas publicações serão incluídas.', 'SOURCE_RESUME_CONFIRM_REQUIRED');
+    const config = this.getConfig(), groupId = input.groupId || config.groupId; if (groupId !== config.groupId) throw fault('Selecione a origem configurada no modo atual.', 'SOURCE_GROUP_UNAVAILABLE'); this._assertGroup(groupId, false);
+    if (this.assertCanCapture(actorId || config.ownerId) === false) throw fault('Confira licença e permissões antes de retomar.', 'SOURCE_CAPTURE_BLOCKED');
+    const at = this.now(), dateKey = localDay(at, config.timezone); let campaign = input.campaignId && this.store.getCampaign(input.campaignId);
+    if (input.campaignId && (!campaign || campaign.state === 'active' || campaign.sourceManaged && (campaign.sourceGroupId !== groupId || campaign.sourceDateKey !== dateKey))) throw fault('Vincule uma campanha desativada sem outra origem, ou a campanha desta origem e do dia atual.', 'SOURCE_RESUME_CAMPAIGN_INVALID');
+    this.cancelGroupCapture(groupId);
+    const result = this.store.transaction(() => {
+      const old = this.store.getSourceLink(groupId); this.store.pauseSourceGroup(groupId, { at, actorId, reason: 'Retomada explícita; publicações anteriores ficam preservadas sem entrar na nova captura.', code: 'SOURCE_RESUME_RESET' });
+      if (!campaign) campaign = this.store.saveCampaign(this._baseCampaign({ groupId, dateKey }, { ...config, ownerId: actorId || config.ownerId }));
+      else campaign=this.store.saveCampaign({...campaign,sourceManaged:true,sourceGroupId:groupId,sourceDateKey:dateKey,sourceTimezone:config.timezone,state:'draft',nextRunAt:null});
+      this.store.relinkSourceDay({ groupId, dateKey, campaignId: campaign.id, createdAt: at });
+      const link = this.store.setSourceLink({ groupId, status: 'active', campaignId: campaign.id, generation: (old?.generation || 0) + 1, captureFrom: at, resumedAt: at, resumedBy: actorId || null, pausedAt: null, reason: null, code: null });
+      const saved = this.store.setSourceConfig({ ...normalizeConfig({ enabled: true }, config, at, actorId), enabledAt: at, importFrom: null, importUntil: null });
+      this.store.addAudit?.({ id: randomUUID(), at, userId: actorId, action: 'source.resume', groupId, campaignId: campaign.id }); return { link, campaign, config: saved, captureFrom: at, importedOldMessages: false };
+    }); this.captureBlockedReason = null; this._configureAdapter(); this._schedulePump(); this.emit('change'); return result;
+  }
   saveConfig(input, actorId) {
     const previous = this.store.getSourceConfig(), config = normalizeConfig(input, previous, this.now(), actorId);
     if (config.groupId) this._assertGroup(config.groupId, false);
     for (const id of config.configTemplate.groupIds) this._assertGroup(id, true);
     this.store.transaction(() => { this.store.setSourceConfig(config); this.store.addAudit?.({ id: randomUUID(), at: this.now(), userId: actorId, action: 'source.config', groupId: config.groupId, enabled: config.enabled }); });
     if (!config.enabled || previous.groupId && previous.groupId !== config.groupId) for (const controller of this.controllers) controller.abort();
-    this._configureAdapter(); this._schedulePump(); this.emit('change'); return config;
+    this._ensureLink(config); this._configureAdapter(); this._schedulePump(); this.emit('change'); return this.getConfig();
   }
   _assertGroup(id, destination) {
     const group = this.store.getGroup(id), simulated = this._mode() === 'simulated';
@@ -95,13 +140,13 @@ class SourceCampaignService extends EventEmitter {
     if (destination && !group.authorized) throw fault('O destino não possui autorização para publicar.', 'SOURCE_DESTINATION_UNAUTHORIZED');
     return group;
   }
-  _configureAdapter() { const c = this.getConfig(); const options = { enabled: c.enabled, groupIds: c.groupId ? [c.groupId] : [], activatedAt: c.enabledAt, importFrom: c.importFrom, importUntil: c.importUntil };
+  _configureAdapter() { const c = this.getConfig(); const options = { enabled: c.enabled && !c.capturePaused && !this.closed && !this.suspended, groupIds: c.groupId ? [c.groupId] : [], activatedAt: c.enabledAt, importFrom: c.importFrom, importUntil: c.importUntil };
     if (this.adapter?.setSourceCapture) this.adapter.setSourceCapture(options); else this.adapter?.configureSourceCapture?.(options);
   }
   _attach() { this.adapter?.on('publication', this.publicationListener); this.adapter?.on('publicationUpdate', this.updateListener); this.adapter?.on('publicationDelete', this.deleteListener); this.adapter?.on('status', this.statusListener); }
   _detach() { this.adapter?.off('publication', this.publicationListener); this.adapter?.off('publicationUpdate', this.updateListener); this.adapter?.off('publicationDelete', this.deleteListener); this.adapter?.off('status', this.statusListener); }
   start() {
-    if (this.started || this.closed) return; this.started = true; this._attach(); this._configureAdapter();
+    if (this.started || this.closed) return; this.started = true; this._attach(); this._ensureLink(); this._configureAdapter();
     for (;;) { const page = this.store.listSourcePublications({ status: 'downloading', limit: 200 });
       for (const record of page.items) this.store.updateSourcePublication(record.id, { status: 'pending', code: 'SOURCE_DOWNLOAD_INTERRUPTED', error: 'Download interrompido; será verificado sem duplicar o item.' });
       if (page.items.length < 200) break;
@@ -111,6 +156,7 @@ class SourceCampaignService extends EventEmitter {
   setAdapter(adapter) { this._detach(); for (const controller of this.controllers) controller.abort(); this.adapter = adapter; if (this.started) this._attach(); this._configureAdapter(); this._schedulePump(); }
   _isCaptureAllowed(config = this.getConfig()) {
     if (this.closed || this.suspended || this.store.persistenceFailed || !config.enabled || this.isAutomationStopped()) return false;
+    const link = this._ensureLink(config); if (link?.status === 'paused') { this.captureBlockedReason = link.code || 'SOURCE_CAPTURE_PAUSED'; return false; }
     try { const allowed = this.assertCanCapture(config.ownerId) !== false; this.captureBlockedReason = allowed ? null : 'SOURCE_CAPTURE_BLOCKED'; return allowed; } catch (error) { this.captureBlockedReason = error.code || 'SOURCE_CAPTURE_BLOCKED'; return false; }
   }
   _identity(context, config) {
@@ -148,7 +194,7 @@ class SourceCampaignService extends EventEmitter {
     try { if (image) persistRaw(context.raw); } catch (error) { metadataError = error; }
     if (image && [...this.queue.values()].filter(entry => entry.mode === this._mode()).length >= 64) metadataError = fault('A fila de captura está cheia. A legenda foi preservada; reenvie esta foto ou importe a mídia manualmente.', 'SOURCE_CAPTURE_QUEUE_FULL');
     const record = { id: hash(`${this._mode()}\0${groupId}\0${messageId}`), messageId, groupId,
-      originalAt, capturedAt: this.now(), revisionAt: originalAt, dateKey: localDay(originalAt, config.timezone), ownerId: config.ownerId,
+      originalAt, capturedAt: this.now(), revisionAt: originalAt, captureGeneration: this.store.getSourceLink(groupId)?.generation || 0, dateKey: localDay(originalAt, config.timezone), ownerId: config.ownerId,
       senderId: identity.id, senderPhone: identity.phone, fromMe: context.fromMe === true, text: caption, caption, originalText: caption, originalCaption: caption,
       type, protectedContext: null, mediaFingerprint: /^[a-f0-9]{64}$/i.test(context.mediaFingerprint || '') ? context.mediaFingerprint : null,
       status: metadataError ? 'failed' : status, reason: image ? caption.trim() ? null : 'Foto sem legenda: revise antes de incluir.' : 'Texto ou outro formato recebido separadamente: revise antes de incluir.',
@@ -180,7 +226,12 @@ class SourceCampaignService extends EventEmitter {
   }
   async _download(record) {
     const mode = this._mode(), adapter = this.adapter, revisionAt = record.revisionAt;
-    const config = this.getConfig(), controller = new AbortController(); this.controllers.add(controller);
+    const config = this.getConfig(), controller = new AbortController(); if (!this._recordAllowed(record)) return; this.controllers.add(controller); this.controllerRecords.set(controller, { groupId: record.groupId, mode, publicationId: record.id, campaignId: record.campaignId || null });
+    const currentPublication = () => {
+      if (this.closed || mode !== this._mode() || adapter !== this.adapter || controller.signal.aborted || !this._recordAllowed(record)) return null;
+      const current = this.store.getSourcePublication(record.id);
+      return current && current.status !== 'removed' && current.revisionAt === revisionAt ? current : null;
+    };
     let timeout, aborted; this.store.updateSourcePublication(record.id, { status: 'downloading', attempts: (record.attempts || 0) + 1, lastAttemptAt: this.now() });
     const deadline = new Promise((_, reject) => {
       aborted = () => reject(fault('Download suspenso com segurança; nenhum conteúdo parcial incluído.', 'SOURCE_MEDIA_DOWNLOAD_SUSPENDED'));
@@ -196,11 +247,14 @@ class SourceCampaignService extends EventEmitter {
       if (context?.raw) {
         try {
           if (!this.safeStorage || !await bounded(this.safeStorage.isEncryptionAvailable())) throw fault('Proteção do sistema indisponível.', 'SOURCE_MEDIA_PROTECTION_UNAVAILABLE');
+          if (!currentPublication()) return;
           const envelope = await bounded(this.safeStorage.encryptString(JSON.stringify(persistRaw(context.raw))));
-          if (mode === this._mode() && adapter === this.adapter && this.store.getSourcePublication(record.id)?.revisionAt === revisionAt) this.store.updateSourcePublication(record.id, { protectedContext: Buffer.from(envelope).toString('base64'), retryRequiresRepost: false });
+          if (!currentPublication()) return;
+          this.store.updateSourcePublication(record.id, { protectedContext: Buffer.from(envelope).toString('base64'), retryRequiresRepost: false });
         } catch (error) {
           if (controller.signal.aborted) throw error;
-          if (mode === this._mode()) this.store.updateSourcePublication(record.id, { retryRequiresRepost: true, protectionCode: 'SOURCE_MEDIA_PROTECTION_UNAVAILABLE' });
+          if (!currentPublication()) return;
+          this.store.updateSourcePublication(record.id, { retryRequiresRepost: true, protectionCode: 'SOURCE_MEDIA_PROTECTION_UNAVAILABLE' });
         }
       }
       if (!context) {
@@ -209,17 +263,18 @@ class SourceCampaignService extends EventEmitter {
         try { context = { messageId: record.messageId, chatId: record.groupId, type: record.type, text: record.caption, raw: restoreRaw(JSON.parse(await bounded(this.safeStorage.decryptString(Buffer.from(record.protectedContext, 'base64'))))) }; }
         catch (error) { if (controller.signal.aborted) throw error; throw fault('Não foi possível abrir os dados protegidos desta mídia neste usuário do Windows. Reenvie a publicação ou importe o arquivo.', 'SOURCE_MEDIA_PROTECTION_UNAVAILABLE'); }
       }
+      if (!currentPublication()) return;
       const work = queued?.context?.media?.download ? queued.context.media.download({ signal: controller.signal }) : adapter?.downloadIncoming?.(context, { signal: controller.signal, timeoutMs: config.mediaTimeoutSeconds * 1000 });
       if (!work) throw fault('A integração não fornece download desta mídia. Importe o arquivo ou revise a publicação.', 'SOURCE_MEDIA_DOWNLOAD_UNSUPPORTED');
       const downloaded = await bounded(work);
-      if (this.closed || adapter !== this.adapter || mode !== this._mode() || controller.signal.aborted) return;
+      if (this.closed || adapter !== this.adapter || mode !== this._mode() || controller.signal.aborted || !this._recordAllowed(record)) return;
       const latest = this.store.getSourcePublication(record.id);
       if (!latest || latest.status === 'removed' || latest.revisionAt !== revisionAt) return;
       const buffer = Buffer.isBuffer(downloaded) ? downloaded : downloaded?.buffer;
       if (!buffer) throw fault('O download não retornou um arquivo completo.', 'SOURCE_MEDIA_DOWNLOAD_INVALID');
       const media = await bounded(this.media.importBuffer(buffer, { name: downloaded.name || `${record.messageId}.jpg`, mime: downloaded.mime || 'image/jpeg', signal: controller.signal, expectedMode: mode,
-        beforeSave: () => { const publication = mode === this._mode() && this.store.getSourcePublication(record.id); return !this.closed && adapter === this.adapter && mode === this._mode() && this._isCaptureAllowed() && this.getConfig().groupId === record.groupId && publication?.status !== 'removed' && publication?.revisionAt === revisionAt; } }));
-      if (this.closed || adapter !== this.adapter || mode !== this._mode()) return;
+        beforeSave: () => { const publication = mode === this._mode() && this.store.getSourcePublication(record.id); return !this.closed && adapter === this.adapter && mode === this._mode() && this._recordAllowed(record) && this.getConfig().groupId === record.groupId && publication?.status !== 'removed' && publication?.revisionAt === revisionAt; } }));
+      if (this.closed || adapter !== this.adapter || mode !== this._mode() || !this._recordAllowed(record)) return;
       const fresh = this.store.getSourcePublication(record.id);
       if (fresh?.status === 'removed' || fresh?.revisionAt !== revisionAt) return;
       this._ready({ ...fresh, mediaId: media.id, mediaType: media.type, error: null, code: null });
@@ -227,10 +282,11 @@ class SourceCampaignService extends EventEmitter {
       if (mode !== this._mode() || this.closed) return;
       const latest = this.store.getSourcePublication(record.id);
       if (!latest || latest.status === 'removed' || latest.revisionAt !== revisionAt) return;
+      if (!this._recordAllowed(record)) { const link = this.store.getSourceLink(record.groupId); if (link?.status !== 'paused' && (record.captureGeneration || 0) === (link?.generation || 0)) this.store.updateSourcePublication(record.id, { status: 'pending' }); return; }
       if (adapter !== this.adapter || error.code === 'SOURCE_MEDIA_DOWNLOAD_SUSPENDED') { this.store.updateSourcePublication(record.id, { status: 'pending' }); return; }
       const saved = this.store.updateSourcePublication(record.id, { status: 'failed', code: error.code || 'SOURCE_MEDIA_DOWNLOAD_FAILED', error: String(error.message || 'Não foi possível salvar a mídia.').slice(0, 500), failedAt: this.now() });
       this._trace(saved, 'media', saved.code, saved.error, 'Tente novamente ou revise/importa o arquivo; nenhum outro item será bloqueado.');
-    } finally { clearTimeout(timeout); if (aborted) controller.signal.removeEventListener('abort', aborted); this.controllers.delete(controller); this.emit('change'); }
+    } finally { clearTimeout(timeout); if (aborted) controller.signal.removeEventListener('abort', aborted); this.controllers.delete(controller); this.controllerRecords.delete(controller); this.emit('change'); }
   }
   _baseCampaign(record, config) {
     const [y, m, d] = record.dateKey.split('-');
@@ -243,13 +299,18 @@ class SourceCampaignService extends EventEmitter {
   _dailyCampaign(record, config) {
     const day = this.store.getSourceDay(record.groupId, record.dateKey);
     let campaign = day && this.store.getCampaign(day.campaignId);
-    if (day && !campaign) throw fault('A campanha diária foi excluída. Revise a publicação; ela não será recriada silenciosamente.', 'SOURCE_CAMPAIGN_REMOVED');
+    if (day && !campaign) {
+      const link = this.store.getSourceLink(record.groupId);
+      if (link?.campaignId === day.campaignId || !link && this.store.getLatestSourceDay(record.groupId)?.campaignId === day.campaignId) this._pauseLink(record.groupId, { campaignId: day.campaignId, code: 'SOURCE_CAMPAIGN_REMOVED' });
+      throw fault('A campanha diária foi excluída. Revise a publicação; ela não será recriada silenciosamente.', 'SOURCE_CAMPAIGN_REMOVED');
+    }
     if (campaign && (campaign.sourceManaged !== true || campaign.sourceGroupId !== record.groupId || campaign.sourceDateKey !== record.dateKey)) throw fault('O vínculo da origem aponta para outra campanha. A publicação não foi adicionada; restaure uma cópia consistente ou revise o cadastro da origem.', 'SOURCE_DAY_CAMPAIGN_INVALID');
     if (!campaign) { campaign = this.store.saveCampaign(this._baseCampaign(record, config)); this.store.insertSourceDay({ groupId: record.groupId, dateKey: record.dateKey, campaignId: campaign.id, createdAt: this.now() }); }
+    const link = this.store.getSourceLink(record.groupId); if (link?.status === 'paused') throw fault('A captura da origem está pausada; retome explicitamente.', 'SOURCE_CAPTURE_PAUSED'); this.store.setSourceLink({ ...link, groupId: record.groupId, status: 'active', campaignId: campaign.id });
     return campaign;
   }
   _ready(record) {
-    if (!this._isCaptureAllowed() || this.getConfig().groupId !== record.groupId) return this.store.updateSourcePublication(record.id, { ...record, status: 'pending' });
+    if (!this._recordAllowed(record)) throw fault('A captura foi pausada ou esta publicação pertence a uma etapa anterior; retome explicitamente e publique novamente.', 'SOURCE_CAPTURE_PAUSED');
     if (!String(record.caption || record.text || '').trim()) return this.store.saveSourcePublication({ ...record, status: 'review', reason: 'Foto salva sem legenda. Revise manualmente; nenhum texto próximo será associado automaticamente.' });
     return this.store.transaction(() => {
       const existing = this.store.getSourcePublication(record.id);
@@ -325,8 +386,12 @@ class SourceCampaignService extends EventEmitter {
     return this.removePublication(old.id, { at: context.deletedAt, event: true });
   }
   reviewPublication(id, { caption, text, include = true, mediaId } = {}, actorId) {
-    let record = this.store.getSourcePublication(id); if (!record || record.status === 'removed') throw fault('Publicação não encontrada ou removida.', 'SOURCE_PUBLICATION_NOT_FOUND');
+    let record = this.store.getSourcePublication(id); if (!record) throw fault('Publicação não encontrada.', 'SOURCE_PUBLICATION_NOT_FOUND');
+    // Removing a captured item is safe while its origin is paused; only adding
+    // or changing future captured content requires a currently active link.
     if (!include) return this.removePublication(id, { actorId });
+    if (record.status === 'removed') throw fault('Publicação removida; não será reimportada automaticamente.', 'SOURCE_PUBLICATION_NOT_FOUND');
+    if (!this._recordAllowed(record)) throw fault('A captura desta publicação está pausada; retome a origem explicitamente.', 'SOURCE_CAPTURE_PAUSED');
     const body = caption !== undefined ? String(caption) : text !== undefined ? String(text) : record.caption;
     if (!body.trim()) throw fault('Informe o texto ou legenda completo para revisão.', 'SOURCE_REVIEW_TEXT_REQUIRED');
     if (body.length > 16000) throw fault('Use até 16.000 caracteres, sem corte automático do texto original.', 'SOURCE_REVIEW_TEXT_TOO_LARGE');
@@ -354,7 +419,7 @@ class SourceCampaignService extends EventEmitter {
     }); this.queue.delete(id); this.emit('change'); return result;
   }
   retryPublication(id) {
-    const record = this.store.getSourcePublication(id); if (!record || record.status === 'removed') throw fault('Publicação não encontrada ou removida.', 'SOURCE_PUBLICATION_NOT_FOUND');
+    const record = this.store.getSourcePublication(id); if (record && !this._recordAllowed(record)) throw fault('A captura desta publicação está pausada; retome a origem explicitamente.', 'SOURCE_CAPTURE_PAUSED'); if (!record || record.status === 'removed') throw fault('Publicação não encontrada ou removida.', 'SOURCE_PUBLICATION_NOT_FOUND');
     if (!['failed', 'review', 'pending'].includes(record.status)) throw fault('Esta publicação já está pronta ou em processamento.', 'SOURCE_RETRY_NOT_ALLOWED');
     if (!record.caption.trim()) throw fault('Revise a foto sem legenda antes de tentar incluí-la.', 'SOURCE_REVIEW_TEXT_REQUIRED');
     const saved = this.store.updateSourcePublication(id, { status: 'pending', error: null, code: null }); this._schedulePump(); this.emit('change'); return saved;
@@ -393,7 +458,7 @@ class SourceCampaignService extends EventEmitter {
     let captured = 0; for (const context of messages) if (this.handlePublication({ ...context, historical: true }, { importing: true }).accepted) captured++;
     return { captured, complete: false, from: start, to: end, notice: 'Somente as mensagens realmente fornecidas pela integração foram importadas; o histórico pode ter lacunas.' };
   }
-  metrics() { const config = this.getConfig(); return { ...this.store.getSourceMetrics(), groupId: config.groupId, groupName: this.store.getGroup(config.groupId)?.name || null, startedAt: config.enabledAt, enabled: config.enabled, captureBlockedReason: this.captureBlockedReason || null,
+  metrics() { const config = this.getConfig(); return { ...this.store.getSourceMetrics(), groupId: config.groupId, groupName: this.store.getGroup(config.groupId)?.name || null, startedAt: config.enabledAt, enabled: config.enabled, capturePaused: config.capturePaused, captureLink: config.captureLink, pausedReason: config.pausedReason, captureBlockedReason: this.captureBlockedReason || null,
     limitations: { historyImport: typeof this.adapter?.listSourceHistory === 'function', albumAssociation: 'Somente vínculo explícito informado pela integração ou agrupamento manual; nunca por proximidade de horário.' } }; }
   async waitForIdle() { for (;;) { this._pump(); if (!this.tasks.size) return; await Promise.allSettled([...this.tasks]); } }
   suspendCapture() { this.suspended = true; for (const controller of this.controllers) controller.abort(); this.emit('change'); return { inProgress: this.inFlight.size }; }

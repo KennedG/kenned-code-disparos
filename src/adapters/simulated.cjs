@@ -20,6 +20,8 @@ class SimulatedAdapter extends EventEmitter {
     this.seenPublications = new Set();
     this.groupAvailability = new Map();
     this.searchCapture = { enabled: false, importHistory: false, groupIds: null, commandGroupIds: null };
+    this.opportunityCapture = { enabled: false, monitoredGroupIds: new Set(), allowOwnMessages: false, activatedAt: 0 };
+    this.seenOpportunities = new Set();
     this.status = { state: 'disconnected', mode: 'simulated', detail: 'Simulação local: nenhum envio pelo WhatsApp.' };
   }
 
@@ -218,6 +220,49 @@ class SimulatedAdapter extends EventEmitter {
     return { enabled: this.searchCapture.enabled, importHistory: this.searchCapture.importHistory, ...this.getSearchCapabilities() };
   }
 
+  configureOpportunityCapture({ enabled = false, monitoredGroupIds = [], allowOwnMessages = false, activatedAt = Date.now() } = {}) {
+    const groups = Array.isArray(monitoredGroupIds) ? monitoredGroupIds : [];
+    this.opportunityCapture = { enabled: enabled === true,
+      monitoredGroupIds: new Set(groups.slice(0, 1000).filter(id => typeof id === 'string' && /^sim-\d+@simulation$/.test(id))),
+      allowOwnMessages: allowOwnMessages === true,
+      activatedAt: Number.isFinite(Number(activatedAt)) && Number(activatedAt) >= 0 ? Number(activatedAt) : Date.now() };
+    return { enabled: this.opportunityCapture.enabled, ...this.getOpportunityCapabilities() };
+  }
+
+  getOpportunityCapabilities() { return { live: true, edits: true, deletes: true, history: false,
+    quotedReferences: 'stored-same-chat-origin-and-current-sender-required', official: false, mode: 'simulated', simulation: true }; }
+
+  _opportunityEvent(event, type = 'opportunityMessage') {
+    const config = this.opportunityCapture;
+    if (!config.enabled || !config.monitoredGroupIds.has(event.chatId) || event.mode !== 'simulated' || event.simulation !== true ||
+        event.type !== 'text' || typeof event.text !== 'string' || !event.text.trim() || event.text.length > 16000 ||
+        !event.identityVerified || event.automaticMessage || event.fromMe && (!config.allowOwnMessages || !event.trustedSelf) || event.history) return;
+    if (type === 'opportunityMessage') {
+      if (!Number.isFinite(event.timestamp) || event.timestamp < config.activatedAt || event.timestamp > Date.now() + 30000) return;
+      const key = `${event.accountId}:${event.chatId}:${event.messageId}`;
+      if (this.seenOpportunities.has(key)) return;
+      this.seenOpportunities.add(key);
+      while (this.seenOpportunities.size > 5000) this.seenOpportunities.delete(this.seenOpportunities.values().next().value);
+    }
+    const { quotedMessageId, quotedChatId, ...context } = event;
+    const quote = typeof quotedMessageId === 'string' && quotedMessageId && quotedMessageId.length <= 512 &&
+      (!quotedChatId || quotedChatId === event.chatId) ? { quotedMessageId, quotedChatId: event.chatId } : {};
+    this.emit(type, { ...context, ...quote, originalTimestamp: type === 'opportunityMessage' ? event.timestamp : null });
+  }
+
+  injectOpportunityMessage(context = {}) {
+    const event = this._offerContext({ ...context, isGroup: true }, context.history === true || context.historical === true); this._opportunityEvent(event); return event;
+  }
+  injectOpportunityUpdate(context = {}) {
+    const event = this._offerContext({ ...context, isGroup: true, revisionAt: context.revisionAt ?? Date.now() });
+    delete event.timestamp; this._opportunityEvent(event, 'opportunityMessageUpdated'); return event;
+  }
+  injectOpportunityDelete(context = {}) {
+    if (!this.opportunityCapture.enabled || !this.opportunityCapture.monitoredGroupIds.has(context.chatId) || !context.messageId) return;
+    this.emit('opportunityMessageDeleted', { messageId: context.messageId, chatId: context.chatId,
+      deletedAt: context.deletedAt ?? Date.now(), source: 'simulation-only', mode: 'simulated', simulation: true });
+  }
+
   _beforeSubmit(callback){if(!callback)return;try{const result=callback();if(result&&typeof result.then==='function')throw Object.assign(new Error('A guarda final deve ser síncrona.'),{code:'WA_SUBMISSION_GUARD_ASYNC'});}catch(error){throw Object.assign(new Error(error.message||'Envio bloqueado antes da submissão.'),{code:error.code||'WA_SUBMISSION_BLOCKED',definitive:true,safeToRetry:false,submitted:false});}}
   async sendPrivateContent(target,item,media,options={}){
     if(item?.type==='text')return this.sendSearchText(target,item.text,options);
@@ -326,6 +371,7 @@ class SimulatedAdapter extends EventEmitter {
     }
     if (!event.history && !(event.isGroup && event.type !== 'text' && this.sourceCapture.enabled && this.sourceCapture.groupIds.has(event.chatId))) this.emit('incoming', event);
     this._sourceEvent(event);
+    this._opportunityEvent(event);
     if (this._searchChatAllowed(event.chatId) && !event.history) this.emit('offerMessage', event);
     return event;
   }
@@ -341,6 +387,7 @@ class SimulatedAdapter extends EventEmitter {
 
   injectOfferMessage(context = {}) {
     const event = this._offerContext(context);
+    this._opportunityEvent(event);
     if (this._searchChatAllowed(event.chatId)) this.emit('offerMessage', event);
     return event;
   }

@@ -2,12 +2,14 @@
 
 function soundPreferences(value={}){
   const volume=Number(value.volume??60),interval=Number(value.intervalSeconds??30),count=Number(value.maxRepeats??3);
-  return {enabled:value.enabled!==false,volume:Number.isFinite(volume)?Math.max(0,Math.min(100,volume)):60,sound:['soft','urgent','custom'].includes(value.sound)?value.sound:'soft',customAudioId:value.customAudioId||null,events:Array.isArray(value.events)?value.events.filter(v=>['disconnect','critical'].includes(v)):['disconnect','critical'],repeat:!!value.repeat,intervalSeconds:Number.isFinite(interval)?Math.max(3,Math.min(3600,interval)):30,maxRepeats:Number.isFinite(count)?Math.max(1,Math.min(20,Math.floor(count))):3,quiet:{enabled:!!value.quiet?.enabled,start:value.quiet?.start||'22:00',end:value.quiet?.end||'07:00'}};
+  const duration=Number(value.durationSeconds);
+  return {enabled:value.enabled!==false,volume:Number.isFinite(volume)?Math.max(0,Math.min(100,volume)):60,sound:['soft','urgent','custom'].includes(value.sound)?value.sound:'soft',customAudioId:value.customAudioId||null,events:Array.isArray(value.events)?value.events.filter(v=>['disconnect','critical','opportunity'].includes(v)):['disconnect','critical'],repeat:!!value.repeat,intervalSeconds:Number.isFinite(interval)?Math.max(3,Math.min(3600,interval)):30,maxRepeats:Number.isFinite(count)?Math.max(1,Math.min(20,Math.floor(count))):3,...(Number.isFinite(duration)&&duration>=0.2&&duration<=30?{durationSeconds:duration}:{}),quiet:{enabled:!!value.quiet?.enabled,start:value.quiet?.start||'22:00',end:value.quiet?.end||'07:00',...(typeof value.quiet?.timezone==='string'?{timezone:value.quiet.timezone}:{})}};
 }
 function isQuiet(at,quiet){
   if(!quiet?.enabled)return false;
   const parse=t=>/^([01]\d|2[0-3]):[0-5]\d$/.test(t)?Number(t.slice(0,2))*60+Number(t.slice(3)):NaN;
-  const start=parse(quiet.start),end=parse(quiet.end),date=new Date(at),now=date.getHours()*60+date.getMinutes();
+  const start=parse(quiet.start),end=parse(quiet.end),date=new Date(at);let now=date.getHours()*60+date.getMinutes();
+  if(quiet.timezone)try{const parts=new Intl.DateTimeFormat('en-GB',{timeZone:quiet.timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(date);now=Number(parts.find(p=>p.type==='hour').value)*60+Number(parts.find(p=>p.type==='minute').value);}catch{return true;}
   if(!Number.isFinite(start)||!Number.isFinite(end))return false;
   return start===end||start<end?(start===end||now>=start&&now<end):(now>=start||now<end);
 }
@@ -43,7 +45,7 @@ const prefs=soundPreferences(value),id=String(event.id||'');
     if(this.current||this.closed)return;const entry=this.queue.shift();if(!entry)return;
     if(entry.muted||(!entry.force&&isQuiet(this.now(),entry.prefs.quiet))){void this._pump();return;}
     this.current=entry;
-    try{await this.play({id:entry.id,sound:entry.prefs.sound,volume:entry.prefs.volume/100,audioUrl:entry.audioUrl});entry.played++;entry.onDone?.(true);}
+    try{await this.play({id:entry.id,sound:entry.prefs.sound,volume:entry.prefs.volume/100,audioUrl:entry.audioUrl,...(entry.prefs.durationSeconds?{durationSeconds:entry.prefs.durationSeconds}:{})});entry.played++;entry.onDone?.(true);}
     catch{entry.muted=true;entry.onDone?.(false);}
     finally{
       this.current=null;
@@ -52,6 +54,7 @@ const prefs=soundPreferences(value),id=String(event.id||'');
     }
   }
   mute(id){const entry=this.occurrences.get(id);if(!entry)return false;entry.muted=true;entry.onDone?.(false);if(entry.timer)this.clearTimer(entry.timer);entry.timer=null;this.queue=this.queue.filter(v=>v!==entry);if(this.current===entry)this.stop(id);return true;}
+  muteAll(){for(const id of this.occurrences.keys())this.mute(id);this.queue=[];}
   shutdown(){this.closed=true;for(const entry of this.occurrences.values()){entry.muted=true;entry.onDone?.(false);if(entry.timer)this.clearTimer(entry.timer);}this.queue=[];if(this.current)this.stop(this.current.id);this.occurrences.clear();}
 }
 module.exports={SoundController,soundPreferences,isQuiet};

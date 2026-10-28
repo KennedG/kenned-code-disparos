@@ -22,14 +22,16 @@ test('License UI displays server dates in Brasília and remaining time uses a mo
   f.clock(3600000); assert.match(f.ui.renderPage(), /2 dia\(s\) e 23h/);
 });
 
-test('Expired licence preserves authorized export access and blocks only new sending controls', () => {
+test('Confirmed expired licence exposes activation and developer contact only, preserving data without readonly/export access', () => {
   const f = fixture({ allowed: false });
-  assert.match(f.ui.renderPage(), /Exportar backup dos meus dados/); assert.match(f.ui.renderPage(), /Exportar históricos/);
-  assert.throws(() => f.ui.assertAction('confirm-activation'), /Ative uma licença/);
-  assert.throws(() => f.ui.assertAction('buscas-confirm-list'), /Ative uma licença/);
-  assert.throws(() => f.ui.assertAction('reminders-test'), /Ative uma licença/);
-  for (const action of ['backup', 'export-history', 'save-template', 'pause', 'stop-all', 'license-open']) assert.doesNotThrow(() => f.ui.assertAction(action));
-  assert.doesNotMatch(f.ui.renderPage(), /data-action="license-resume"/);
+  const html = f.ui.renderPage();
+  assert.match(html, /Sua licença expirou/); assert.match(html, /Seus dados estão preservados/);
+  assert.match(html, /Guilherme Kenned/); assert.match(html, /99403-3173/); assert.match(html, /data-action="open-support"/);
+  assert.doesNotMatch(html, /data-action="backup"|data-action="export-history"|data-action="license-resume"/);
+  assert.doesNotMatch(html, /Configurações, consulta e exportação continuam disponíveis/);
+  for (const action of ['confirm-activation', 'buscas-confirm-list', 'reminders-test', 'backup', 'export-history', 'save-template', 'pause', 'stop-all', 'opportunity-evaluate', 'source-resume-group']) assert.throws(() => f.ui.assertAction(action), /Ative|Renove|licen[cç]a|expir/i, action);
+  for (const action of ['license-open', 'license-refresh', 'open-support', 'window-minimize']) assert.doesNotThrow(() => f.ui.assertAction(action));
+  assert.equal(f.calls.length, 0, 'Developer contact must not open or send automatically while rendering');
   const restricted = fixture({ allowed: false, permissions: [] }); assert.doesNotMatch(restricted.ui.renderPage(), /data-action="backup"|data-action="export-history"/);
 });
 

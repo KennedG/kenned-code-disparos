@@ -63,6 +63,17 @@ function messageContent(message, { edits = false } = {}) {
   return null;
 }
 
+// A quote is a reference, never proof of its author's identity. Consumers must
+// match this ID to a stored origin in this same chat and authenticate the
+// current sender before changing the original request.
+function quotedReference(message, chatId) {
+  const info = unwrapMessage(message)?.extendedTextMessage?.contextInfo;
+  const id = info?.stanzaId;
+  if (typeof id !== 'string' || !id.trim() || id.length > 512 ||
+      info.remoteJid && info.remoteJid !== chatId) return {};
+  return { quotedMessageId: id, quotedChatId: chatId };
+}
+
 /** Serialized auth state is encrypted by Windows DPAPI; plaintext auth files are never created. */
 class EncryptedAuthStore {
   constructor({ dir, safeStorage, library }) {
@@ -209,6 +220,8 @@ class WhatsAppAdapter extends EventEmitter {
     this.groupMetadataCache = new Map();
     this.groupMetadataRequests = new Map();
     this.networkSubmissions = new Set();
+    this.opportunityCapture = { enabled: false, monitoredGroupIds: new Set(), allowOwnMessages: false, activatedAt: 0 };
+    this.seenOpportunities = new Map();
   }
 
   _receiveTraceId(key = {}, accountId = this._ownAccount().id) {
@@ -398,6 +411,7 @@ class WhatsAppAdapter extends EventEmitter {
         for (const event of updates || []) {
           this._captureUpdate(event);
           this._sourceUpdate(event);
+          this._opportunityUpdate(event);
           if (Number(event.update?.status) >= 2 && (event.key?.fromMe || this.pendingAcks.has(event.key?.id))) {
             const status = Number(event.update.status);
             this._ack(event.key.id, { confirmationScope: status >= 4 ? 'whatsapp-read' : status >= 3 ? 'whatsapp-delivered' : 'whatsapp-server' });
@@ -411,7 +425,7 @@ class WhatsAppAdapter extends EventEmitter {
         }
       });
       socket.ev.on('messages.delete', event => {
-        if (generation === this.generation) { this._captureDelete(event); this._sourceDelete(event); }
+        if (generation === this.generation) { this._captureDelete(event); this._sourceDelete(event); this._opportunityDelete(event); }
       });
       socket.ev.on('contacts.upsert', contacts => {
         if (generation === this.generation) this._rememberContacts(contacts);
@@ -807,6 +821,93 @@ class WhatsAppAdapter extends EventEmitter {
     return groupIds === null || groupIds.has(chatId) || (!history && (commandGroupIds === null || commandGroupIds.has(chatId)));
   }
 
+  configureOpportunityCapture({ enabled = false, monitoredGroupIds = [], allowOwnMessages = false, activatedAt = Date.now() } = {}) {
+    const groups = Array.isArray(monitoredGroupIds) ? monitoredGroupIds : [];
+    this.opportunityCapture = { enabled: enabled === true,
+      monitoredGroupIds: new Set(groups.slice(0, 1000).filter(id => typeof id === 'string' && /^[^\s@]+@g\.us$/.test(id))),
+      allowOwnMessages: allowOwnMessages === true,
+      activatedAt: Number.isFinite(Number(activatedAt)) && Number(activatedAt) >= 0 ? Number(activatedAt) : Date.now() };
+    return { enabled: this.opportunityCapture.enabled, ...this.getOpportunityCapabilities() };
+  }
+
+  getOpportunityCapabilities() {
+    return { live: true, edits: true, deletes: true, history: false,
+      quotedReferences: 'stored-same-chat-origin-and-current-sender-required',
+      official: false, mode: 'whatsapp', simulation: false };
+  }
+
+  _opportunityChatAllowed(chatId) {
+    return this.opportunityCapture.enabled && this.opportunityCapture.monitoredGroupIds.has(chatId);
+  }
+
+  _opportunityContext(message, { edits = false } = {}) {
+    const key = message?.key || {};
+    if (!this._opportunityChatAllowed(key.remoteJid) || typeof key.id !== 'string' || !key.id || key.id.length > 512) return null;
+    const content = messageContent(message.message, { edits });
+    if (content?.type !== 'text' || !content.text.trim() || content.text.length > 16000) return null;
+    if (this._commandCandidate(message)) return null;
+    const { contact, ...identity } = this._identityContext(key, true);
+    if (!identity.identityVerified || identity.automaticMessage ||
+        key.fromMe && (!this.opportunityCapture.allowOwnMessages || !identity.trustedSelf)) return null;
+    const timestamp = messageTimestamp(message.messageTimestamp);
+    if (!edits && (!timestamp || timestamp < this.opportunityCapture.activatedAt || timestamp > Date.now() + 30000)) return null;
+    return { ...identity, messageId: key.id, chatId: key.remoteJid, isGroup: true, fromMe: key.fromMe === true,
+      type: 'text', text: content.text, timestamp: edits ? undefined : timestamp,
+      originalTimestamp: edits ? null : timestamp, capturedAt: Date.now(), history: false,
+      ...(edits ? { revisionAt: timestamp || Date.now() } : {}),
+      pushName: typeof message.pushName === 'string' ? message.pushName.slice(0, 500) : contact.notify || '',
+      displayName: typeof message.pushName === 'string' ? message.pushName.slice(0, 500) : contact.notify || '',
+      savedName: contact.name || '', forwarded: hasForwardedMetadata(message.message),
+      traceId: this._receiveTraceId(key), ...quotedReference(message.message, key.remoteJid) };
+  }
+
+  _opportunityUpsert(event, generation) {
+    if (generation !== this.generation || !this.opportunityCapture.enabled || event?.type !== 'notify') return;
+    for (const message of event.messages || []) {
+      if (!this._opportunityChatAllowed(message.key?.remoteJid)) continue;
+      const body = unwrapMessage(message.message), protocol = body.protocolMessage;
+      if (protocol?.key?.id) {
+        if (protocol.key.remoteJid && protocol.key.remoteJid !== message.key.remoteJid) continue;
+        // The edited ID refers to the old message, but its participant fields
+        // are supplied in the payload. Authenticate the current envelope's
+        // author; a claimed original participant must never impersonate them.
+        const key = { ...message.key, id: String(protocol.key.id), remoteJid: message.key.remoteJid };
+        if (protocol.type === 14 && protocol.editedMessage) {
+          const context = this._opportunityContext({ key, message: protocol.editedMessage, messageTimestamp: protocol.timestampMs ? Number(protocol.timestampMs) / 1000 : message.messageTimestamp }, { edits: true });
+          if (context) this.emit('opportunityMessageUpdated', context);
+        } else if (protocol.type === 0) this._opportunityDelete({ keys: [key] });
+        continue;
+      }
+      if (typeof event.requestId === 'string' && event.requestId && !this._isPendingRecovery(message, generation)) continue;
+      const context = this._opportunityContext(message); if (!context) continue;
+      const dedupeId = `${context.accountId}:${context.chatId}:${context.messageId}`;
+      if (this.seenOpportunities.has(dedupeId)) continue;
+      this.seenOpportunities.set(dedupeId, Date.now());
+      while (this.seenOpportunities.size > 5000) this.seenOpportunities.delete(this.seenOpportunities.keys().next().value);
+      this.emit('opportunityMessage', context);
+    }
+  }
+
+  _opportunityUpdate(event) {
+    if (!this._opportunityChatAllowed(event?.key?.remoteJid) || !event.key.id) return;
+    const update = event.update || {};
+    if (update.message === null && (update.messageStubType === this.library?.WAMessageStubType?.REVOKE || update.messageStubType === 1)) {
+      this._opportunityDelete({ keys: [event.key] }); return;
+    }
+    if (!update.message) return;
+    const context = this._opportunityContext({ key: event.key, ...update }, { edits: true });
+    if (context) this.emit('opportunityMessageUpdated', context);
+  }
+
+  _opportunityDelete(event) {
+    // A chat cleared locally is not evidence that each original request was
+    // withdrawn. Expose only identifiable deletion events; consumers review.
+    for (const key of event?.keys || []) if (typeof key.id === 'string' && key.id && key.id.length <= 512 && this._opportunityChatAllowed(key.remoteJid)) {
+      this.emit('opportunityMessageDeleted', { messageId: key.id, chatId: key.remoteJid, deletedAt: Date.now(),
+        source: 'messages.delete', mode: 'whatsapp', simulation: false });
+    }
+  }
+
   _rememberContacts(contacts) {
     for (const contact of contacts || []) {
       const id = accountJid(contact?.id);
@@ -856,6 +957,7 @@ class WhatsAppAdapter extends EventEmitter {
         const batch = { ...event, messages: [hydrated] };
         this._captureUpsert(batch, generation);
         this._sourceUpsert(batch, generation);
+        this._opportunityUpsert(batch, generation);
         this._incoming(batch, generation);
       }).finally(() => { clearTimeout(timer); this.identityHydrations.delete(hydrationId); });
       this.identityHydrations.set(hydrationId, pending);
@@ -864,6 +966,7 @@ class WhatsAppAdapter extends EventEmitter {
       const batch = { ...event, messages: ready };
       this._captureUpsert(batch, generation);
       this._sourceUpsert(batch, generation);
+      this._opportunityUpsert(batch, generation);
       this._incoming(batch, generation);
     }
   }
@@ -1556,6 +1659,7 @@ class WhatsAppAdapter extends EventEmitter {
         type,
         raw: message,
         timestamp,
+        ...quotedReference(message.message, chatId),
         ...(recovered ? { recoveredAfterDecryption: true } : {})
       };
       context.replyProof = this._replyProof(context);

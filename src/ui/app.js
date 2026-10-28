@@ -54,7 +54,11 @@
   const empty = (ico,title,desc,action='',label='') => `<div class="empty-state"><div class="empty-icon">${icon(ico)}</div><h3>${e(title)}</h3><p>${e(desc)}</p>${action ? button(action,label,'primary','','plus') : ''}</div>`;
   const pageTitle = (eyebrow,title,desc,action='') => `<div class="page-heading"><div><div class="eyebrow">${e(eyebrow)}</div><h1>${e(title)}</h1><p class="subtitle">${e(desc)}</p></div>${action}</div>`;
   const state = {page:'dashboard',data:null,search:'',filter:'all',libraryTab:'media',modal:null,draft:null,pending:false,refreshing:false,settingsDirty:false,authScreen:null,authKey:null,history:null,diagnostics:null,users:[],roles:[],contacts:[],recipients:[],alerts:null,audit:null,pageOffset:0,pageLimit:50,pageFilters:{},pageLoading:false,pageRequest:0};
-  let buscasUI,libraryUI,remindersUI,contactIntakeUI,licenseUI,sourceUI;
+  let buscasUI,libraryUI,remindersUI,contactIntakeUI,licenseUI,sourceUI,opportunityUI,vitrineUI;
+  state.moreTools=false;state.sidebarCollapsed=false;state.licenseLocked=false;
+  try{state.sidebarCollapsed=localStorage.getItem('kenned.sidebarCollapsed')==='true';}catch{}
+  const LICENSE_ONLY_RPC=new Set(['snapshot','authStatus','licenseStatus','licenseActivate','licenseRefresh','openSupport','windowMinimize','windowQuit']);
+  const licenseOnly=()=>data()?.license?.totalBlocked===true||data()?.lockedByLicense===true||(data()?.license?.allowed===false&&['expired','trial_expired'].includes(data()?.license?.status));
 
   function toast(message,error=false) {
     const div = document.createElement('div');
@@ -66,6 +70,7 @@
 
   async function call(action,payload) {
     if (!window.mega) throw new Error('A interface precisa ser aberta pelo aplicativo Kenned Code Disparos.');
+    if(licenseOnly()&&!LICENSE_ONLY_RPC.has(action))throw Object.assign(new Error('O prazo da licença terminou. Ative ou renove para acessar o aplicativo.'),{code:'LICENSE_EXPIRED'});
     const result = await window.mega.call(action,payload);
     if (result && result.error) throw Object.assign(new Error(typeof result.error === 'string' ? result.error : result.error.message || 'Não foi possível executar esta ação.'),{code:result.code||result.error?.code});
     return result;
@@ -85,14 +90,18 @@
       if(nextMode && state.data && nextMode!==currentMode()){
         state.pageRequest++;state.pageOffset=0;state.pageFilters={};state.search='';state.filter='all';state.settingsDirty=false;
         state.history=null;state.diagnostics=null;state.contacts=[];state.recipients=[];state.alerts=null;state.audit=null;clearTimeout(state.searchTimer);
-        buscasUI.reset();libraryUI?.reset();remindersUI?.reset();contactIntakeUI?.reset();sourceUI?.reset();closeModal();
+        buscasUI.reset();libraryUI?.reset();remindersUI?.reset();contactIntakeUI?.reset();sourceUI?.reset();opportunityUI?.reset();vitrineUI?.reset();closeModal();
       }
       state.data = snapshot;
+      vitrineUI?.sync(snapshot);
+      if(licenseOnly())lockLicenseView();
       state.contacts = Array.isArray(snapshot.contacts) ? snapshot.contacts : [];
       document.body.dataset.theme = snapshot.settings?.theme || 'light';
       if(state.page==='sources'&&snapshot.auth?.authenticated&&!sourceUI.hasUnsaved())try{await sourceUI.maybeLoad();}catch(error){toast(error.message,true);}
+      if(state.page==='opportunities'&&snapshot.auth?.authenticated&&!opportunityUI.hasUnsaved())try{await opportunityUI.maybeLoad();}catch(error){toast(error.message,true);}
       render();
       if(state.modal?.kind==='trace'&&!can('diagnostics.view'))closeModal();
+      if(state.modal?.kind?.startsWith('opportunity-')&&!canPage('opportunities')){opportunityUI.reset();closeModal();}
       if (state.modal?.kind === 'connection') renderConnectionModal();
       sourceUI?.updateMonitor();
       } catch (error) { toast(error.message,true); }
@@ -121,32 +130,44 @@
   const permittedGroups = () => groups().filter(g => g.authorized && Boolean(g.simulation) === (currentMode() === 'simulated'));
   const selectedLimit = () => Math.max(1,number(settings().maxSelectedGroups,15));
 
+  function lockLicenseView(){
+    if(!state.licenseLocked){state.pageRequest++;state.pageOffset=0;state.pageFilters={};state.search='';state.filter='all';state.settingsDirty=false;state.draft=null;clearTimeout(state.searchTimer);state.history=null;state.diagnostics=null;state.contacts=[];state.recipients=[];state.alerts=null;state.users=[];state.roles=[];buscasUI?.reset();libraryUI?.reset();remindersUI?.reset();contactIntakeUI?.reset();sourceUI?.reset();opportunityUI?.reset();closeModal();}
+    state.licenseLocked=true;state.page='license';state.moreTools=false;
+  }
+
+  function updateSidebar(){
+    document.body.dataset.sidebarCollapsed=String(state.sidebarCollapsed);
+    const toggle=$('#sidebar-collapse');if(toggle){toggle.setAttribute('aria-expanded',String(!state.sidebarCollapsed));toggle.title=state.sidebarCollapsed?'Expandir menu lateral':'Recolher menu lateral';toggle.setAttribute('aria-label',toggle.title);toggle.innerHTML=`<span aria-hidden="true">${state.sidebarCollapsed?'›':'‹'}</span>`;}
+  }
+
   function render(force=false) {
     const d = data();
     if (!d) return;
     if(licenseUI?.sync(d)&&d.auth?.authenticated)state.page='license';
-    if (renderAuth()) {licenseUI?.updateChrome();return;}
-    const nav = [['dashboard','Painel','dashboard'],['campaigns','Campanhas','campaign'],['sources','Origem da loja','image'],['buscas','BUSCAS','search'],['reminders','LEMBRETES','clock'],['contacts','Contatos','groups'],['groups','Grupos','groups'],['library','Biblioteca','library'],['history','Histórico','history'],['reports','Relatórios','history'],['diagnostics','Diagnóstico','shield'],['alerts','Alertas','whatsapp'],['users','Usuários e perfis','shield'],['settings','Configurações','settings'],['license','Licença','shield']].filter(([key])=>canPage(key));
-    if (!canPage(state.page)) state.page='dashboard';
-    $('#navigation').innerHTML = nav.map(([key,label,ico]) => `<button class="nav-item${state.page===key?' active':''}" data-action="navigate" data-id="${key}" ${state.page===key?'aria-current="page"':''}><span class="nav-icon"><svg viewBox="0 0 24 24">${icons[ico]}</svg></span><span>${label}</span>${key==='campaigns' ? `<span class="nav-count">${campaigns().length}</span>` : ''}</button>`).join('');
+    if(licenseOnly()){lockLicenseView();$('.app-shell').hidden=false;$('#auth-root').hidden=true;$('#auth-root').replaceChildren();}
+    else{state.licenseLocked=false;if(renderAuth()){licenseUI?.updateChrome();return;}}
+    if (!canPage(state.page)) state.page=licenseOnly()?'license':'dashboard';
+    updateSidebar();
+    $('#navigation').innerHTML = window.KennedNavigation.render({canPage,page:state.page,expired:licenseOnly(),moreTools:state.moreTools,libraryTab:libraryUI?.getTab?.()||state.libraryTab,icons,campaignCount:campaigns().length});
     const conn = d.connection || {state:'disconnected'};
     $('#connection-pill').innerHTML = `<span class="status-dot ${e(conn.state)}"></span>${e(names[conn.state] || conn.state)}${d.storageError?' · Envios bloqueados: armazenamento':''}${d.maintenance?' · Atualizando dados…':''} <span class="muted">· ${currentMode()==='simulated'?'Simulação local':'WhatsApp · não oficial'}</span>${conn.ownNumber?` <span class="muted">· Conta: ${e(conn.ownNumber)}</span>`:''}`;
     $('#simulation-banner').hidden=currentMode()!=='simulated';
     const stopped=d.automation?.stopped===true;$('#automation-banner').hidden=!stopped;
-    $('#automation-banner').innerHTML=stopped?`<div><strong>ENVIOS AUTOMÁTICOS INTERROMPIDOS</strong><small>Campanhas, buscas com entrega, alertas e lembretes não entram em novas filas até uma retomada explícita.</small></div>${button('resume-automation','Retomar sistema','small primary')}`:'';
-    $('#user-bar').innerHTML = `<button class="account-button" data-action="account"><span class="user-avatar">${e((auth().user?.name||'U').slice(0,1).toUpperCase())}</span><span>${e(auth().user?.name||'Usuário')}<small>${e(auth().user?.roleName||'')}</small></span></button>${button('logout','Sair','small ghost')}`;
-    $('.topbar [data-action="stop-all"]').disabled=!can('automation.control');
+    $('#automation-banner').innerHTML=stopped?`<div><strong>ENVIOS AUTOMÁTICOS INTERROMPIDOS</strong><small>Campanhas, buscas com entrega, alertas, lembretes e oportunidades não entram em novas filas até uma retomada explícita.</small></div>${button('resume-automation','Retomar sistema','small primary')}`:'';
+    $('#user-bar').innerHTML = licenseOnly()?'':`<button class="account-button" data-action="account"><span class="user-avatar">${e((auth().user?.name||'U').slice(0,1).toUpperCase())}</span><span>${e(auth().user?.name||'Usuário')}<small>${e(auth().user?.roleName||'')}</small></span></button>${button('logout','Sair','small ghost')}`;
+    $('.topbar [data-action="stop-all"]').disabled=licenseOnly()||!can('automation.control');
     renderConnectionBanner();
     licenseUI?.updateChrome();
     $('#theme-toggle').disabled=!can('settings.edit');
     $('#theme-toggle').innerHTML = icon(document.body.dataset.theme==='dark'?'sun':'moon');
     $('#version').textContent = d.version || '1.0';
-    const renderers = {dashboard:renderDashboard,campaigns:renderCampaigns,sources:()=>sourceUI.render(),buscas:()=>buscasUI.render(),groups:renderGroups,library:()=>libraryUI.render(),reminders:()=>remindersUI.render(),history:renderHistory,settings:renderSettings,reports:renderReports,diagnostics:renderDiagnostics,users:renderUsers,contacts:renderContacts,alerts:renderAlerts,license:()=>licenseUI.renderPage()};
+    const renderers = {dashboard:renderDashboard,campaigns:renderCampaigns,sources:()=>sourceUI.render(),opportunities:()=>opportunityUI.render(),buscas:()=>buscasUI.render(),groups:renderGroups,library:()=>libraryUI.render(),reminders:()=>remindersUI.render(),history:renderHistory,settings:renderSettings,reports:renderReports,diagnostics:renderDiagnostics,users:renderUsers,contacts:renderContacts,alerts:renderAlerts,license:()=>licenseUI.renderPage()};
     if (!force && state.page==='settings' && $('#settings-form') && (state.settingsDirty || $('#settings-form').contains(document.activeElement))) return;
     if(!force&&state.page==='contacts'&&contactIntakeUI.shouldPreserveDOM())return;
     if(!force&&state.page==='library'&&libraryUI.shouldPreserveDOM())return;
     if(!force&&state.page==='license'&&licenseUI.shouldPreserveDOM())return;
     if(!force&&state.page==='sources'&&sourceUI.shouldPreserveDOM())return;
+    if(!force&&state.page==='opportunities'&&opportunityUI.shouldPreserveDOM())return;
     if (!force && state.page==='buscas' && buscasUI.shouldPreserveDOM()) {buscasUI.updateStatus();return;}
     const focused=document.activeElement?.id;
     const selection=focused==='page-search'?document.activeElement.selectionStart:null;
@@ -166,9 +187,9 @@
   }
 
   function renderDashboard() {
-    const m = data().metrics || {};
-    const metrics = [['Campanhas ativas',m.activeCampaigns??campaigns().filter(c=>c.state==='active').length,'Programação em execução','campaign'],['Grupos selecionados',m.selectedGroups??new Set(campaigns().flatMap(c=>c.groupIds||[])).size,'Destinos nas campanhas','groups'],['Envios aceitos',m.confirmed||0,'Aceitação pela integração; entrega é outra etapa','check'],['Próxima rodada',m.nextRunAt?new Date(m.nextRunAt).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}):'—',m.nextRunAt?fmt(m.nextRunAt):'Ative uma campanha para começar','clock']];
-    return pageTitle('Visão geral','Tudo sob controle','Suas campanhas, seus grupos e cada envio em um só lugar.',button('new-campaign','Nova campanha','primary','','plus')) + connectionCard() +
+    const m = data().metrics || {}, opportunityMetrics=data().opportunities?.metrics||{}, unavailable=new Set(Object.values(data().campaignOps||{}).flatMap(value=>value.destinations||[]).filter(value=>['blocked','unavailable','suspended'].includes(value.state)).map(value=>value.groupId));
+    const metrics = [['Campanhas ativas',m.activeCampaigns??campaigns().filter(c=>c.state==='active').length,'Programação em execução','campaign'],['Grupos selecionados',m.selectedGroups??new Set(campaigns().flatMap(c=>c.groupIds||[])).size,'Destinos nas campanhas','groups'],['Envios aceitos',m.confirmed||0,'Aceitação pela integração; entrega é outra etapa','check'],['Próxima rodada',m.nextRunAt?new Date(m.nextRunAt).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}):'—',m.nextRunAt?fmt(m.nextRunAt):'Ative uma campanha para começar','clock'],['Resultados incertos',m.uncertain||0,'Verifique a evidência antes de repetir','history'],['Falhas confirmadas',m.failed||0,'Consulte o motivo e as tentativas','shield'],...(canPage('opportunities')?[['Novas oportunidades',opportunityMetrics.new??opportunityMetrics.open??0,'Pedidos agrupados para revisar','search']]:[]),['Grupos indisponíveis',unavailable.size,'Somente impedimentos identificados','groups']];
+    return pageTitle('Painel operacional','Tudo sob controle','Conexão, campanhas, oportunidades e próximos envios.',button('new-campaign','Nova campanha','primary','','plus')) + connectionCard() + `<div class="row-actions dashboard-quick-actions">${canPage('sources')?button('navigate','Abrir origem da loja','ghost','sources','image'):''}${canPage('buscas')?button('navigate','Pesquisar ofertas','ghost','buscas','search'):''}${canPage('opportunities')?button('navigate','Revisar oportunidades','ghost','opportunities','eye'):''}</div>` + (vitrineUI?.renderDashboard()||'') +
       `<div class="stats-grid">${metrics.map(([label,value,caption,ico])=>`<div class="stat-card"><div class="stat-top">${e(label)}<span class="stat-icon">${icon(ico)}</span></div><div class="stat-value">${e(value)}</div><div class="stat-caption">${e(caption)}</div></div>`).join('')}</div>` +
       `<div class="panel"><div class="panel-header"><div><h2>Suas campanhas</h2><p>Uma fila sequencial. Cada rodada passa por todos os destinos selecionados.</p></div><button class="text-button" data-action="navigate" data-id="campaigns">Ver todas →</button></div>${campaignTable(campaigns().slice(0,5),true)}</div>` +
       `<div class="two-column"><div class="panel"><div class="panel-header"><h2>Como suas rodadas funcionam</h2>${icon('clock')}</div><div class="panel-body"><div class="flow-item"><span class="flow-number">01</span><div>O intervalo é medido entre o início das rodadas<small>Por padrão, uma rodada a cada 10 minutos.</small></div></div><div class="flow-item"><span class="flow-number">02</span><div>Os grupos recebem o conteúdo em sequência<small>O espaçamento entre grupos é uma configuração separada.</small></div></div><div class="flow-item"><span class="flow-number">03</span><div>Uma rodada termina antes da próxima começar<small>Não há rodadas simultâneas nem acúmulo após suspensão.</small></div></div></div></div><div class="panel"><div class="panel-header"><h2>Acompanhamento</h2>${icon('shield')}</div><div class="panel-body"><div class="status-list"><div class="status-line">${icon('check')}<div>${number(m.confirmed)} envios aceitos pela integração<small>Confirmação de aceitação pelo servidor; não indica leitura.</small></div></div><div class="status-line">${icon('history')}<div>${number(m.failed)} falhas · ${number(m.uncertain)} resultados incertos<small>Resultados incertos aguardam revisão e não são reenviados.</small></div></div><div class="status-line">${icon('folder')}<div>Campanhas e arquivos armazenados localmente<small>Faça backups em Configurações.</small></div></div></div></div></div></div>`;
@@ -221,7 +242,7 @@
   const actionPermissions = {'new-campaign':'campaign.create','edit-campaign':'campaign.edit','save-campaign':'campaign.edit','confirm-save':'campaign.edit','duplicate':'campaign.create','delete-campaign':'campaign.delete','activate':'campaign.start','resume':'campaign.start','confirm-activation':'campaign.start','pause':'campaign.pause','stop-all':'automation.control','resume-automation':'automation.control','refresh-groups':'groups.view','import-media':'media.create','import-editor-media':'media.create','save-template':'media.create','delete-template':'media.delete','connection':'connection.view','connect':'connection.manage','disconnect':'connection.manage','backup':'settings.edit','restore':'settings.edit','open-data':'settings.edit','toggle-theme':'settings.edit','clear-history':'history.clear','export-history':'history.export','export-diagnostics':'diagnostics.export','export-reports':'reports.export','new-user':'users.create','edit-user':'users.edit','delete-user':'users.delete','reset-user':'users.edit','new-role':'users.roles','edit-role':'users.roles','delete-role':'users.roles','new-contact':'contacts.create','edit-contact':'contacts.edit','delete-contact':'contacts.delete','new-recipient':'notifications.manage','edit-recipient':'notifications.manage','delete-recipient':'notifications.manage','test-recipient':'notifications.manage','test-alert':'notifications.manage','retry-alert':'notifications.manage','import-audio':'settings.edit','test-sound':'settings.edit','confirm-job':'campaign.edit','discard-job':'campaign.edit','source-monitor':'campaign.view','confirm-alert':'notifications.manage','discard-alert':'notifications.manage','save-user':'users.edit','save-role':'users.roles'};
   Object.assign(actionPermissions,{'view-trace':'diagnostics.view','copy-trace':'diagnostics.view','copy-diagnostic':'diagnostics.view'});
   const canAction = action => !actionPermissions[action] || can(actionPermissions[action]) || (action==='save-campaign'&&state.draft&&!campaign(state.draft.id)&&can('campaign.create')) || (action==='save-user'&&!state.modal?.userId&&can('users.create'));
-  const canPage = page => ({dashboard:()=>true,license:()=>true,campaigns:()=>can('campaign.view'),sources:()=>can('campaign.view'),reminders:()=>can('reminder.view'),buscas:()=>can('search.view')&&(data()?.buscas?.authorized===true||auth().user?.isOwner),groups:()=>can('groups.view'),library:()=>can('media.view'),contacts:()=>can('contacts.view'),history:()=>can('history.view'),reports:()=>can('reports.view'),diagnostics:()=>can('diagnostics.view'),alerts:()=>can('notifications.view'),users:()=>can('users.view'),settings:()=>can('settings.view')})[page]?.() || false;
+  const canPage = page => licenseOnly()?page==='license':({dashboard:()=>true,license:()=>true,campaigns:()=>can('campaign.view'),sources:()=>can('campaign.view'),opportunities:()=>can('opportunity.view')&&(auth().user?.isOwner||auth().campaignScope==='all'),reminders:()=>can('reminder.view'),buscas:()=>can('search.view')&&(data()?.buscas?.authorized===true||auth().user?.isOwner),groups:()=>can('groups.view'),library:()=>can('media.view'),contacts:()=>can('contacts.view'),history:()=>can('history.view'),reports:()=>can('reports.view'),diagnostics:()=>can('diagnostics.view'),alerts:()=>can('notifications.view'),users:()=>can('users.view'),settings:()=>can('settings.view')})[page]?.() || false;
   const field = (label,name,value='',type='text',extra='') => `<div class="field"><label for="field-${e(name)}">${e(label)}</label><input id="field-${e(name)}" name="${e(name)}" type="${e(type)}" value="${e(value)}" ${extra}></div>`;
   const panel = (title,body,action='') => `<div class="panel"><div class="panel-header"><h2>${e(title)}</h2>${action}</div><div class="panel-body">${body}</div></div>`;
   const authFields = setup => `${setup?field('Seu nome','name','','text','required maxlength="140"'):''}${field('Nome de usuário','username','','text','required autocomplete="username" maxlength="80"')}${field('Senha','password','','password',`required autocomplete="${setup?'new-password':'current-password'}" ${setup?'minlength="12"':''}`)}${setup?`${field('Confirme a senha','confirmPassword','','password','required minlength="12" autocomplete="new-password"')}${field('WhatsApp para alertas (país + DDD, opcional)','phone','','tel','placeholder="5511999999999"')}<div class="info-note">Cadastre o dono deste computador. Depois, somente usuários autorizados poderão criar novos acessos. Use uma senha de pelo menos 12 caracteres.</div>`:''}`;
@@ -232,7 +253,7 @@
     const locked = !a.authenticated || a.user?.requirePasswordChange;
     $('.app-shell').hidden=locked;$('#auth-root').hidden=!locked;
     if(!locked){state.authKey=null;$('#auth-root').replaceChildren();return false;}
-    if(!a.authenticated){$('#main').replaceChildren();$('#navigation').replaceChildren();$('#user-bar').replaceChildren();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.alerts=null;state.settingsDirty=false;buscasUI?.reset();libraryUI?.reset();remindersUI?.reset();contactIntakeUI?.reset();sourceUI?.reset();}
+    if(!a.authenticated){$('#main').replaceChildren();$('#navigation').replaceChildren();$('#user-bar').replaceChildren();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.alerts=null;state.settingsDirty=false;buscasUI?.reset();libraryUI?.reset();remindersUI?.reset();contactIntakeUI?.reset();sourceUI?.reset();opportunityUI?.reset();}
     if(!['recovery-codes','license'].includes(state.modal?.kind)) closeModal();
     const screen = a.setupRequired?'setup':a.user?.requirePasswordChange?'password':state.authScreen==='recovery'?'recovery':'login';
     const key=`${screen}:${a.user?.id||''}`;
@@ -286,6 +307,7 @@
       else if(page==='buscas'){await buscasUI.load();return;}
       else if(page==='reminders'){await remindersUI.load();return;}
       else if(page==='sources'){await sourceUI.load();return;}
+      else if(page==='opportunities'){await opportunityUI.load();return;}
       else return;
       if(request!==state.pageRequest||page!==state.page)return;
       if(page==='users'){[state.users,state.roles]=result;}else if(page==='alerts'){[state.recipients,state.alerts]=result;}else state[page]=result;
@@ -555,6 +577,7 @@
 
   async function onAction(action,el) {
     const id=el.dataset.id;
+    if(licenseOnly()&&!action.startsWith('license-')&&!['open-support','toggle-sidebar','window-minimize','navigate','vitrine-exit'].includes(action))throw new Error('Ative ou renove a licença para acessar o aplicativo.');
     if (!canAction(action)) throw new Error('Seu perfil não permite esta ação.');
     licenseUI?.assertAction(action);
     if(action.startsWith('license-'))return licenseUI.onAction(action,el);
@@ -563,10 +586,15 @@
     if(action.startsWith('reminders-'))return remindersUI.onAction(action,el);
     if(action.startsWith('contact-intake-'))return contactIntakeUI.onAction(action,el.dataset.id);
     if(action.startsWith('source-'))return sourceUI.onAction(action,el);
+    if(action.startsWith('opportunity-'))return opportunityUI.onAction(action,el);
+    if(action.startsWith('vitrine-'))return vitrineUI?.onAction(action,el);
     switch(action) {
+      case 'open-support':await call('openSupport');break;
+      case 'toggle-sidebar':state.sidebarCollapsed=!state.sidebarCollapsed;if(state.sidebarCollapsed)state.moreTools=false;try{localStorage.setItem('kenned.sidebarCollapsed',String(state.sidebarCollapsed));}catch{}render(true);break;
+      case 'toggle-more-tools':if(licenseOnly())break;state.moreTools=!state.moreTools;render(true);break;
       case 'auth-recovery': state.authScreen='recovery';state.authKey=null;render();break;
       case 'auth-login': state.authScreen='login';state.authKey=null;render();break;
-      case 'logout': await call('logout');closeModal();buscasUI.reset();libraryUI.reset();remindersUI.reset();contactIntakeUI.reset();sourceUI.reset();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.authScreen=null;state.settingsDirty=false;state.page='dashboard';await refresh();break;
+      case 'logout': await call('logout');closeModal();buscasUI.reset();libraryUI.reset();remindersUI.reset();contactIntakeUI.reset();sourceUI.reset();opportunityUI.reset();vitrineUI?.reset();state.moreTools=false;state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.authScreen=null;state.settingsDirty=false;state.page='dashboard';await refresh();break;
       case 'account': {
         state.modal={kind:'account'};
         showModal('account','Minha conta','Troque sua senha ou gere novos códigos de recuperação.',`<form id="account-form">${field('Senha atual','currentPassword','','password','required autocomplete="current-password"')}${field('Nova senha (mínimo 12 caracteres)','newPassword','','password','minlength="12" autocomplete="new-password"')}${field('Confirme a nova senha','confirmPassword','','password','minlength="12" autocomplete="new-password"')}</form>`,`${button('rotate-recovery','Novos códigos','','','shield')}${button('save-password','Alterar senha','primary','','check')}`,true);break;
@@ -650,13 +678,15 @@
       case 'test-sound': await call('testSound',{sound:collectSound()});toast('Teste de som solicitado com o volume selecionado.');break;
 
       case 'navigate':
+        if(!canPage(id))throw new Error(licenseOnly()?'Ative ou renove a licença para abrir esta tela.':'Seu perfil não permite acessar esta tela.');
         if(state.settingsDirty && state.page==='settings' && id!=='settings' && !confirm('Sair de Configurações e descartar alterações não salvas?'))break;
         if(state.page==='buscas' && id!=='buscas' && buscasUI.hasUnsaved()){if(!confirm('Sair de BUSCAS e descartar alterações não salvas?'))break;buscasUI.reset();}
         if(state.page==='sources'&&id!=='sources'&&sourceUI.hasUnsaved()){if(!confirm('Sair de Origem da loja e descartar alterações não salvas?'))break;sourceUI.reset();}
-        state.settingsDirty=false;state.page=id;state.search='';state.filter='all';state.pageOffset=0;state.pageFilters=id==='history'?{categories:['sends']}:{};render();await loadPageData();break;
+        if(state.page==='opportunities'&&id!=='opportunities'&&opportunityUI.hasUnsaved()){if(!confirm('Sair de OPORTUNIDADES e descartar alterações não salvas?'))break;opportunityUI.reset();}
+        state.settingsDirty=false;state.page=id;state.search='';state.filter='all';state.pageOffset=0;state.pageFilters=id==='history'?{categories:['sends']}:{};render();await loadPageData();if(id==='library'&&el.dataset.libraryTab)await libraryUI.onAction('library-tab',{dataset:{id:el.dataset.libraryTab}});break;
       case 'toggle-theme': {const theme=document.body.dataset.theme==='dark'?'light':'dark';await perform('saveSettings',{settings:{theme}});if(state.settingsDirty&&$('#settings-form'))$('#settings-form').elements.theme.value=theme;break;}
       case 'window-minimize': await call('windowMinimize');break;
-      case 'stop-all': {const report=await perform('stopAll');const count=x=>typeof x==='number'?x:number(x?.cancelled||x?.campaigns||x?.paused,0);toast(`Automações interrompidas. Campanhas: ${count(report.campaigns)}; respostas: ${count(report.search)}; alertas: ${count(report.alerts)}; lembretes: ${count(report.reminders)}. Novas entradas bloqueadas até Retomar sistema.${report.inFlight?' '+report.inFlight+' envio(s) já em andamento podem concluir.':''}`);break;}
+      case 'stop-all': {const report=await perform('stopAll');const count=x=>typeof x==='number'?x:number(x?.cancelled||x?.campaigns||x?.paused,0);toast(`Automações interrompidas. Campanhas: ${count(report.campaigns)}; respostas: ${count(report.search)}; alertas: ${count(report.alerts)}; lembretes: ${count(report.reminders)}; oportunidades: ${count(report.opportunities)}. Novas entradas bloqueadas até Retomar sistema.${report.inFlight?' '+report.inFlight+' envio(s) já em andamento podem concluir.':''}`);break;}
       case 'resume-automation':if(confirm('Retomar o sistema? Revise e reative somente as campanhas e os lembretes que deseja usar.'))await perform('resumeAutomation',undefined,'Sistema desbloqueado. Reative as campanhas e os lembretes que deseja retomar.');break;
       case 'connection': state.modal={kind:'connection',previousFocus:document.activeElement};renderConnectionModal();break;
       case 'connect': await perform('connect');renderConnectionModal();break;
@@ -767,6 +797,8 @@
     try {
       if(el.closest('#buscas-page'))await buscasUI.onChange(el);
       if(el.closest('#source-page'))await sourceUI.onChange(el);
+      if(el.closest('#opportunity-page')||el.closest('#opportunity-detail'))await opportunityUI.onChange(el);
+      if(el.closest('#vitrine-editor'))await vitrineUI?.onChange(el);
       if(el.closest('#library-page')||el.closest('#library-template-form'))await libraryUI.onChange(el);
       if(el.closest('#reminders-form'))remindersUI.onChange(el);
       if(el.dataset.cleanupCategory){state.modal.categories=$$('[data-cleanup-category]:checked').map(x=>x.dataset.cleanupCategory);await renderCleanup();}
@@ -797,6 +829,8 @@
     const el=event.target;
     if(el.closest('#buscas-page'))buscasUI.onInput(el);
     if(el.closest('#source-config-form'))sourceUI.onInput(el);
+    if(el.closest('#opportunity-page'))opportunityUI.onInput(el);
+    if(el.closest('#vitrine-editor'))vitrineUI?.onInput(el);
     if(el.closest('#library-page')||el.closest('#library-template-form'))libraryUI.onInput(el);
     if(el.closest('#reminders-form'))remindersUI.onInput(el);
     if(el.closest('.contact-intake-form'))contactIntakeUI.onInput(el);
@@ -815,7 +849,10 @@
     event.preventDefault();
     try{
       if(event.target.id==='license-activation-form'){await licenseUI.onSubmit(event.target);return;}
+      if(licenseOnly())throw new Error('Ative ou renove a licença antes de alterar dados do aplicativo.');
+      if(event.target.id.startsWith('vitrine-')){await vitrineUI?.onSubmit(event.target);return;}
       if(event.target.id.startsWith('source-')){await sourceUI.onSubmit(event.target);return;}
+      if(event.target.id.startsWith('opportunity-')){await opportunityUI.onSubmit(event.target);return;}
       if(event.target.id.startsWith('buscas-')){await buscasUI.onSubmit(event.target);return;}
       if(event.target.id.startsWith('library-')){await libraryUI.onSubmit(event.target);return;}
       if(event.target.id==='reminders-form'){await remindersUI.onSubmit(event.target);return;}
@@ -866,13 +903,15 @@
     }
   });
 
-  $('.brand').addEventListener('click',event=>{event.preventDefault();if((state.settingsDirty||buscasUI.hasUnsaved()||sourceUI.hasUnsaved())&&!confirm('Sair e descartar alterações não salvas?'))return;state.settingsDirty=false;buscasUI.reset();sourceUI.reset();state.page='dashboard';state.search='';state.filter='all';render();});
+  $('.brand').addEventListener('click',event=>{event.preventDefault();if(licenseOnly()){state.page='license';render(true);return;}if((state.settingsDirty||buscasUI.hasUnsaved()||sourceUI.hasUnsaved()||opportunityUI.hasUnsaved())&&!confirm('Sair e descartar alterações não salvas?'))return;state.settingsDirty=false;buscasUI.reset();sourceUI.reset();opportunityUI.reset();state.page='dashboard';state.search='';state.filter='all';render();});
   const moduleContext={call,toast,data,auth,can,groups,icon,showModal,closeModal,render,refresh,modalKind:()=>state.modal?.kind||null};
+  opportunityUI=window.KennedOpportunitiesUI.create(moduleContext);
+  vitrineUI=window.MegaVitrine?.create({...moduleContext,mediaUrl:id=>mediaItem(id)?.previewUrl||`mega-media://asset/${encodeURIComponent(id)}`});
   sourceUI=window.KennedSourceCampaignsUI.create({...moduleContext,editCampaign,previewCampaign:showPreview,navigate:page=>{state.page=page;state.search='';state.filter='all';render(true);}});
   buscasUI=window.MegaBuscasUI.create(moduleContext);
   libraryUI=window.KennedLibraryUI.create({...moduleContext,useTemplate:template=>{if(!can('campaign.create'))throw new Error('Sem permissão para criar campanhas.');editCampaign(undefined,template);}});
   remindersUI=window.KennedRemindersUI.create(moduleContext);contactIntakeUI=window.KennedContactIntakeUI.create(moduleContext);
-  licenseUI=window.KennedLicenseUI.create({...moduleContext,navigate:page=>{if((state.settingsDirty||buscasUI.hasUnsaved()||sourceUI.hasUnsaved())&&!confirm('Abrir Licença e descartar alterações não salvas?'))return;state.settingsDirty=false;state.page=page;render(true);}});
+  licenseUI=window.KennedLicenseUI.create({...moduleContext,navigate:page=>{if((state.settingsDirty||buscasUI.hasUnsaved()||sourceUI.hasUnsaved()||opportunityUI.hasUnsaved())&&!confirm('Abrir Licença e descartar alterações não salvas?'))return;state.settingsDirty=false;state.page=page;render(true);}});
   if(window.mega?.onUpdate)window.mega.onUpdate(()=>refresh());
   refresh();
 })();

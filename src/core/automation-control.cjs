@@ -33,6 +33,7 @@ class AutomationControl extends EventEmitter {
   _uncertainForReview() {
     let count = Number(this.store.getMetrics?.().uncertain) || 0;
     count += Number(this.store.listSearchDeliveries?.({ status: 'uncertain', limit: 0 })?.total) || 0;
+    count += Number(this.store.listOpportunityTasks?.({ status: 'uncertain', limit: 0 })?.total) || 0;
     for (const table of ['alerts', 'reminder_deliveries']) {
       if (this.store.queryEntities) count += Number(this.store.queryEntities(table, { status: 'uncertain', limit: 0 }).total) || 0;
       else if (this.store.listEntities) count += this.store.listEntities(table, { status: 'uncertain' }).length;
@@ -51,7 +52,7 @@ class AutomationControl extends EventEmitter {
     try { this.store.setSetting('automationState', state); }
     catch (error) { persistenceError = error; this.scheduler?.blockOnPersistenceFailure(); }
     if (this.operation) return this.operation;
-    const report = { stopped: true, campaigns: 0, jobs: 0, search: 0, alerts: 0, reminders: 0,
+    const report = { stopped: true, campaigns: 0, jobs: 0, search: 0, alerts: 0, reminders: 0, opportunities: 0,
       inFlight: this.scheduler?.getCampaignInFlightCount?.() || 0,
       processing: this.scheduler?.getInFlightCount?.() || 0, uncertainForReview: 0, errors: [] };
     // Invoke every service synchronously before waiting for any one service.

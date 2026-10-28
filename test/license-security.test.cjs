@@ -157,7 +157,7 @@ test('independent review: wall-clock rollback and a frozen wall clock cannot ext
 test('independent review: the backend public snapshot excludes all receipt and administrative material', () => {
   const marker = 'PRIVATE_TEST_MARKER_NEVER_PUBLIC';
   const status = publicLicenseStatus({ allowed: true, status: 'active', plan: 'annual', expiresAt: BASE, receipt: marker, privateKeyPem: marker, adminToken: marker, allLicenseKeys: [marker], deviceId: marker, lastError: { secret: marker } });
-  assert.deepEqual(status, { allowed: true, autoResumeRequired: false, status: 'active', plan: 'annual', expiresAt: BASE });
+  assert.deepEqual(status, { allowed: true, autoResumeRequired: false, totalBlocked: false, status: 'active', plan: 'annual', expiresAt: BASE });
   assert.equal(JSON.stringify(status).includes(marker), false);
 });
 
@@ -173,14 +173,14 @@ test('independent review: an interrupted dual-anchor save cannot choose an older
   assert.equal((await host.loadState()).authoritativeDenial?.code, 'LICENSE_REVOKED');
 });
 
-test('independent review: an administrative reply cannot lend its license exemption to an unrelated private send', async t => {
+test('independent review: expiry blocks control replies and unconfirmed service outage never lends reply exemption to unrelated sends', async t => {
   const { createAppService } = require('../src/backend/service.cjs');
   const { SimulatedAdapter } = require('../src/adapters/simulated.cjs');
   const originalReply = SimulatedAdapter.prototype.reply;
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kenned-license-scope-audit-'));
   let service, nestedResult = null;
-  const status = { allowed: false, status: 'expired', plan: 'trial', reasonCode: 'LICENSE_EXPIRED', reason: 'Teste encerrado', serverConfigured: true };
-  const license = { initialize: async () => status, getStatus: () => status, assertAllowed: () => { throw Object.assign(new Error('Teste encerrado'), { code: 'LICENSE_EXPIRED' }); } };
+  const { createLicenseFixture } = require('./fixtures/license.cjs');
+  const license = createLicenseFixture();
   SimulatedAdapter.prototype.reply = async function (...args) {
     try { nestedResult = await this.sendPrivate('5562999998888', 'Mensagem automática que não pertence à resposta administrativa', { clientMessageId: crypto.randomUUID() }); }
     catch (error) { nestedResult = error; }
@@ -189,7 +189,18 @@ test('independent review: an administrative reply cannot lend its license exempt
   t.after(async () => { await service?.shutdown(); SimulatedAdapter.prototype.reply = originalReply; await fs.rm(dir, { recursive: true, force: true }); });
   service = await createAppService({ dir, licenseService: license, runtimePlatform: 'linux', host: async action => action === 'secretGet' ? null : { canceled: true } });
   await service.call('setupOwner', { name: 'Dono de teste', username: 'dono-auditoria', phone: '5562999999999', password: 'Senha-Auditoria-License-232!' });
+  const model = await service.call('saveTemplate', { name: 'Preservado no vencimento', items: [{ type: 'text', text: 'Conteúdo preservado' }] });
+  license.set({ allowed: false, status: 'expired', reasonCode: 'LICENSE_EXPIRED', reason: 'Teste encerrado', expiresAt: Date.now() - 1 });
+  await service.systemCall('licenseChanged');
+  await assert.rejects(service.call('testSimulation', { text: '!mega ajuda' }), { code: 'LICENSE_EXPIRED' });
+  assert.equal(nestedResult, null, 'Confirmed expiry must prevent the administrative reply from entering any submission scope');
+  assert.equal(service.snapshot().licenseOnly, true);
+  await service.call('licenseActivate', { key: 'ISOLATED-AUDIT-RENEWAL' });
+  assert.equal((await service.call('getTemplate', { id: model.id })).name, model.name);
+  assert.equal(service.snapshot().automation.stopped, true, 'Renewal does not resume automations');
+  license.set({ allowed: false, status: 'network_required', reasonCode: 'LICENSE_CONNECTION_REQUIRED', reason: 'Autoridade de licença temporariamente indisponível.' });
+  await service.systemCall('licenseChanged');
   const result = await service.call('testSimulation', { text: '!mega ajuda' });
-  assert.ok(result.replies.length > 0, 'Authorized administrative replies remain available after expiration');
-  assert.equal(nestedResult?.code, 'LICENSE_EXPIRED', 'The private async context must exempt only the original administrative reply');
+  assert.ok(result.replies.length > 0, 'Unconfirmed outage permits authorised control replies and must not be mistaken for confirmed expiry');
+  assert.equal(nestedResult?.code, 'LICENSE_CONNECTION_REQUIRED', 'The private async context must exempt only the original administrative reply');
 });

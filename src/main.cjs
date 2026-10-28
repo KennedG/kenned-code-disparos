@@ -7,6 +7,7 @@ const {WorkerClient}=require('./core/worker-client.cjs');
 const {SoundController}=require('./core/sound.cjs');
 const {LicenseClient}=require('./core/license-client.cjs');
 const {LicenseIdentityHost}=require('./core/license-host.cjs');
+const {confirmedLicenseExpiry}=require('./core/license-policy.cjs');
 
 const APP_NAME='Kenned Code Disparos';
 // Keep the existing profile and the OS mutex during the identity update.
@@ -52,14 +53,18 @@ async function createAudioWindow(){
   await audioWindow.loadFile(audioPath);resolveAudio();
 }
 async function playAudio(payload){
+  if(confirmedLicenseExpiry(licensing?.getStatus?.()))throw new Error('Licença expirada; alertas sonoros interrompidos.');
   await audioReady;
+  if(confirmedLicenseExpiry(licensing?.getStatus?.()))throw new Error('Licença expirada; alertas sonoros interrompidos.');
   if(!audioWindow||audioWindow.isDestroyed())throw new Error('O reprodutor de alertas não está disponível.');
   return new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>{audioRequests.delete(payload.id);audioWindow.webContents.send('mega:audioStop',{id:payload.id});reject(new Error('O áudio não pôde ser concluído.'));},17000);
+    const duration=Number(payload.durationSeconds),timeoutMs=Number.isFinite(duration)&&duration>=0.2&&duration<=30?Math.ceil(duration*1000)+2000:17000;
+    const timer=setTimeout(()=>{audioRequests.delete(payload.id);audioWindow.webContents.send('mega:audioStop',{id:payload.id});reject(new Error('O áudio não pôde ser concluído.'));},timeoutMs);
     audioRequests.set(payload.id,{resolve,reject,timer});audioWindow.webContents.send('mega:audioPlay',payload);
   });
 }
 async function nativeAlert(payload){
+  if(confirmedLicenseExpiry(licensing?.getStatus?.()))return {soundStatus:'disabled',nativeStatus:'suppressed',reason:'license_expired'};
   const preferences=payload.soundPreferences||payload.sound||settings.sound||{};
   let audioUrl;try{audioUrl=registerAudio(payload.audioPath);}catch{}
   const audio=sounds.handle(payload,preferences,{audioUrl});
@@ -96,6 +101,7 @@ async function nativeHost(action,payload={}){
     case 'showSaveDialog':return dialog.showSaveDialog(win,payload);
     case 'showMessageBox':return dialog.showMessageBox(win,payload);
     case 'openDataFolder':return shell.openPath(dataDir());
+    case 'openSupport':await shell.openExternal('https://wa.me/5562994033173');return {opened:true};
     case 'setLoginItemSettings':if(process.platform==='win32')app.setLoginItemSettings({name:APP_NAME,openAtLogin:!!payload.openAtLogin,path:process.execPath,args:['--autostart']});return true;
     case 'localAlert':return nativeAlert(payload);
     case 'testSound':return sounds.test(payload.preferences||payload.soundPreferences||payload.sound||settings.sound,{audioUrl:registerAudio(payload.audioPath)});
@@ -136,13 +142,14 @@ if(locked){
   app.on('second-instance',showWindow);
   app.whenReady().then(async()=>{
     licensing=new LicenseClient({identityProvider:new LicenseIdentityHost({safeStorage}),fetchImpl:(url,options)=>net.fetch(url,options)});
-    licensing.on('change',status=>{if(client&&!client.closed)client.worker?.postMessage({type:'licenseChanged',status});});
+    licensing.on('change',status=>{if(confirmedLicenseExpiry(status))sounds?.muteAll();if(client&&!client.closed)client.worker?.postMessage({type:'licenseChanged',status});});
     // Start on the first execution, even before the owner registers. The UI is
     // allowed to open while the hosted, authoritative trial request runs.
     void licensing.initialize();
     licenseTimer=setInterval(()=>{void licensing.tick().catch(()=>{});},5000);licenseTimer.unref();
     sounds=new SoundController({play:playAudio,stop:id=>audioWindow?.webContents.send('mega:audioStop',{id})});
     protocol.handle('mega-audio',request=>{
+      if(confirmedLicenseExpiry(licensing?.getStatus?.()))return new Response('Licença expirada',{status:403});
       try{const url=new URL(request.url);if(url.hostname!=='asset')throw new Error();const file=audioFiles.get(url.pathname.slice(1));if(!file)throw new Error();return net.fetch(pathToFileURL(file).href,{headers:request.headers});}catch{return new Response('Áudio indisponível',{status:404});}
     });
     protocol.handle('mega-media',async request=>{

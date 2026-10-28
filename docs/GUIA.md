@@ -1,14 +1,24 @@
-# Instalação e uso da versão 2.3.0
+# Instalação e uso — Kenned Code Disparos 2.3.2
+
+**Revisão atual: reformulado-r1.** Antes de atualizar, siga [backup e recuperação desta revisão](ATUALIZACAO-2.3.2-REFORMULADO.md). A versão mantém os dados e a identidade da licença da base 2.3.2; não contém módulos de vendas, caixa ou financeiro.
 
 ## Instalar ou atualizar
 
-1. No Windows 10/11 de 64 bits, encerre a versão anterior pelo menu da bandeja e execute **Kenned-Code-Disparos-Setup-2.3.0-x64.exe**. Para atualizar, mantenha a pasta dedicada usada anteriormente: **Mega Disparos** continua aceita. Em uma instalação nova, a pasta padrão é **Kenned Code Disparos**. O atalho e a identidade passam a Kenned Code Disparos; o perfil local antigo é preservado. O instalador inclui o runtime e cria o atalho no menu Iniciar; o atalho na área de trabalho é opcional.
+1. No Windows 10/11 de 64 bits, encerre a versão anterior pelo menu da bandeja, copie o perfil completo conforme o guia de atualização e execute **Kenned-Code-Disparos-Setup-2.3.2-Reformulado-x64.exe**. Para atualizar, mantenha a pasta dedicada usada anteriormente: **Mega Disparos** continua aceita. Em uma instalação nova, a pasta padrão é **Kenned Code Disparos**. O nome exibido permanece Kenned Code Disparos; o perfil local antigo é preservado. O instalador inclui o runtime e cria o atalho no menu Iniciar; o atalho na área de trabalho é opcional.
 2. No primeiro acesso, cadastre o **Dono** com usuário e senha de pelo menos 12 caracteres. Guarde os oito códigos de recuperação apresentados uma única vez, fora dos backups comuns. Em uma atualização, campanhas, mídias e configurações anteriores são preservadas e o banco é migrado com cópia de segurança em `backups`.
 3. Em uma instalação nova, teste em **SIMULAÇÃO — DADOS FICTÍCIOS**. A campanha de exemplo tem 15 grupos fictícios, rodadas a cada 10 minutos, espaçamento de 5 segundos e começa desativada. Campanhas anteriores em execução ficam pausadas após a reabertura.
 
 A atualização para 2.3.0 preserva campanhas, arquivos, usuários, configurações e credenciais e migra o banco para esquema 7, com cópia anterior à migração. **BUSCAS começa desativado em instalação nova** e mantém as configurações existentes em atualização; selecionar grupos para monitorar ofertas não altera os destinos das campanhas.
 
-O Windows pode exibir um aviso de editor desconhecido, pois o instalador não tem assinatura de código. Não é preciso instalar Node.js ou usar terminal.
+O Windows pode exibir um aviso de editor desconhecido, pois o instalador não tem assinatura de código. Não é preciso instalar Node.js ou usar terminal. A instalação física no Windows e os envios WhatsApp reais precisam ser comprovados separadamente da verificação do pacote feita neste ambiente.
+
+## Navegação e vitrine
+
+O menu principal mostra **Painel, Campanhas, Origem da loja, Buscas, Grupos, Configurações e Licença**. Expanda **Mais ferramentas** para atendimento, conteúdo, automação, diagnóstico e administração. O controle de largura recolhe a barra para ícones com descrição. As ferramentas continuam sujeitas às permissões de cada usuário.
+
+O **Painel** reúne acompanhamento operacional e configuração da [Vitrine TV](TV-DE-OFERTAS.md). Selecione itens, revise descrição pública, observações sobre defeitos e preços próprios de varejo/atacado, confira a prévia e confirme a publicação. Coloque a janela na televisão antes de abrir a apresentação em tela cheia; **Esc** encerra a apresentação. Nenhuma oferta capturada entra na TV automaticamente.
+
+O vencimento confirmado do teste ou licença redireciona para **Licença** e bloqueia todas as outras áreas, inclusive exportação e comandos. Os dados ficam preservados. **Falar com o desenvolvedor** abre o contato de Guilherme Kenned somente após clicar. Falta de conexão ao serviço não representa por si só vencimento: o comprovante válido respeita a tolerância já definida, sempre limitada à expiração. Renovar não retoma campanhas antigas nem republica a TV.
 
 ## Criar campanha e conectar
 
@@ -132,7 +142,7 @@ O controle exige `automation.control`; autorização BUSCAS isoladamente não co
 
 Envios incertos precisam de verificação na conversa real e revisão manual: marque confirmado somente depois de conferir o envio, ou descarte sem repetição automática. A lista de revisões usa o controle operacional e permanece disponível após a limpeza dos registros visíveis.
 
-A exclusão de uma campanha é bloqueada enquanto houver envio incerto ligado a ela, para manter acesso à revisão. Confira e resolva os resultados antes de excluir a campanha.
+A exclusão de uma campanha comum é bloqueada enquanto houver envio incerto ligado a ela. Na campanha vinculada à **Origem da loja**, a confirmação explica o grupo e eventual envio já submetido: a exclusão pausa o vínculo, cancela pendências e preserva o controle operacional de mensagens incertas ou em andamento. A importação fica **Pausada — campanha excluída** após reiniciar ou reconectar. Escolha criar/vincular outra campanha e retomar explicitamente, ou manter a pausa; somente publicações novas desde a retomada são capturadas por padrão.
 
 Para limpar registros, entre com o dono ou com um usuário que tenha a permissão **Apagar históricos**. Em Configurações, escolha **Apagar todos os históricos**, selecione campanhas, envios, erros/diagnóstico e/ou notificações, confira as quantidades, exporte se necessário e digite **APAGAR** exatamente. Se novos registros alterarem a prévia, atualize-a antes de confirmar.
 

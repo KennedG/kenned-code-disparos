@@ -46,7 +46,7 @@ async function fixture(t) {
 test('known schema eight opens with a verified snapshot, retained accounts, media, offers and send ledger, without downgrading or loading extra modules', async t => {
   const f = await fixture(t), mediaHash = digest(f.mediaFile), credentialsHash = digest(path.join(f.dir, 'credentials.bin'));
   const store = await f.open({ upgradeVersion: '2.3.3' });
-  assert.equal(store.schemaVersion, 8); assert.equal(store.coreSchemaVersion, 7); assert.equal(store.schemaCompatibility.extraTablesPreserved, 20);
+  assert.equal(store.schemaVersion, 8); assert.equal(store.coreSchemaVersion, 7); assert.equal(store.schemaCompatibility.extraTablesPreserved, 32); // 20 legacy + 11 opportunity tables + 1 durable source link table
   assert(store.upgradeBackup?.path); assert.equal(fs.statSync(store.upgradeBackup.path).mode & 0o777, 0o600);
   const backup = new DatabaseSync(store.upgradeBackup.path, { readOnly: true });
   try {

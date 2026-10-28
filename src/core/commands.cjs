@@ -21,7 +21,7 @@ class ControlError extends Error {}
 const fail = message => { throw new ControlError(message); };
 
 class CommandController {
-  constructor({ store, scheduler, adapter, mediaManager, authService, automationControl, statusProvider, sendAdminReply, now = () => Date.now() }) {
+  constructor({ store, scheduler, adapter, mediaManager, authService, automationControl, statusProvider, sendAdminReply, licenseGuard = () => true, now = () => Date.now() }) {
     this.store = store;
     this.scheduler = scheduler;
     this.adapter = adapter;
@@ -30,6 +30,7 @@ class CommandController {
     this.automationControl = automationControl || null;
     this.statusProvider = statusProvider || null;
     this.sendAdminReply = sendAdminReply || null;
+    this.licenseGuard = licenseGuard;
     this.actorContext = new AsyncLocalStorage();
     this.now = now;
     this.sessions = new Map();
@@ -67,6 +68,7 @@ class CommandController {
 
   handle(context) {
     if (this.closed || !context) return Promise.resolve(false);
+    try { this.licenseGuard('whatsapp.command'); } catch { return Promise.resolve(false); }
     const sender = phone(context.senderNumber);
     const command = context.type === 'text' && /^!mega(?:\s|$)/i.test(String(context.text || '').trim());
     if (!command && !this.sessions.has(sender)) return Promise.resolve(false);
@@ -226,6 +228,7 @@ class CommandController {
   }
 
   async _reply(context, text) {
+    this.licenseGuard('whatsapp.command.reply');
     const value = String(text);
     const actorId = this.actorContext.getStore()?.id || null;
     for (let offset = 0; offset < value.length; offset += 3500) {
@@ -234,6 +237,7 @@ class CommandController {
       const index = Math.floor(offset / 3500) + 1;
       let adapterInvoked = false;
       const assertAuthorized = () => {
+        this.licenseGuard('whatsapp.command.reply');
         if (this.closed || context.commandAdapterRevision !== this.adapterRevision) throw Object.assign(new ControlError('O aplicativo foi encerrado ou a integração foi alterada antes do envio.'), { code: 'ADMIN_REPLY_INTEGRATION_CHANGED', definitive: true, submitted: false });
         const live = this._authorization(context);
         if (!live.allowed || (live.user?.id || null) !== actorId) throw Object.assign(new ControlError('A identidade ou autorização foi alterada antes do envio da resposta.'), { code: 'ADMIN_REPLY_AUTH_CHANGED', definitive: true, submitted: false });
@@ -294,6 +298,7 @@ class CommandController {
 
   async _handle(context) {
     if (this.closed) return false;
+    try { this.licenseGuard('whatsapp.command'); } catch { return false; }
     if (context.commandAdapterRevision !== this.adapterRevision) {
       this._trace(context, 'autorizacao', 'ADMIN_INTEGRATION_CHANGED', 'A integração mudou enquanto o comando aguardava; envie uma nova mensagem.');
       return false;
@@ -313,6 +318,7 @@ class CommandController {
   }
 
   _assert(permission, campaign) {
+    this.licenseGuard('whatsapp.command.operation');
     if (!this.authService) return;
     try { this.authService.assertFor(this.actorContext.getStore(), permission, campaign); }
     catch { fail('Seu usuário não tem permissão para esta operação ou para esta campanha. Consulte o administrador.'); }
@@ -623,7 +629,7 @@ class CommandController {
         const report = await this.automationControl.stop({ actorId: this.actorContext.getStore()?.id || null, source: 'whatsapp' });
         this._audit('automation.stop-all', null, { report });
         const count = value => typeof value === 'number' ? value : Number(value?.cancelled ?? value?.stopped ?? value?.campaigns ?? value?.count) || 0;
-        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}${report.uncertainForReview ? `⚠️ ${report.uncertainForReview} resultado(s) incerto(s) permanecem para revisão. Uma submissão anterior pode concluir após a parada; nenhum reenvio automático será feito.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
+        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\nRespostas de oportunidades pendentes canceladas: ${count(report.opportunities)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}${report.uncertainForReview ? `⚠️ ${report.uncertainForReview} resultado(s) incerto(s) permanecem para revisão. Uma submissão anterior pode concluir após a parada; nenhum reenvio automático será feito.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
       }
       await this.scheduler.stopAll();
       this._audit('campaign.stop-all');

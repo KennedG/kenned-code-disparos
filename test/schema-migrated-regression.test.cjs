@@ -60,7 +60,9 @@ test('historical sql.js spelling migrates through ALTER TABLE into schema eight 
 
   const upgraded = await createStore(directory, { upgradeVersion: '2.3.4-diagnostic' }); stores.push(upgraded);
   assert.equal(upgraded.schemaVersion, 8); assert.equal(upgraded.coreSchemaVersion, 7);
-  assert.equal(upgraded.schemaCompatibility.extraTablesPreserved, 20);
+  // The 20 historical tables and 11 persistent opportunity tables survive
+  // compatibility inspection; adding this module does not erase either set.
+  assert.equal(upgraded.schemaCompatibility.extraTablesPreserved, 32);
   assert.equal(upgraded.getCampaign(campaign.id).state, 'paused');
   assert.deepEqual(upgraded.getCampaign(campaign.id).items, campaign.items);
   assert.equal(upgraded.getJob(confirmed.id).status, 'confirmed');

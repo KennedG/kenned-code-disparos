@@ -66,6 +66,6 @@ window.KennedLibraryUI={
     function onChange(el){if(el.id==='library-search')return;if(el.dataset.libraryMedia){if(el.checked)state.selected.add(el.dataset.libraryMedia);else state.selected.delete(el.dataset.libraryMedia);const count=$('#library-selected-count');if(count)count.textContent=state.selected.size+' arquivo(s) selecionado(s)';}onInput(el);}
     async function onSubmit(form){if(form.id==='library-template-form'){await onAction('library-save-template',{dataset:{}});return true;}if(form.id==='library-delete-form'){await onAction('library-confirm-delete-media',{dataset:{}});return true;}return false;}
     function reset(){state.epoch++;state.tab='media';state.query='';state.selected.clear();state.draft=null;state.dirty=false;state.deletion=null;state.onFinish=null;}
-    return {render,onAction,onSubmit,onInput,onChange,openEditor,closeEditor,reset,hasUnsaved:()=>state.dirty,shouldPreserveDOM:()=>document.activeElement?.id==='library-search'};
+    return {render,onAction,onSubmit,onInput,onChange,openEditor,closeEditor,reset,getTab:()=>state.tab,hasUnsaved:()=>state.dirty,shouldPreserveDOM:()=>document.activeElement?.id==='library-search'};
   }
 };

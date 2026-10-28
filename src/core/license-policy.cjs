@@ -12,9 +12,14 @@ function unavailableStatus() {
     reason: 'O serviço de licença não está disponível. Abra Licença para validar ou ativar; seus dados foram preservados.' };
 }
 
+function confirmedLicenseExpiry(value) {
+  return Boolean(value && value.allowed === false &&
+    (value.status === 'expired' || ['LICENSE_EXPIRED', 'LICENSE_TRIAL_EXPIRED', 'TRIAL_EXPIRED'].includes(value.reasonCode)));
+}
+
 function publicLicenseStatus(value, { resumeRequired = false } = {}) {
   if (!value || typeof value !== 'object') value = unavailableStatus();
-  const result = { allowed: value.allowed === true, autoResumeRequired: resumeRequired === true };
+  const result = { allowed: value.allowed === true, autoResumeRequired: resumeRequired === true, totalBlocked: confirmedLicenseExpiry(value) };
   for (const field of PUBLIC_FIELDS) {
     const entry = value[field];
     if (entry === null || ['string', 'number', 'boolean'].includes(typeof entry)) result[field] = typeof entry === 'string' ? entry.slice(0, 1000) : entry;
@@ -40,4 +45,4 @@ function unavailableLicenseService() {
   };
 }
 
-module.exports = { publicLicenseStatus, unavailableLicenseService, licenseError };
+module.exports = { publicLicenseStatus, unavailableLicenseService, licenseError, confirmedLicenseExpiry };

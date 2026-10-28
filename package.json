@@ -50,7 +50,7 @@
       ],
       "icon": "assets/icon.ico",
       "signExecutable": false,
-      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Origem-${arch}.exe"
+      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Reformulado-${arch}.exe"
     },
     "nsis": {
       "script": "scripts/installer.nsi",
@@ -72,5 +72,5 @@
       "en-US"
     ]
   },
-  "releaseRevision": "origem-r1"
+  "releaseRevision": "reformulado-r1"
 }
