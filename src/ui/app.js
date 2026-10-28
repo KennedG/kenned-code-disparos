@@ -161,7 +161,7 @@
     licenseUI?.updateChrome();
     $('#theme-toggle').disabled=!can('settings.edit');
     $('#theme-toggle').innerHTML = icon(document.body.dataset.theme==='dark'?'sun':'moon');
-    $('#version').textContent = d.version || '1.0';
+    $('#version').textContent = (d.version || '1.0') + (d.buildRevision ? ` · ${d.buildRevision.match(/r\d+$/i)?.[0]?.toUpperCase() || d.buildRevision}` : '');
     const renderers = {dashboard:renderDashboard,campaigns:renderCampaigns,sources:()=>sourceUI.render(),opportunities:()=>opportunityUI.render(),buscas:()=>buscasUI.render(),groups:renderGroups,library:()=>libraryUI.render(),reminders:()=>remindersUI.render(),history:renderHistory,settings:renderSettings,reports:renderReports,diagnostics:renderDiagnostics,users:renderUsers,contacts:renderContacts,alerts:renderAlerts,license:()=>licenseUI.renderPage()};
     if (!force && state.page==='settings' && $('#settings-form') && (state.settingsDirty || $('#settings-form').contains(document.activeElement))) return;
     if(!force&&state.page==='contacts'&&contactIntakeUI.shouldPreserveDOM())return;

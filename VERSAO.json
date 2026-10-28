@@ -1,8 +1,8 @@
 {
-  "tag": "v2.3.2-r7",
-  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Oportunidades-Automatico-x64.exe",
-  "installerSha256": "00fc2a9cf4d39b09bd0ea0c21630a7c4838b34c5569e18feea975a4fa1b12001",
+  "tag": "v2.3.2-r8",
+  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Privado-R8-x64.exe",
+  "installerSha256": "1a39762b9e6e64d327293314f1fdbead888933ce56e9ee698119415921009213",
   "sourceRecoveredFromInstaller": false,
-  "packagedSourceFilesAudited": 122,
+  "packagedSourceFilesAudited": 123,
   "latestRecommended": false
 }

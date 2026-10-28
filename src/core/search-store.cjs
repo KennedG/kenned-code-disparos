@@ -196,6 +196,13 @@ function attachSearchStore(store,{db,prepared: basePrepared,transaction}) {
     prepared(`INSERT INTO buscas_history(id,userId,chatId,createdAt,status,data)VALUES(?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET status=excluded.status,data=excluded.data`).run(id,data.userId??data.actorId??null,data.chatId??null,data.createdAt,data.status,encode(data));return data;
   }
   function claimRun(value){return transaction(()=>{
+    // Private account routes may legitimately change between PN and LID after
+    // reconnect. Retain the real reply chat while reserving the command once
+    // per central actor/message, including rows written by earlier revisions.
+    if(['whatsapp-private','whatsapp-self'].includes(value?.source)&&value?.actorId&&value?.messageId){
+      const old=decode(prepared("SELECT data FROM buscas_runs WHERE userId=? AND messageId=? AND json_extract(data,'$.source') IN ('whatsapp-private','whatsapp-self') LIMIT 1").get(identifier(value.actorId),identifier(value.messageId)));
+      if(old)return {claimed:false,run:old};
+    }
     if(value?.chatId&&value?.messageId){const old=decode(prepared('SELECT data FROM buscas_runs WHERE chatId=? AND messageId=?').get(identifier(value.chatId),identifier(value.messageId)));if(old)return {claimed:false,run:old};}
     if(value?.id){const old=decode(prepared('SELECT data FROM buscas_runs WHERE id=?').get(value.id));if(old)return {claimed:false,run:old};}
     return {claimed:true,run:saveRunRaw({...value,id:value.id??randomUUID()})};

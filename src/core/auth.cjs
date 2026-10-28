@@ -93,6 +93,10 @@ class AuthService {
   constructor(options) {
     this.store = options.store || options;
     this.now = options.clock || (() => Date.now());
+    // Only the running transport may provide authenticated identity aliases.
+    // Message payloads and renderer parameters never populate this resolver.
+    this.identityAliases = typeof options.identityAliases === 'function' ? options.identityAliases : () => [];
+    this.prepareIdentity = typeof options.prepareIdentity === 'function' ? options.prepareIdentity : null;
     this.currentUserId = null;
     this._tail = Promise.resolve(); this._waiting = 0;
     this._unknownFailures = new Map();
@@ -177,11 +181,36 @@ class AuthService {
   }
   assert(permission, campaign) { return this.assertFor(this.currentUserId, permission, campaign); }
   visibleCampaigns(campaigns = this.store.listCampaigns()) { return campaigns.filter(c => this.can('campaign.view', c)); }
+  _phoneIdentities(value) {
+    let number; try { number = phone(value); } catch { return []; }
+    if (!number) return [];
+    let aliases; try { aliases = this.identityAliases(number); } catch { aliases = []; }
+    if (!Array.isArray(aliases) || aliases.length > 8) return [number];
+    const values = aliases.map(value => { try { return phone(value); } catch { return ''; } }).filter(Boolean);
+    return [...new Set([number, ...values])];
+  }
+  sameVerifiedPhoneIdentity(left, right) {
+    let first, second; try { first = phone(left); second = phone(right); } catch { return false; }
+    if (!first || !second) return false;
+    return first === second || this._phoneIdentities(first).includes(second) && this._phoneIdentities(second).includes(first);
+  }
+  _matchingPhoneUsers(number) {
+    const identities = new Set(this._phoneIdentities(number));
+    return this._users().filter(u => u.active !== false && !u.requirePasswordChange && this._role(u) &&
+      [u.phone, ...(u.authorizedPhones || [])].some(value => { try { return identities.has(phone(value)); } catch { return false; } }));
+  }
+  async prepareWhatsAppActor(context) {
+    if (!this.prepareIdentity || context?.verified !== true || context.isGroup !== false || context.forwarded !== false ||
+      context.automaticMessage === true || context.machineGenerated === true || context.history || context.historical || context.isHistory) return;
+    const numbers = [...new Set(this._users().filter(u => u.active !== false && !u.requirePasswordChange && this._role(u))
+      .flatMap(u => [u.phone, ...(u.authorizedPhones || [])]).map(value => { try { return phone(value); } catch { return ''; } }).filter(Boolean))];
+    await this.prepareIdentity(context, numbers);
+  }
   findAuthorizedPhone(value) {
     let number; try { number = phone(value); } catch { return null; }
     if (!number) return null;
-    const users = this._users().filter(u => u.active !== false && !u.requirePasswordChange && this._role(u) && [u.phone, ...(u.authorizedPhones || [])].some(value=>{try{return phone(value)===number;}catch{return false;}}));
-    return users.length===1?this._public(users[0]):null;
+    const users = this._matchingPhoneUsers(number);
+    return users.length === 1 ? this._public(users[0]) : null;
   }
   resolveWhatsAppActor(context) {
     const denied=(code,reason,number='')=>({user:null,number,code,reason});
@@ -190,7 +219,7 @@ class AuthService {
     if(!number)return denied('WA_PHONE_UNAVAILABLE','O WhatsApp não informou um telefone confiável para este remetente.');
     const identities=[context.senderId,...(Array.isArray(context.senderIds)?context.senderIds:[])].filter(value=>typeof value==='string');
     for(const jid of identities){const match=jid.match(/^([1-9]\d{9,14})(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/);if(match&&match[1]!==number)return denied('WA_IDENTITY_CONFLICT','O telefone confirmado diverge do identificador do remetente.',number);}
-    const matches=this._users().filter(u=>u.active!==false&&!u.requirePasswordChange&&this._role(u)&&[u.phone,...(u.authorizedPhones||[])].some(value=>{try{return phone(value)===number;}catch{return false;}}));
+    const matches=this._matchingPhoneUsers(number);
     if(matches.length>1)return denied('WA_AUTH_AMBIGUOUS','O número está vinculado a mais de um usuário. Revise o cadastro de autorizações.',number);
     if(!matches.length)return denied('WA_SENDER_NOT_AUTHORIZED','O número confirmado não pertence a um usuário ativo autorizado.',number);
     return {user:this._public(matches[0]),number,code:'WA_IDENTITY_AUTHORIZED',reason:'Identidade confirmada e vinculada a um único usuário ativo.'};

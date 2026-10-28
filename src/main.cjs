@@ -157,7 +157,7 @@ function createWindow(){
   tray.setContextMenu(Menu.buildFromTemplate([
     {label:'Abrir '+APP_NAME,click:showWindow},
     {label:'PARAR TODOS OS ENVIOS',click:()=>{void client.call('stopAll').then(result=>{if(result?.error)throw new Error(result.error);}).catch(()=>{showWindow();void dialog.showMessageBox(win,{type:'warning',message:'Entre com um usuário autorizado para interromper as campanhas.'});});}},
-    {type:'separator'},{label:'Sobre '+APP_NAME,click:()=>{void dialog.showMessageBox(win,{type:'info',title:'Sobre '+APP_NAME,message:APP_NAME+' '+app.getVersion(),detail:'Aplicativo local para Windows. Campanhas e buscas autorizadas pelo WhatsApp.\nIntegração Baileys não oficial. Os dados da instalação anterior foram preservados.',buttons:['OK']});}},{label:'Encerrar',click:()=>app.quit()}
+    {type:'separator'},{label:'Sobre '+APP_NAME,click:()=>{void dialog.showMessageBox(win,{type:'info',title:'Sobre '+APP_NAME,message:APP_NAME+' '+app.getVersion()+' · '+require('../package.json').releaseRevision,detail:'Aplicativo local para Windows. Campanhas e buscas autorizadas pelo WhatsApp.\nIntegração Baileys não oficial. Os dados da instalação anterior foram preservados.',buttons:['OK']});}},{label:'Encerrar',click:()=>app.quit()}
   ]));
   tray.on('double-click',showWindow);Menu.setApplicationMenu(null);
   for(const payload of pendingForeground.values())foregroundIncident(payload);pendingForeground.clear();

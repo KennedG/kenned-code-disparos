@@ -51,7 +51,7 @@ class OpportunityPrivateCommands {
     let config; try { config = this._config(); } catch { return deny('OP_CONTROL_CONFIG_INVALID', 'Não foi possível verificar a configuração do administrador.'); }
     const admin = normalizePhone(config?.adminPhone), actorId = config?.adminActorId || config?.ownerId;
     if (!admin || typeof actorId !== 'string' || !actorId) return deny('OP_CONTROL_ADMIN_MISSING', 'Configure o número e o usuário administrador de Oportunidades no aplicativo.');
-    if (!sender || sender !== admin) return deny('OP_CONTROL_SENDER_DENIED', 'Remetente não corresponde ao administrador configurado.');
+    if (!sender || sender !== admin && this.authService.sameVerifiedPhoneIdentity?.(sender, admin) !== true) return deny('OP_CONTROL_SENDER_DENIED', 'Remetente não corresponde ao administrador configurado.');
     const directPhone = context.chatId === `${sender}@s.whatsapp.net`;
     const verifiedLid = /^[1-9]\d*@lid$/.test(context.chatId || '');
     if (!directPhone && !verifiedLid) return deny('OP_CONTROL_REPLY_CHAT_MISMATCH', 'Chat privado não corresponde à identidade do remetente verificado.');
@@ -72,10 +72,11 @@ class OpportunityPrivateCommands {
     }
     const entries = this._entries(context.commandStorageMode);
     const id = `${normalizePhone(context.senderNumber)}:${context.messageId}`;
-    const previous = entries.find(entry => entry.id === id);
+    const previous = entries.find(entry => entry.id === id || context.commandActorId && entry.actorId === context.commandActorId &&
+      (entry.messageId || (typeof entry.id === 'string' ? entry.id.slice(entry.id.indexOf(':') + 1) : '')) === context.messageId);
     if (previous) { context.commandTraceId = previous.traceId; this._trace(context, 'duplicate', 'OP_CONTROL_DUPLICATE', 'Comando já registrado; operação e resposta não foram repetidas.'); return false; }
     if (entries.length >= MAX_COMMANDS) { this._trace(context, 'duplicate', 'OP_CONTROL_CAPACITY', 'Limite diário de comandos atingido; processamento bloqueado sem descartar a proteção de duplicidade.'); return false; }
-    const entry = { id, at: this.now(), traceId: context.commandTraceId, actorId: context.commandActorId, chatId: context.chatId, status: 'claimed', replies: [] };
+    const entry = { id, messageId: context.messageId, at: this.now(), traceId: context.commandTraceId, actorId: context.commandActorId, chatId: context.chatId, status: 'claimed', replies: [] };
     entries.push(entry); this._persist(entries, context.commandStorageMode); context.commandLedgerKey = id; return true;
   }
   _record(context, patch) {
@@ -146,12 +147,16 @@ class OpportunityPrivateCommands {
       }
     }
   }
-  handle(context) {
+  async handle(context) {
     if (this.closed || context?.type !== 'text' || !PREFIX.test(String(context.text || '').trim())) return Promise.resolve(false);
-    context = { ...context, commandTraceId: randomUUID(), commandStorageMode: this._mode(), commandAdapterRevision: this.adapterRevision };
+    context = { ...context, commandTraceId: /^wa-receive-[a-f0-9]{24}$/.test(context.traceId || '') ? context.traceId : randomUUID(), commandStorageMode: this._mode(), commandAdapterRevision: this.adapterRevision };
     this._trace(context, 'received', 'OP_CONTROL_RECEIVED', 'Comando privado de oportunidades recebido; aguardando autorização.');
     try { this.licenseGuard('opportunity.control'); } catch (err) { this._trace(context, 'authorization', 'OP_CONTROL_LICENSE_DENIED', safe(err.message)); return Promise.resolve(false); }
+    const initialActor = this._authorization(context).user?.id || null;
+    try { await this.authService.prepareWhatsAppActor?.(context); }
+    catch (err) { this._trace(context, 'authorization', 'OP_CONTROL_IDENTITY_RESOLUTION_FAILED', safe(err.message || 'Não foi possível comprovar a identidade do administrador.')); return false; }
     const authorization = this._authorization(context);
+    if (initialActor && authorization.user?.id !== initialActor) { this._trace(context, 'authorization', 'OP_CONTROL_ACTOR_CHANGED', 'O administrador mudou durante a verificação da identidade. Envie um novo comando.'); return false; }
     if (!authorization.allowed) { this._trace(context, 'authorization', authorization.code, authorization.reason); return Promise.resolve(false); }
     context.commandActorId = authorization.user.id;
     if (/^!pausar\s*$/i.test(context.text.trim())) return this._handle(context);

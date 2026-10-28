@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomBytes, createHash, createHmac, timingSafeEqual } = require('node:crypto');
+const { normalizePhone } = require('../core/phone.cjs');
 
 const AUTH_FILE = 'session.dpapi';
 const ACK_TIMEOUT_MS = 20000;
@@ -52,6 +53,16 @@ function messageTimestamp(value) {
 function accountJid(value) {
   if (typeof value !== 'string' || value.length > 160 || !/^\d+(?::\d+)?@(s\.whatsapp\.net|lid)$/.test(value)) return '';
   return value.replace(/:\d+(?=@)/, '');
+}
+
+// This shape is only a candidate for a server verification, never identity
+// evidence. In particular, no telephone is manufactured by removing a digit.
+function brazilNinthDigitPair(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string' || left === right) return false;
+  const longer = left.length > right.length ? left : right;
+  const shorter = left.length > right.length ? right : left;
+  return /^55[1-9]\d9[6-9]\d{7}$/.test(longer) && /^55[1-9]\d[6-9]\d{7}$/.test(shorter) &&
+    longer.slice(0, 4) === shorter.slice(0, 4) && longer.slice(5) === shorter.slice(4);
 }
 
 function messageContent(message, { edits = false } = {}) {
@@ -207,6 +218,7 @@ class WhatsAppAdapter extends EventEmitter {
     this.captureHistoryQueued = 0;
     this.automaticMessages = new Set();
     this.recipientCache = new Map();
+    this.verifiedRecipientAliases = new Map();
     this.protocolRecipientHints = new Map();
     this.recipientResolutions = new Map();
     this.deliveryProofs = new Map();
@@ -266,7 +278,7 @@ class WhatsAppAdapter extends EventEmitter {
     const text = messageContent(message?.message)?.text;
     if (typeof text !== 'string') return false;
     const normalized = text.trimStart().toLowerCase();
-    return [this.commandPrefix, '!mega'].some(prefix => normalized.startsWith(prefix.toLowerCase()) &&
+    return [this.commandPrefix, '!mega', '!automatico', '!aprovar', '!recusar', '!pausar', '!status', '!ajuda'].some(prefix => normalized.startsWith(prefix.toLowerCase()) &&
       (normalized.length === prefix.length || /\s/.test(normalized[prefix.length])));
   }
 
@@ -274,7 +286,7 @@ class WhatsAppAdapter extends EventEmitter {
     const key = message?.key || {};
     const messageId = typeof key.id === 'string' ? key.id.slice(0, 128) : '';
     const chatId = accountJid(key.remoteJid) || (typeof key.remoteJid === 'string' && key.remoteJid.endsWith('@g.us') ? key.remoteJid : '');
-    const outgoing = ['transport.submitting', 'transport.accepted', 'transport.delivered', 'transport.failed'].includes(stage);
+    const outgoing = ['transport.recipient', 'transport.submitting', 'transport.accepted', 'transport.delivered', 'transport.failed'].includes(stage);
     const unknownPrivate = !chatId.endsWith('@g.us') && message?.messageStubType === (this.library?.WAMessageStubType?.CIPHERTEXT ?? 2);
     const commandCandidate = this._commandCandidate(message);
     if (!outgoing && !commandCandidate && !unknownPrivate) return;
@@ -298,6 +310,7 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   _status(state, detail, extras = {}) {
+    if (state !== 'connected') this.verifiedRecipientAliases.clear();
     const failure = ['disconnected', 'restricted'].includes(state);
     const own = this._ownAccount();
     this.status = { state, ready: state === 'connected', mode: 'whatsapp', simulation: false, detail, ownNumber: own.phone || '', ownAccountId: own.id || '', ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
@@ -333,6 +346,7 @@ class WhatsAppAdapter extends EventEmitter {
     this._status('connecting', 'Preparando a conexão não oficial com o WhatsApp…');
     const generation = ++this.generation;
     this.recipientCache.clear();
+    this.verifiedRecipientAliases.clear();
     this.recipientResolutions.clear();
     this.pendingDecryption.clear();
     this.groupMetadataCache.clear();
@@ -1510,15 +1524,120 @@ class WhatsAppAdapter extends EventEmitter {
     return this.sendPrivateContent(target, { type: 'document', caption: document?.caption || '' }, document, options);
   }
 
-  async resolveRecipient(number, { traceId } = {}) {
-    try { return await this._resolveRecipient(number); }
+  verifiedPhoneAliases(number) {
+    const digits = normalizePhone(number);
+    if (!digits || !this.socket || !this.getConnectionReadiness().ready) return [];
+    const binding = this.verifiedRecipientAliases.get(digits);
+    if (!binding) return [];
+    if (binding.generation !== this.generation || binding.socket !== this.socket ||
+        binding.accountId !== this._ownAccount().id || binding.expiresAt <= Date.now()) {
+      for (const phone of binding.phones) {
+        if (this.verifiedRecipientAliases.get(phone) === binding) this.verifiedRecipientAliases.delete(phone);
+        if (this.recipientCache.get(phone)?.result?.identityAliasesConfirmed) this.recipientCache.delete(phone);
+      }
+      return [];
+    }
+    return [...binding.phones];
+  }
+
+  async prepareIdentityAliases(context, configuredPhones) {
+    // These lookups are limited to the administrator/authorization allowlist
+    // supplied by the backend. An arbitrary received number cannot cause a
+    // scan of contacts or become authorized merely by resembling one.
+    if (!context || context.isGroup !== false || context.verified !== true ||
+        context.identityVerified !== true || context.forwarded !== false ||
+        context.history || context.historical || context.isHistory ||
+        context.automaticMessage || context.machineGenerated || context.automated ||
+        !this._commandCandidate({ message: { conversation: context.text } })) return context;
+    if (context.fromMe !== false && !(context.fromMe === true && context.selfChat === true && this.isTrustedSelfContext(context))) return context;
+    const sender = normalizePhone(context.senderNumber);
+    const at = Number(context.timestamp);
+    if (!sender || !Number.isFinite(at) || at < Date.now() - 120000 || at > Date.now() + 30000) return context;
+    const candidates = [...new Set((Array.isArray(configuredPhones) ? configuredPhones : []).map(normalizePhone).filter(phone => phone && brazilNinthDigitPair(phone, sender)))];
+    if (!candidates.length) return context;
+    // Validate the signed inbound route BEFORE consulting numbers from the
+    // allowlist. No raw renderer object or unverified LID can establish aliases.
+    await this.resolveReplyRecipient(context);
+    for (const candidate of candidates) {
+      if (this.verifiedPhoneAliases(candidate).includes(sender)) continue;
+      let timer;
+      try {
+        const recipient = await Promise.race([
+          this.resolveRecipient(candidate, { traceId: context.traceId, timeoutMs: 5000 }),
+          new Promise((_resolve, reject) => { timer = setTimeout(() => reject(definitiveError('A verificação da identidade do administrador excedeu o prazo. Nenhuma autorização foi acrescentada.', true, 'WA_RECIPIENT_TIMEOUT')), 5000); })
+        ]);
+        // A normal exact result for the configured number is NOT evidence that
+        // the different sender is the same person. Only the proven pair counts.
+        if (!this.verifiedPhoneAliases(candidate).includes(sender)) throw definitiveError('O número do remetente não foi vinculado de forma inequívoca ao administrador. Nenhuma autorização foi acrescentada.', false, 'WA_RECIPIENT_MISMATCH');
+        if (!recipient?.jid) throw definitiveError('Não foi possível confirmar o identificador do administrador.', false, 'WA_RECIPIENT_INVALID_JID');
+      } finally { clearTimeout(timer); }
+    }
+    return context;
+  }
+
+  async _confirmRecipientAlias(requestedPhone, resolvedPhone, socket, generation, deadline) {
+    if (!brazilNinthDigitPair(requestedPhone, resolvedPhone) ||
+        typeof socket.executeUSyncQuery !== 'function' ||
+        typeof this.library?.USyncQuery !== 'function' || typeof this.library?.USyncUser !== 'function') return null;
+    const query = phone => new this.library.USyncQuery().withContactProtocol().withLIDProtocol()
+      .withUser(new this.library.USyncUser().withPhone(`+${phone}`));
+    let timer;
+    const timeout = Math.max(1, deadline - Date.now());
+    try {
+      if (Date.now() >= deadline) throw definitiveError('O prazo de identificação do destinatário terminou antes da confirmação dos identificadores. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_TIMEOUT');
+      const results = await Promise.race([
+        Promise.all([requestedPhone, resolvedPhone].map(phone => Promise.resolve().then(() => socket.executeUSyncQuery(query(phone))))),
+        new Promise((_resolve, reject) => { timer = setTimeout(() => reject(definitiveError('O WhatsApp não confirmou a equivalência dos identificadores no prazo. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_TIMEOUT')), timeout); })
+      ]);
+      this._assertTransport(socket, generation);
+      if (Date.now() >= deadline) throw definitiveError('O prazo de identificação do destinatário terminou. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_TIMEOUT');
+      const canonicalJid = `${resolvedPhone}@s.whatsapp.net`;
+      const confirmed = [];
+      for (const result of results) {
+        // A list containing an extra unmatched row is ambiguous too. Do not
+        // filter rows and accidentally hide a conflicting server response.
+        if (!Array.isArray(result?.list) || result.list.length !== 1 ||
+            result.sideList !== undefined && (!Array.isArray(result.sideList) || result.sideList.length)) return null;
+        const entry = result.list[0];
+        const jid = accountJid(this.library?.jidNormalizedUser?.(entry?.id) || entry?.id);
+        const lid = accountJid(entry?.lid);
+        if (entry?.contact !== true || jid !== canonicalJid || !lid.endsWith('@lid')) return null;
+        confirmed.push({ jid, lid });
+      }
+      if (confirmed[0].lid !== confirmed[1].lid) return null;
+      const own = this._ownAccount();
+      if (!own.id) return null;
+      const binding = { phones: [requestedPhone, resolvedPhone], canonicalPhone: resolvedPhone,
+        lid: confirmed[0].lid, generation, socket, accountId: own.id, expiresAt: Date.now() + 600000 };
+      // The same two server responses also prove this LID-to-PN mapping. Keep
+      // that authenticated mapping for LID-only inbound events; do not derive
+      // a telephone from the LID's numeric part or require an unrelated event.
+      this._rememberContacts([{ id: binding.lid, phoneNumber: canonicalJid }]);
+      for (const phone of binding.phones) this.verifiedRecipientAliases.set(phone, binding);
+      while (this.verifiedRecipientAliases.size > 2000) this.verifiedRecipientAliases.delete(this.verifiedRecipientAliases.keys().next().value);
+      return binding;
+    } finally { clearTimeout(timer); }
+  }
+
+  async resolveRecipient(number, { traceId, timeoutMs } = {}) {
+    try {
+      const result = await this._resolveRecipient(number, { timeoutMs });
+      if (result.identityAliasesConfirmed && this._validTraceId(traceId)) {
+        const masked = value => `${value.slice(0, 2)}…${value.slice(-4)}`;
+        this._transportDiagnostic({ key: { id: '', remoteJid: result.jid, fromMe: true } }, 'transport.recipient', 'WA_RECIPIENT_IDENTITY_CONFIRMED', 'A identidade do destinatário e a rota canônica foram confirmadas por duas consultas autenticadas. Isso ainda não representa envio ou entrega.',
+          { submitted: false, resolutionSource: result.resolutionSource, requestedPhoneMasked: masked(result.requestedPhone), requestedPhoneLength: result.requestedPhone.length,
+            returnedPhoneMasked: masked(result.resolvedPhone), returnedPhoneLength: result.resolvedPhone.length, returnedIdentifierType: 'phone-jid', identityConfirmed: true,
+            evidence: 'dual-single-user-contact-lid', canonicalRouteConfirmed: true }, traceId);
+      }
+      return result;
+    }
     catch (error) {
       if (this._validTraceId(traceId)) this._transportDiagnostic({ key: { id: '', remoteJid: /^\d{10,15}$/.test(String(number || '')) ? `${number}@s.whatsapp.net` : '', fromMe: true } }, 'transport.failed', /^[A-Z0-9_]{1,80}$/.test(error?.code || '') ? error.code : 'WA_RECIPIENT_LOOKUP_REJECTED', 'Não foi possível resolver o destinatário pela integração. Nenhuma mensagem foi submetida.', { submitted: false, ...(error?.resolutionDetails || {}) }, traceId);
       throw error;
     }
   }
 
-  async _resolveRecipient(number) {
+  async _resolveRecipient(number, { timeoutMs } = {}) {
     const digits = String(number || '');
     if (!/^[1-9]\d{9,14}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.', false, 'WA_RECIPIENT_INVALID');
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado antes de resolver o destinatário.', true, 'WA_RECIPIENT_OFFLINE');
@@ -1536,16 +1655,21 @@ class WhatsAppAdapter extends EventEmitter {
       return { jid: hint.jid, phone: digits, requestedPhone: digits, isSelf: false, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-private-message' };
     }
     const cached = this.recipientCache.get(digits);
-    if (cached && cached.generation === generation && cached.expiresAt > Date.now()) return { ...cached.result };
+    if (cached && cached.generation === generation && cached.expiresAt > Date.now()) {
+      if (!cached.result.identityAliasesConfirmed || this.verifiedPhoneAliases(digits).includes(cached.result.resolvedPhone)) return { ...cached.result };
+      this.recipientCache.delete(digits);
+    }
     if (this.recipientResolutions.has(digits)) return this.recipientResolutions.get(digits);
     if (this.recipientResolutions.size >= 64) throw definitiveError('Há destinatários demais sendo resolvidos. Aguarde a fila atual.', true, 'WA_RECIPIENT_BUSY');
     if (typeof socket.onWhatsApp !== 'function') throw definitiveError('Esta integração não disponibiliza a resolução de números. Atualize a instalação antes de enviar.', false, 'WA_RECIPIENT_UNSUPPORTED');
     const operation = (async () => {
       let timer;
       try {
+        const budget = Math.max(1, Math.min(this.controlTimeoutMs, 30000, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : Infinity));
+        const deadline = Date.now() + budget;
         const results = await Promise.race([
           Promise.resolve().then(() => socket.onWhatsApp(digits)),
-          new Promise((_resolve, reject) => { timer = setTimeout(() => reject(definitiveError('O WhatsApp não respondeu à validação do destinatário. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_TIMEOUT')), Math.min(this.controlTimeoutMs, 30000)); })
+          new Promise((_resolve, reject) => { timer = setTimeout(() => reject(definitiveError('O WhatsApp não respondeu à validação do destinatário. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_TIMEOUT')), budget); })
         ]);
         if (generation !== this.generation || this.socket !== socket || this.status.state !== 'connected') throw definitiveError('A conexão mudou durante a resolução do destinatário. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_CONNECTION_CHANGED');
         if (!Array.isArray(results)) throw definitiveError('Não foi possível confirmar o destinatário no WhatsApp. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_LOOKUP_INCOMPLETE');
@@ -1555,14 +1679,20 @@ class WhatsAppAdapter extends EventEmitter {
         const jid = accountJid(this.library?.jidNormalizedUser?.(available[0].jid) || available[0].jid);
         if (!jid) throw definitiveError('O WhatsApp retornou um identificador de destinatário inválido. Nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_INVALID_JID');
         const resolvedPhone = phoneFromJid(jid);
+        let alias = null;
         if (resolvedPhone && resolvedPhone !== digits) {
+          alias = await this._confirmRecipientAlias(digits, resolvedPhone, socket, generation, deadline);
+        }
+        if (resolvedPhone && resolvedPhone !== digits && !alias) {
           const masked = value => `${value.slice(0, 2)}…${value.slice(-4)}`;
           const mismatch = definitiveError('O WhatsApp retornou um telefone diferente do configurado. Confira o número solicitado e a identificação mascarada em Diagnóstico; o destino não foi substituído e nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_MISMATCH');
           mismatch.resolutionDetails = { resolutionSource: 'whatsapp-usync', requestedPhoneMasked: masked(digits), requestedPhoneLength: digits.length, returnedPhoneMasked: masked(resolvedPhone), returnedPhoneLength: resolvedPhone.length, returnedIdentifierType: 'phone-jid', identityConfirmed: false, destinationSubstituted: false, guidance: 'Confira o cadastro do responsável ou solicite uma mensagem privada desse contato para obter uma rota autenticada. Uma variação de telefone não é autorizada automaticamente.' };
           throw mismatch;
         }
-        const result = { jid, phone: digits, requestedPhone: digits, isSelf: false, mode: 'whatsapp', simulation: false, resolutionSource: 'whatsapp-usync' };
-        this._rememberContacts([{ id: jid, phoneNumber: `${digits}@s.whatsapp.net` }]);
+        const result = { jid, phone: digits, requestedPhone: digits, isSelf: Boolean(alias && own.phone === resolvedPhone), mode: 'whatsapp', simulation: false, resolutionSource: alias ? 'whatsapp-usync-confirmed-alias' : 'whatsapp-usync', ...(alias ? { resolvedPhone, identityAliasesConfirmed: true } : {}) };
+        // Preserve the actual PN for a PN JID. Saving the input alias here would
+        // later manufacture an identity conflict for a legitimate incoming chat.
+        this._rememberContacts([{ id: jid, phoneNumber: `${resolvedPhone || digits}@s.whatsapp.net` }]);
         this.recipientCache.set(digits, { result, generation, expiresAt: Date.now() + 600000 });
         while (this.recipientCache.size > 1000) this.recipientCache.delete(this.recipientCache.keys().next().value);
         return { ...result };

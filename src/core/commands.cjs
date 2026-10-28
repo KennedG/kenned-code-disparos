@@ -66,7 +66,7 @@ class CommandController {
     this.replyIndex.clear();
   }
 
-  handle(context) {
+  async handle(context) {
     if (this.closed || !context) return Promise.resolve(false);
     try { this.licenseGuard('whatsapp.command'); } catch { return Promise.resolve(false); }
     const sender = phone(context.senderNumber);
@@ -76,7 +76,11 @@ class CommandController {
       commandAdapterRevision: this.adapterRevision, commandStorageMode: this.store.getStorageMode?.() || this.adapter.status?.mode || 'whatsapp' };
     this._trace(context, 'recebimento', 'ADMIN_COMMAND_RECEIVED',
       context.fromMe === true ? 'Comando manual da conta conectada observado.' : 'Mensagem de controle recebida; autorização ainda não validada.');
+    const initialActor = this._authorization(context).user?.id || null;
+    try { await this.authService?.prepareWhatsAppActor?.(context); }
+    catch (err) { this._trace(context, 'autorizacao', 'ADMIN_IDENTITY_RESOLUTION_FAILED', 'Não foi possível comprovar o vínculo de identidade retornado pelo WhatsApp. Confira o diagnóstico e tente novamente após reconectar.'); return false; }
     const authorization = this._authorization(context);
+    if (initialActor && authorization.user?.id !== initialActor) { this._trace(context, 'autorizacao', 'ADMIN_ACTOR_CHANGED', 'O administrador mudou durante a verificação da identidade. Envie um novo comando.'); return false; }
     if (!authorization.allowed) {
       this._trace(context, 'autorizacao', authorization.code, authorization.reason);
       return Promise.resolve(false);
@@ -172,7 +176,8 @@ class CommandController {
     const activeKeys = new Set(seen.map(entry => entry.id));
     for (const [messageId, commandKey] of this.replyIndex) if (!activeKeys.has(commandKey)) this.replyIndex.delete(messageId);
     const key = `${phone(context.senderNumber)}:${context.messageId}`;
-    const previous = seen.find(entry => entry.id === key);
+    const previous = seen.find(entry => entry.id === key || context.commandActorId && entry.actorId === context.commandActorId &&
+      (entry.messageId || (typeof entry.id === 'string' ? entry.id.slice(entry.id.indexOf(':') + 1) : '')) === context.messageId);
     if (previous) {
       context.commandTraceId = previous.traceId || context.commandTraceId;
       return rejected('ADMIN_COMMAND_DUPLICATE', 'Evento já processado; operação e resposta não foram repetidas.');
@@ -180,7 +185,7 @@ class CommandController {
     // Retain the durable identities for 24 hours, not just the freshness window.
     // A bounded flood fails closed rather than evicting live replay protection.
     if (seen.length >= 10000) return rejected('ADMIN_REPLAY_CAPACITY', 'Limite diário de comandos atingido; processamento bloqueado para proteger contra repetição.');
-    seen.push({ id: key, at: now, traceId: context.commandTraceId, actorId: context.commandActorId || null, chatId: context.chatId, replies: [] });
+    seen.push({ id: key, messageId: context.messageId, at: now, traceId: context.commandTraceId, actorId: context.commandActorId || null, chatId: context.chatId, replies: [] });
     this.store.setSetting('recentCommandIds', seen);
     context.commandLedgerKey = key;
     return true;

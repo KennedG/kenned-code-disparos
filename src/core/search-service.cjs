@@ -290,7 +290,7 @@ class SearchService extends EventEmitter {
     if (selfChat && settings.selfCommandsEnabled) return true;
     if (!settings.privateCommandsEnabled) return false;
     if (own) { const number = phone(ctx.chatId?.match(/^(\d+)@s\.whatsapp\.net$/)?.[1]); return !!number && settings.commandPrivateNumbers.includes(number); }
-    return (!settings.commandPrivateNumbers.length || settings.commandPrivateNumbers.includes(phone(ctx.senderNumber))) && (ctx.chatId === `${ctx.senderNumber}@s.whatsapp.net` || /^\d+@lid$/.test(ctx.chatId || '')); 
+    return (!settings.commandPrivateNumbers.length || settings.commandPrivateNumbers.some(number => number === phone(ctx.senderNumber) || this.authService.sameVerifiedPhoneIdentity?.(number, ctx.senderNumber) === true)) && (ctx.chatId === `${ctx.senderNumber}@s.whatsapp.net` || /^\d+@lid$/.test(ctx.chatId || '')); 
   }
   async handleIncoming(ctx) {
     if (this.closed) return false; this._enqueue(ctx);
@@ -305,6 +305,10 @@ class SearchService extends EventEmitter {
     const own = this._trustedSelf(ctx);
     if (ctx.fromMe !== false && !own) return reject('untrusted_own_account_message');
     if (!(ctx.identityVerified === true || ctx.verified === true) || !phone(ctx.senderNumber) || !boundedText(ctx.messageId, 512) || !ctx.messageId) return reject('sender_identity_unavailable');
+    const identityAdapter = this.adapter, identityMode = this._mode();
+    try { await this.authService.prepareWhatsAppActor?.(ctx); }
+    catch (error) { return reject('sender_identity_unavailable', error?.code || 'SEARCH_IDENTITY_RESOLUTION_FAILED', 'Não foi possível comprovar a identidade telefônica do solicitante.'); }
+    if (identityAdapter !== this.adapter || identityMode !== this._mode() || this.closed) return reject('integration_mode_mismatch');
     const senderResolution = this.authService.resolveWhatsAppActor?.(ctx), actor = senderResolution ? senderResolution.user : this.authService.findAuthorizedPhone(ctx.senderNumber);
     if (!actor) return reject('sender_not_authorized', senderResolution?.code, senderResolution?.reason);
     if (!this._can(actor.id, 'search') || own && !this._user(actor.id)?.isOwner) return reject('sender_not_authorized', 'SEARCH_DENIED');

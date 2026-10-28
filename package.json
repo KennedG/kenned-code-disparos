@@ -50,7 +50,7 @@
       ],
       "icon": "assets/icon.ico",
       "signExecutable": false,
-      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Oportunidades-Automatico-${arch}.exe"
+      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Privado-R8-${arch}.exe"
     },
     "nsis": {
       "script": "scripts/installer.nsi",
@@ -72,5 +72,5 @@
       "en-US"
     ]
   },
-  "releaseRevision": "oportunidades-automatico-r7"
+  "releaseRevision": "privado-identidade-r8"
 }
