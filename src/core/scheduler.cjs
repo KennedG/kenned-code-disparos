@@ -98,6 +98,7 @@ class Scheduler extends EventEmitter {
     this.lastSubmissionAt = null;
     this.closed = false;
     this.submissionHolds = 0;
+    this.externalSubmissions = Promise.resolve();
     this.receipts = new Map();
     // Defense in depth: constructing a worker never replays an old queue.
     const interrupted = new Set();
@@ -340,6 +341,19 @@ class Scheduler extends EventEmitter {
     return () => { if (!released) { released = true; this.submissionHolds = Math.max(0, this.submissionHolds - 1); } };
   }
 
+  runExternalSubmission(task) {
+    // All private alerts and search results share this queue. Holding the
+    // scheduler immediately prevents a new campaign round taking their slot.
+    const release = this.holdSubmissions();
+    const operation = this.externalSubmissions.catch(() => {}).then(async () => {
+      await this.waitForIdle();
+      if (this.closed || this.persistenceFailed || this.store.persistenceFailed) throw new Error('Envios externos bloqueados: processamento indisponível.');
+      return task();
+    });
+    this.externalSubmissions = operation.catch(() => {});
+    return operation.finally(release);
+  }
+
   tick() {
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
     if (this.closed || this.persistenceFailed || this.submissionHolds) return Promise.resolve();
@@ -578,6 +592,7 @@ class Scheduler extends EventEmitter {
     this._pauseActive('Aplicativo encerrado.');
     this.currentRound?.controller.abort();
     if (this.worker) await this.worker;
+    await this.externalSubmissions;
     this.adapter.off('status', this.statusListener);
     this.adapter.off('receipt', this.receiptListener);
   }

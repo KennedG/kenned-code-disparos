@@ -12,6 +12,7 @@ class SimulatedAdapter extends EventEmitter {
     this.nextOutcome = null;
     this.replies = [];
     this.sent = [];
+    this.searchCapture = { enabled: false, importHistory: false, groupIds: null, commandGroupIds: null };
     this.status = { state: 'disconnected', mode: 'simulated', detail: 'Simulação local: nenhum envio pelo WhatsApp.' };
   }
 
@@ -89,6 +90,45 @@ class SimulatedAdapter extends EventEmitter {
     return { status, messageId, simulation: true };
   }
 
+  configureSearchCapture({ enabled = false, importHistory = false, groupIds, commandGroupIds } = {}) {
+    const normalize = value => Array.isArray(value) ? new Set(value.filter(id => typeof id === 'string')) : null;
+    this.searchCapture = { enabled: enabled === true, importHistory: importHistory === true, groupIds: normalize(groupIds), commandGroupIds: normalize(commandGroupIds) };
+    return { enabled: this.searchCapture.enabled, importHistory: this.searchCapture.importHistory, ...this.getSearchCapabilities() };
+  }
+
+  getSearchCapabilities() {
+    return { searchCapture: true, live: true, edits: true, deletes: true, opportunisticHistory: true, communityGroups: 'simulation-only', historySupport: 'simulated', complete: false, originalMessageLinks: false, official: false, simulation: true };
+  }
+
+  _searchChatAllowed(chatId, history = false) {
+    if (!this.searchCapture.enabled || typeof chatId !== 'string') return false;
+    const isGroup = chatId.endsWith('@simulation');
+    if (!isGroup) return !history && /^\d+(?::\d+)?@(s\.whatsapp\.net|lid)$/.test(chatId);
+    const { groupIds, commandGroupIds } = this.searchCapture;
+    return groupIds === null || groupIds.has(chatId) || (!history && (commandGroupIds === null || commandGroupIds.has(chatId)));
+  }
+
+  async sendSearchText(target, text, { clientMessageId } = {}) {
+    if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
+    if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw Object.assign(new Error('Resultado da busca inválido.'), { safeToRetry: false });
+    if (typeof target !== 'string' || !(/^\d{10,15}$/.test(target) || /^\d+(?::\d+)?@(s\.whatsapp\.net|lid)$/.test(target) || /^sim-\d+@simulation$/.test(target))) throw Object.assign(new Error('Destinatário da busca inválido para simulação.'), { safeToRetry: false });
+    const targetId = /^\d{10,15}$/.test(target) ? `${target}@s.whatsapp.net` : target.replace(/:\d+(?=@)/, '');
+    const messageId = clientMessageId || `SIM-SEARCH-${randomUUID()}`;
+    const existing = this.sent.find(entry => entry.messageId === messageId);
+    if (existing) {
+      if (existing.targetId !== targetId) throw Object.assign(new Error('Identificador da busca já pertence a outro destino.'), { safeToRetry: false });
+      return { status: existing.status, messageId, simulation: true };
+    }
+    const outcome = this.nextOutcome || 'confirmed';
+    this.nextOutcome = null;
+    if (outcome === 'failed') throw Object.assign(new Error('Falha temporária simulada antes da resposta da busca.'), { safeToRetry: true });
+    this.sent.push({ targetId, chatId: targetId, privateNumber: /^\d+@s\.whatsapp\.net$/.test(targetId) ? targetId.split('@')[0] : undefined, text, messageId, status: outcome, search: true, simulation: true, at: new Date().toISOString() });
+    if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);
+    if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
+    if (outcome === 'confirmed') this.emit('receipt', { messageId, status: 'confirmed', simulation: true });
+    return { status: outcome, messageId, simulation: true };
+  }
+
   setNetworkOnline(online) { return this.setNetworkState({ online }); }
 
   setNetworkState(value) {
@@ -130,7 +170,41 @@ class SimulatedAdapter extends EventEmitter {
       simulation: true
     };
     this.emit('incoming', event);
+    if (this._searchChatAllowed(event.chatId) && !event.history) this.emit('offerMessage', this._offerContext(event));
     return event;
+  }
+
+  _offerContext(context = {}, history = false) {
+    const number = String(context.senderNumber || '').replace(/\D/g, '');
+    const senderId = context.senderId || (number ? `${number}@s.whatsapp.net` : '');
+    return { ...context, messageId: context.messageId || `SIM-OFFER-${randomUUID()}`, chatId: context.chatId || 'sim-01@simulation', isGroup: context.isGroup ?? (context.chatId || 'sim-01@simulation').endsWith('@simulation'), senderId, senderIds: context.senderIds || [senderId].filter(Boolean), identityVerified: context.identityVerified ?? context.verified ?? Boolean(senderId), senderNumber: number, verified: context.verified ?? Boolean(number), pushName: context.pushName || context.displayName || '', displayName: context.displayName || context.pushName || '', savedName: context.savedName || '', text: context.text || '', type: context.type || 'text', timestamp: context.timestamp ?? Date.now(), capturedAt: context.capturedAt ?? Date.now(), forwarded: context.forwarded === true, fromMe: context.fromMe === true, history, revisionAt: context.revisionAt ?? null, simulation: true };
+  }
+
+  injectOfferMessage(context = {}) {
+    const event = this._offerContext(context);
+    if (this._searchChatAllowed(event.chatId)) this.emit('offerMessage', event);
+    return event;
+  }
+
+  injectOfferUpdate(context = {}) {
+    const event = this._offerContext({ ...context, revisionAt: context.revisionAt ?? Date.now() });
+    delete event.timestamp;
+    if (this._searchChatAllowed(event.chatId, true)) this.emit('offerMessageUpdate', event);
+    return event;
+  }
+
+  injectOfferDelete(context = {}) {
+    const event = { ...context, chatId: context.chatId || 'sim-01@simulation', deletedAt: context.deletedAt ?? Date.now(), simulation: true };
+    if (this._searchChatAllowed(event.chatId, true)) this.emit('offerMessageDelete', event);
+    return event;
+  }
+
+  injectOfferHistory(messages = [], metadata = {}) {
+    if (!this.searchCapture.enabled || !this.searchCapture.importHistory) return [];
+    const values = messages.slice(0, 5000).map(message => this._offerContext(message, true)).filter(message => this._searchChatAllowed(message.chatId, true));
+    for (let offset = 0; offset < values.length; offset += 100) this.emit('offerHistory', { ...metadata, messages: values.slice(offset, offset + 100), source: 'simulated-history', complete: false, at: Date.now(), simulation: true });
+    this.emit('captureHistoryStatus', { source: 'simulated-history', status: messages.length > 5000 ? 'truncated' : 'batch-received', complete: false, at: Date.now(), simulation: true });
+    return values;
   }
 }
 

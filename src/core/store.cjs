@@ -5,11 +5,12 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { configurationFingerprint } = require('./campaign-version.cjs');
+const { createSearchSchema, attachSearchStore } = require('./search-store.cjs');
 
 const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts']);
 const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
-const SCHEMA_VERSION = 4;
-const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout)/i;
+const SCHEMA_VERSION = 5;
+const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
 
 function atomicWrite(filename, data) {
   fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -77,6 +78,7 @@ async function createStore(dir,options={}) {
     }
     db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=1000;');
     if(version<SCHEMA_VERSION)transaction(()=>{
+      if(version<4){
       for(const table of ['settings','campaigns','groups_data','media','templates','rounds'])db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL)`);
       db.exec('CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,roundId TEXT NOT NULL,campaignId TEXT NOT NULL,groupId TEXT NOT NULL,itemId TEXT NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(roundId,groupId,itemId));');
       const addColumns=(table,columns)=>{const present=new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(r=>r.name));for(const[name,type]of Object.entries(columns))if(!present.has(name))db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);};
@@ -114,6 +116,8 @@ async function createStore(dir,options={}) {
       db.exec(`INSERT OR IGNORE INTO group_rounds(campaignId,groupId,roundId,startedAt) SELECT j.campaignId,j.groupId,j.roundId,r.startedAt FROM jobs j JOIN rounds r ON r.id=j.roundId WHERE j.attempts>0 OR j.status IN('confirmed','uncertain','sending');
         INSERT INTO group_progress(campaignId,groupId,lastAt,roundCount) SELECT campaignId,groupId,MAX(startedAt),COUNT(*) FROM group_rounds GROUP BY campaignId,groupId ON CONFLICT(campaignId,groupId) DO UPDATE SET lastAt=excluded.lastAt,roundCount=excluded.roundCount;`);
       for(const c of all('campaigns'))if(!Number.isInteger(c.configRevision))prepared('UPDATE campaigns SET data=? WHERE id=?').run(json({...c,configRevision:c.revision||1}),c.id);
+      }
+      createSearchSchema(db);
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
     });
   }catch(error){db.close();throw error;}
@@ -226,6 +230,7 @@ async function createStore(dir,options={}) {
   });
   // This one-time migration marker preserves deliberately cleared histories.
   if(!getSetting('historyProjectionInitialized',false))transaction(()=>{for(const row of prepared('SELECT data FROM jobs ORDER BY rowid DESC LIMIT 10000').all()){const j=JSON.parse(row.data);projection('sends',j.id,j);}for(const row of prepared('SELECT data FROM rounds ORDER BY rowid DESC LIMIT 10000').all()){const r=JSON.parse(row.data);projection('campaigns',`round:${r.id}`,{...r,kind:'round'});}putRaw('settings',{id:'historyProjectionInitialized',value:true});retentionRaw();});
+  attachSearchStore(store,{db,prepared,transaction});
   return store;
 }
 function seed(store) {

@@ -1,14 +1,74 @@
 {
   "name": "mega-disparos",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Agendador local de campanhas autorizadas para grupos do WhatsApp",
   "main": "src/main.cjs",
   "author": "Mega Disparos",
   "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node scripts/test.cjs",
+    "test:ui": "node scripts/smoke-ui.cjs",
+    "dist:win": "node scripts/build-win.cjs",
+    "check": "node scripts/check.cjs"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4",
     "stream-json": "1.9.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "electron": "44.5.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "br.com.megadisparos.desktop",
+    "productName": "Mega Disparos",
+    "compression": "maximum",
+    "publish": [],
+    "asar": true,
+    "afterPack": "scripts/ownership-manifest.cjs",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json",
+      "docs/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/whatsapp-rust-bridge/**/*",
+      "node_modules/@whiskeysockets/baileys/node_modules/whatsapp-rust-bridge/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico",
+      "signExecutable": false,
+      "artifactName": "Mega-Disparos-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "script": "scripts/installer.nsi",
+      "differentialPackage": false,
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Mega Disparos",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": [
+        "pt_BR"
+      ],
+      "language": "1046"
+    },
+    "electronLanguages": [
+      "pt-BR",
+      "en-US"
+    ]
   }
 }

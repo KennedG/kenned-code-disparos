@@ -21,14 +21,19 @@ const PERMISSIONS = Object.freeze([
   ['settings.view', 'Visualizar configurações', 'Configurações'], ['settings.edit', 'Editar configurações', 'Configurações'],
   ['notifications.view', 'Visualizar alertas', 'Alertas'], ['notifications.manage', 'Configurar e testar alertas', 'Alertas'],
   ['diagnostics.view', 'Visualizar diagnóstico', 'Diagnóstico'], ['diagnostics.export', 'Exportar diagnóstico', 'Diagnóstico'],
-  ['audit.view', 'Visualizar auditoria', 'Auditoria']
+  ['audit.view', 'Visualizar auditoria', 'Auditoria'],
+  ['search.view', 'Consultar ofertas e mensagens capturadas', 'BUSCAS'],
+  ['search.run', 'Executar buscas de ofertas', 'BUSCAS'],
+  ['search.history', 'Consultar histórico de buscas', 'BUSCAS'],
+  ['search.filters', 'Alterar filtros e apelidos de BUSCAS', 'BUSCAS'],
+  ['search.manage', 'Gerenciar monitoramento e autorizações de BUSCAS', 'BUSCAS']
 ].map(([id, label, section]) => Object.freeze({ id, label, section })));
 const PERMISSION_IDS = new Set(PERMISSIONS.map(p => p.id));
 const ALL = [...PERMISSION_IDS];
 const DEFAULT_ROLES = Object.freeze([
   { id: 'role-owner', name: 'Dono', permissions: ALL, campaignScope: 'all', isOwner: true, builtIn: true },
-  { id: 'role-admin', name: 'Administrador', permissions: ALL.filter(p => p !== 'users.assignOwner'), campaignScope: 'all', isOwner: false, builtIn: true },
-  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !['history.clear', 'settings.edit', 'connection.manage', 'audit.view'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
+  { id: 'role-admin', name: 'Administrador', permissions: ALL.filter(p => p !== 'users.assignOwner' && !p.startsWith('search.')), campaignScope: 'all', isOwner: false, builtIn: true },
+  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !p.startsWith('search.') && !['history.clear', 'settings.edit', 'connection.manage', 'audit.view'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
   { id: 'role-seller', name: 'Vendedor', permissions: ['campaign.view', 'campaign.create', 'campaign.edit', 'campaign.start', 'campaign.pause', 'campaign.stop', 'contacts.view', 'contacts.create', 'contacts.edit', 'groups.view', 'media.view', 'media.create', 'reports.view', 'history.view', 'notifications.view'], campaignScope: 'own', isOwner: false, builtIn: true }
 ]);
 

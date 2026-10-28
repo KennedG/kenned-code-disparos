@@ -15,6 +15,7 @@ const {SimulatedAdapter}=require('../adapters/simulated.cjs');
 const {WhatsAppAdapter}=require('../adapters/whatsapp.cjs');
 const {AuthService}=require('../core/auth.cjs');
 const {AlertService}=require('../core/alerts.cjs');
+const {SearchService}=require('../core/search-service.cjs');
 const {writeRecordsJSON}=require('../core/export-records.cjs');
 
 const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook'];
@@ -32,7 +33,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   const media=new MediaManager(store),events=new EventEmitter();
   let channelUrl='';try{const value=await host('secretGet',{key:'webhookUrl'});if(typeof value==='string')channelUrl=value;}catch{}
   const auth=new AuthService({store,clock:now});
-  let adapter,scheduler,commands,alerts,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null;
+  let adapter,scheduler,commands,alerts,searches,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null;
   const cleanupTokens=new Map();
   const nativeTasks=new Set();
   const audioDir=path.join(dir,'audio');fs.mkdirSync(audioDir,{recursive:true});
@@ -48,6 +49,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   const assertModeChange=()=>assertGlobal('settings.edit',['connection.manage','campaign.stop']);
   const assertBackup=()=>assertGlobal('settings.edit',['campaign.view','media.view','groups.view','contacts.view','notifications.view']);
   const assertRestore=()=>assertGlobal('settings.edit',['connection.manage','users.edit','campaign.view','campaign.create','campaign.edit','campaign.delete','campaign.stop','groups.edit','media.create','media.delete','contacts.create','contacts.delete','notifications.manage']);
+  const assertSearchActor=()=>{const actor=user();if(!actor)throw new Error('Faça login para continuar.');return actor.id;};
   const getCampaign=(id,permission='campaign.view')=>{const c=store.getCampaign(id);if(!c)throw new Error('Campanha não encontrada.');assert(permission,c);return c;};
   const audit=(action,details={})=>store.addAudit({id:randomUUID(),at:now(),userId:user()?.id||null,userName:user()?.name||null,action,...details});
   const curatedError=(action,error)=>{
@@ -82,7 +84,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     const metrics=store.getMetrics?store.getMetrics({campaignIds:scopeIds()}):{confirmed:0,failed:0,uncertain:0};
     let recent=[];if(can('history.view'))recent=historyPage({limit:50,offset:0}).items||[];
     const publicSettings=can('settings.view')?settings():{theme:store.getSetting('theme','dark')};
-    return {...base,auth:status,connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items:[]};
+    return {...base,auth:status,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items:[]};
   }
   function broadcast(immediate=false){
     if(closed)return;
@@ -114,10 +116,10 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(!id)return null;const entry=(store.getSetting('audioAssets',[])||[]).find(a=>a.id===id);if(!entry)return null;
     try{const real=fs.realpathSync(entry.path);if(!real.startsWith(fs.realpathSync(audioDir)+path.sep))return null;return real;}catch{return null;}
   }
-  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{return await task();}finally{maintenance=false;broadcast();}}
+  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');return await task();}finally{searches?.resumeCapture();maintenance=false;broadcast();}}
   async function switchMode(mode){
     await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();adapter.removeAllListeners();
-    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);bindAdapter();
+    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);bindAdapter();
     if(mode==='simulated'){await adapter.connect();store.upsertGroups(await adapter.listGroups());}
   }
   const configRevision=c=>c.configRevision??c.revision;
@@ -136,6 +138,47 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     const actor=user()?.id,count=await writeRecordsJSON(response.filePath,{header:{format:'mega-disparos-logs',version:1,exportedAt:new Date(now()).toISOString()},check:()=>{if(user()?.id!==actor)throw new Error('A sessão de acesso mudou.');assert(table==='history'?'history.export':'diagnostics.export');},page:(offset,limit)=>table==='history'?historyPage({...p,offset,limit}):diagnosisPage({...p,offset,limit})});
     audit(`${table}.export`,{count});return {path:response.filePath,count};
   }
+  async function testSearchSimulation(p={}){
+    const actorId=assertSearchActor();assert('search.manage');
+    if(!searches.getState(actorId).permissions?.manage)throw new Error('Você não tem autorização para gerenciar o módulo BUSCAS.');
+    if(adapter.status.mode!=='simulated'||store.getSetting('integrationMode')!=='simulated')throw new Error('Disponível somente no modo simulado; nenhum dado ou envio real é realizado.');
+    if(p.kind==='disconnect'){
+      assert('connection.manage');await adapter.disconnect({reasonCode:'unexpected',manual:false});await searches.waitForIdle();
+      return {simulation:true,description:'Desconexão local simulada; nenhuma conta WhatsApp foi afetada.',state:searches.getState(actorId)};
+    }
+    if(p.kind!==undefined&&!['offer','edit','delete','command'].includes(p.kind))throw new Error('Tipo de teste simulado inválido.');
+    if(['offer','edit','delete'].includes(p.kind))p={...p,text:undefined,command:undefined,messages:[{...p,event:p.kind==='edit'?'update':p.kind==='delete'?'delete':'message'}]};
+    const fixtures=p.messages||p.fixtures||[];
+    if(!Array.isArray(fixtures)||fixtures.length>50)throw new Error('Use no máximo 50 mensagens fictícias por teste.');
+    const knownGroups=new Set(store.listGroups().filter(g=>g.simulation).map(g=>g.id));
+    const before=adapter.sent?.length||0;
+    for(const fixture of fixtures){
+      const groupId=fixture.groupId||fixture.chatId;
+      if(!knownGroups.has(groupId))throw new Error('O teste aceita apenas grupos identificados como simulados.');
+      const text=String(fixture.text||'');if(fixture.event!=='delete'&&(!text.trim()||text.length>32000))throw new Error('Informe uma mensagem fictícia de até 32.000 caracteres.');
+      const number=cleanPhone(fixture.senderNumber||'');if(number&&!validPhone(number))throw new Error('Telefone fictício inválido.');
+      const messageId=fixture.messageId?String(fixture.messageId).slice(0,128):`SIM-OFFER-${randomUUID()}`;
+      const senderId=number?`${number}@s.whatsapp.net`:`SIM-SUPPLIER-${String(fixture.senderId||'indisponivel').slice(0,100)}`;
+      const timestamp=fixture.timestamp===undefined?now():Number(fixture.timestamp);if(!Number.isFinite(timestamp)||timestamp<0||timestamp>now()+60000)throw new Error('Data da mensagem fictícia inválida.');
+      const context={messageId,groupId,chatId:groupId,text,type:'text',isGroup:true,fromMe:false,forwarded:!!fixture.forwarded,verified:true,identityVerified:true,senderId,senderNumber:number||null,pushName:asText(fixture.supplierName||fixture.pushName||'Fornecedor fictício',120),timestamp,simulation:true,dataOnly:true};
+      if(fixture.event==='update')adapter.injectOfferUpdate(context);
+      else if(fixture.event==='delete')adapter.injectOfferDelete(context);
+      else if(fixture.event!==undefined&&fixture.event!=='message')throw new Error('Evento fictício inválido.');
+      else adapter.injectOfferMessage(context);
+    }
+    await searches.waitForIdle();
+    if(p.text!==undefined||p.command!==undefined){
+      const actor=user(),senderNumber=cleanPhone(p.senderNumber||actor.phone);
+      if(!validPhone(senderNumber)||![actor.phone,...(actor.authorizedPhones||[])].includes(senderNumber))throw new Error('O comando de teste aceita somente um número vinculado ao usuário conectado.');
+      const chatId=p.chatId||(p.isGroup?p.groupId:`${senderNumber}@s.whatsapp.net`),isGroup=!!p.isGroup;
+      if(isGroup&&!knownGroups.has(chatId))throw new Error('O comando aceita apenas grupos simulados.');
+      if(!isGroup&&chatId!==`${senderNumber}@s.whatsapp.net`)throw new Error('A conversa privada de teste deve pertencer ao usuário conectado.');
+      adapter.injectOfferMessage({messageId:`SIM-COMMAND-${randomUUID()}`,senderId:`${senderNumber}@s.whatsapp.net`,senderNumber,verified:true,identityVerified:true,isGroup,fromMe:false,forwarded:!!p.forwarded,chatId,text:String(p.text??p.command),type:'text',timestamp:now(),simulation:true});
+      await searches.waitForIdle();
+    }
+    audit('search.simulation',{messages:fixtures.length});
+    return {simulation:true,description:'Teste local com dados fictícios; nenhum envio pelo WhatsApp.',messages:fixtures.length,replies:(adapter.sent?.slice(before)||[]).filter(entry=>entry.search===true),state:searches.getState(actorId)};
+  }
   const actions={
     snapshot:async()=>snapshot(),authStatus:async()=>auth.status(),
     setupOwner:async p=>{const result=await auth.setupOwner(p);broadcast(true);return result;},
@@ -144,6 +187,21 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     recoverPassword:async p=>auth.recoverPassword(p),changePassword:async p=>auth.changePassword(p),
     listUsers:async()=>auth.listUsers(),createUser:async p=>auth.createUser(p.user||p),updateUser:async p=>auth.updateUser({...p,...p.user,id:p.id||p.user?.id}),deleteUser:async p=>auth.deleteUser(p.id),
     issueReset:async p=>auth.issueReset({userId:p.id||p.userId}),listRoles:async()=>auth.listRoles(),saveRole:async p=>auth.saveRole(p.role||p),deleteRole:async p=>auth.deleteRole(p.id),rotateRecoveryCodes:async p=>auth.rotateRecoveryCodes(p),
+    searchesState:async()=>searches.getState(assertSearchActor()),
+    saveSearchSettings:async p=>searches.saveSettings(p.settings||p,assertSearchActor()),
+    searchOffers:async p=>searches.listOffers(p,assertSearchActor()),
+    searchMessages:async p=>searches.listMessages(p,assertSearchActor()),
+    searchHistory:async p=>searches.listHistory(p,assertSearchActor()),
+    runSearch:async p=>searches.executeSearch({query:p.query,filters:p.filters},assertSearchActor(),{deliver:p.deliver===true}),
+    searchAuthorizations:async()=>searches.listAuthorizations(assertSearchActor()),
+    saveSearchAuthorization:async p=>searches.saveAuthorization(p.authorization||p,assertSearchActor()),
+    deleteSearchAuthorization:async p=>searches.deleteAuthorization(p.id,assertSearchActor()),
+    reviewSearchOffer:async p=>searches.reviewOffer(p,assertSearchActor()),
+    searchCleanupPreview:async p=>searches.cleanupPreview({scope:p.scope},assertSearchActor()),
+    clearSearchHistory:async p=>searches.clearData({...p,scope:'history'},assertSearchActor()),
+    clearSearchBase:async p=>searches.clearData({...p,scope:'base'},assertSearchActor()),
+    importSearchHistory:async()=>searches.importHistory(assertSearchActor()),
+    testSearchSimulation:async p=>testSearchSimulation(p),
     connect:async()=>{assert('connection.manage');await adapter.connect({reconnect:true});if(adapter.status.state==='connected')store.upsertGroups(await adapter.listGroups());audit('connection.connect');return adapter.status;},
     disconnect:async()=>{assert('connection.manage');for(const c of store.listCampaigns())if(c.state==='active')await scheduler.pause(c.id);await adapter.disconnect({logout:true});audit('connection.disconnect');return adapter.status;},
     refreshGroups:async()=>{assert('groups.view');store.upsertGroups(await adapter.listGroups());return store.listGroups();},
@@ -211,7 +269,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     windowMinimize:async()=>host('windowMinimize',{}),windowQuit:async()=>host('windowQuit',{})
   };
   const publicUnprotected=new Set(['snapshot','authStatus','setupOwner','login','recoverPassword','windowMinimize','windowQuit']);
-  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit']);
+  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory']);
   events.call=async(action,payload={})=>{
     if(closed)throw new Error('Aplicativo encerrado.');if(!Object.hasOwn(actions,action))throw new Error('Ação não autorizada.');
     if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');
@@ -230,9 +288,11 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(action==='shutdown')return events.shutdown();
     throw new Error('Ação interna não autorizada.');
   };
-  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);await scheduler?.stopAll();await adapter?.disconnect();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
+  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);await scheduler?.stopAll();await searches?.shutdown();await adapter?.disconnect();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
   adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now});commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,now});
   alerts=new AlertService({store,scheduler,adapter,now,secretGet:async key=>host('secretGet',{key}),sendWebhook:async({secret,message,occurrenceId,originalAt,idempotencyKey})=>{if(!channelUrl)throw Object.assign(new Error('Canal independente não configurado.'),{definitive:true});const parsed=new URL(channelUrl);if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw Object.assign(new Error('Canal HTTPS inválido.'),{definitive:true});const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);try{const response=await fetch(parsed.href,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${secret}`,'idempotency-key':idempotencyKey},body:JSON.stringify({message,occurrenceId,originalAt}),signal:controller.signal,redirect:'error'});if(!response.ok)throw Object.assign(new Error('WEBHOOK_HTTP_FAILURE'),{definitive:true,code:'WEBHOOK_HTTP_FAILURE'});return {status:'confirmed',messageId:idempotencyKey};}finally{clearTimeout(timer);}}});
+  searches=new SearchService({store,adapter,authService:auth,now,scheduler,host});
+  searches.on('change',()=>broadcast());searches.start();
   alerts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});alerts.on('change',()=>broadcast());scheduler.on('change',()=>broadcast());bindAdapter();alerts.start();scheduler.start();
   retentionTimer=setInterval(()=>{try{store.applyRetention?.(store.getSetting('retention',DEFAULTS.retention));}catch{if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();}},60000);retentionTimer.unref?.();
   if(store.getSetting('integrationMode')==='simulated'){await adapter.connect();store.upsertGroups(await adapter.listGroups());}

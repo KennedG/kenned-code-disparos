@@ -49,6 +49,20 @@ function messageTimestamp(value) {
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
 }
 
+function accountJid(value) {
+  if (typeof value !== 'string' || value.length > 160 || !/^\d+(?::\d+)?@(s\.whatsapp\.net|lid)$/.test(value)) return '';
+  return value.replace(/:\d+(?=@)/, '');
+}
+
+function messageContent(message, { edits = false } = {}) {
+  let body = unwrapMessage(message);
+  if (edits && body.editedMessage?.message) body = unwrapMessage(body.editedMessage.message);
+  if (typeof body.conversation === 'string') return { type: 'text', text: body.conversation };
+  if (body.extendedTextMessage) return { type: 'text', text: body.extendedTextMessage.text || '' };
+  for (const type of ['image', 'video', 'document']) if (body[`${type}Message`]) return { type, text: body[`${type}Message`].caption || '' };
+  return null;
+}
+
 /** Serialized auth state is encrypted by Windows DPAPI; plaintext auth files are never created. */
 class EncryptedAuthStore {
   constructor({ dir, safeStorage, library }) {
@@ -174,6 +188,12 @@ class WhatsAppAdapter extends EventEmitter {
     this.requestedDisconnect = false;
     this.restartCount = 0;
     this.networkAvailable = true;
+    this.searchCapture = { enabled: false, importHistory: false, groupIds: null, commandGroupIds: null };
+    this.seenOffers = new Map();
+    this.contacts = new Map();
+    this.knownSearchGroups = new Set();
+    this.captureHistoryChain = Promise.resolve();
+    this.captureHistoryQueued = 0;
   }
 
   _status(state, detail, extras = {}) {
@@ -225,7 +245,8 @@ class WhatsAppAdapter extends EventEmitter {
         printQRInTerminal: false,
         syncFullHistory: false,
         markOnlineOnConnect: false,
-        shouldSyncHistoryMessage: () => false,
+        // History is explicitly opt-in and opportunistic. Do not request full-account sync.
+        shouldSyncHistoryMessage: () => this.searchCapture.enabled && this.searchCapture.importHistory,
         getMessage: async () => undefined,
         enableRecentMessageCache: false,
         enableAutoSessionRecreation: false,
@@ -254,16 +275,41 @@ class WhatsAppAdapter extends EventEmitter {
           if (generation === this.generation) this._status('disconnected', 'Falha ao atualizar a conexão. Tente reconectar.');
         });
       });
-      socket.ev.on('messages.upsert', event => this._incoming(event, generation));
+      socket.ev.on('messages.upsert', event => {
+        this._captureUpsert(event, generation);
+        this._incoming(event, generation);
+      });
       socket.ev.on('messages.update', updates => {
         if (generation !== this.generation) return;
         for (const event of updates || []) {
+          this._captureUpdate(event);
           if (Number(event.update?.status) >= 2 && (event.key?.fromMe || this.pendingAcks.has(event.key?.id))) this._ack(event.key.id);
           if (Number(event.update?.status) === 0 && event.key?.fromMe) {
             if ((event.update?.messageStubParameters || []).some(value => ['403', '429', '463'].includes(String(value)))) this._restrict(socket);
             this._uncertain(event.key.id);
           }
         }
+      });
+      socket.ev.on('messages.delete', event => {
+        if (generation === this.generation) this._captureDelete(event);
+      });
+      socket.ev.on('contacts.upsert', contacts => {
+        if (generation === this.generation) this._rememberContacts(contacts);
+      });
+      socket.ev.on('contacts.update', contacts => {
+        if (generation === this.generation) this._rememberContacts(contacts);
+      });
+      socket.ev.on('lid-mapping.update', mapping => {
+        if (generation === this.generation) this._rememberContacts([{ id: mapping.lid, lid: mapping.lid, phoneNumber: mapping.pn }]);
+      });
+      socket.ev.on('messaging-history.set', event => {
+        if (generation !== this.generation || !this.searchCapture.enabled || !this.searchCapture.importHistory) return;
+        this._rememberContacts(event.contacts);
+        this._queueCaptureHistory(event.messages, generation, 'messaging-history.set', event);
+      });
+      socket.ev.on('messaging-history.status', event => {
+        if (generation !== this.generation || !this.searchCapture.enabled || !this.searchCapture.importHistory) return;
+        this.emit('captureHistoryStatus', { source: 'messaging-history.status', status: event.status, explicit: event.explicit === true, syncType: event.syncType ?? null, complete: false, at: Date.now(), detail: 'Estado de uma etapa de sincronização; não comprova histórico completo dos grupos.' });
       });
       socket.ev.on('message-receipt.update', updates => {
         if (generation !== this.generation) return;
@@ -390,12 +436,170 @@ class WhatsAppAdapter extends EventEmitter {
   async listGroups() {
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('Conecte o WhatsApp antes de carregar os grupos.', true);
     const groups = await this.socket.groupFetchAllParticipating();
-    return Object.values(groups || {}).filter(group => typeof group.id === 'string' && group.id.endsWith('@g.us')).map(group => ({
+    const result = Object.values(groups || {}).filter(group => typeof group.id === 'string' && group.id.endsWith('@g.us')).map(group => ({
       id: group.id,
       name: group.subject || group.id,
       authorized: false,
-      simulation: false
+      simulation: false,
+      ...(typeof group.linkedParent === 'string' ? { linkedParent: group.linkedParent } : {}),
+      ...(typeof group.isCommunity === 'boolean' ? { isCommunity: group.isCommunity } : {}),
+      ...(typeof group.isCommunityAnnounce === 'boolean' ? { isCommunityAnnounce: group.isCommunityAnnounce } : {})
     }));
+    this.knownSearchGroups = new Set(result.map(group => group.id));
+    return result;
+  }
+
+  configureSearchCapture({ enabled = false, importHistory = false, groupIds, commandGroupIds } = {}) {
+    const normalize = value => Array.isArray(value) ? new Set(value.filter(id => typeof id === 'string' && id.endsWith('@g.us'))) : null;
+    this.searchCapture = { enabled: enabled === true, importHistory: importHistory === true, groupIds: normalize(groupIds), commandGroupIds: normalize(commandGroupIds) };
+    return { enabled: this.searchCapture.enabled, importHistory: this.searchCapture.importHistory, ...this.getSearchCapabilities() };
+  }
+
+  getSearchCapabilities() {
+    return { searchCapture: true, live: true, edits: true, deletes: true, opportunisticHistory: true, communityGroups: 'participating-groups-only', historySupport: 'opportunistic', complete: false, originalMessageLinks: false, official: false };
+  }
+
+  _captureChatAllowed(chatId, { history = false } = {}) {
+    if (!this.searchCapture.enabled || typeof chatId !== 'string') return false;
+    if (!chatId.endsWith('@g.us')) return !history && Boolean(accountJid(chatId));
+    const { groupIds, commandGroupIds } = this.searchCapture;
+    return groupIds === null || groupIds.has(chatId) || (!history && (commandGroupIds === null || commandGroupIds.has(chatId)));
+  }
+
+  _rememberContacts(contacts) {
+    for (const contact of contacts || []) {
+      const id = accountJid(contact?.id);
+      if (!id) continue;
+      const previous = this.contacts.get(id) || {};
+      const saved = { ...previous, id };
+      for (const key of ['name', 'notify', 'verifiedName']) if (typeof contact[key] === 'string') saved[key] = contact[key].slice(0, 500);
+      const phone = phoneFromJid(contact.phoneNumber) || phoneFromJid(id);
+      if (phone) saved.phoneNumber = phone;
+      this.contacts.set(id, saved);
+      const lid = accountJid(contact.lid);
+      if (lid) this.contacts.set(lid, { ...saved, id: lid });
+      while (this.contacts.size > 10000) this.contacts.delete(this.contacts.keys().next().value);
+    }
+  }
+
+  _captureContext(message, { history = false, edits = false } = {}) {
+    const key = message?.key || {};
+    const chatId = key.remoteJid;
+    if (!key.id || !this._captureChatAllowed(chatId, { history })) return null;
+    const content = messageContent(message.message, { edits });
+    if (!content || typeof content.text !== 'string') return null;
+    const timestamp = messageTimestamp(message.messageTimestamp);
+    if (!edits && (!timestamp || timestamp > Date.now() + 30000)) return null;
+    const isGroup = chatId.endsWith('@g.us');
+    const senderId = accountJid(isGroup ? key.participant : chatId);
+    const senderAlt = accountJid(isGroup ? key.participantAlt : key.remoteJidAlt);
+    const contact = this.contacts.get(senderId) || this.contacts.get(senderAlt) || {};
+    const direct = phoneFromJid(senderId);
+    const alternate = phoneFromJid(senderAlt);
+    const mapped = contact.phoneNumber || null;
+    const numbers = [direct, alternate, mapped].filter(Boolean);
+    const consistent = new Set(numbers).size <= 1;
+    const senderNumber = consistent ? direct || (senderId.endsWith('@lid') ? alternate || mapped : null) || '' : '';
+    const normalized = {
+      messageId: String(key.id), chatId, isGroup, fromMe: key.fromMe === true,
+      senderId, senderIds: [senderId, senderAlt].filter(Boolean), identityVerified: Boolean(senderId),
+      senderNumber, verified: Boolean(senderNumber) && consistent,
+      pushName: typeof message.pushName === 'string' ? message.pushName : contact.notify || '',
+      displayName: typeof message.pushName === 'string' ? message.pushName : contact.notify || '',
+      savedName: contact.name || '', ...content, capturedAt: Date.now(),
+      forwarded: hasForwardedMetadata(message.message), history, revisionAt: edits ? timestamp || Date.now() : null
+    };
+    // An edit timestamp belongs to the edit; never replace the original offer time with it.
+    if (!edits) normalized.timestamp = timestamp;
+    return normalized;
+  }
+
+  _captureProtocol(message) {
+    const body = unwrapMessage(message.message);
+    const protocol = body.protocolMessage;
+    if (!protocol?.key?.id) return false;
+    const constants = this.library?.proto?.Message?.ProtocolMessage?.Type || {};
+    const key = { ...message.key, ...protocol.key, remoteJid: protocol.key.remoteJid || message.key?.remoteJid };
+    const isEdit = (constants.MESSAGE_EDIT != null && protocol.type === constants.MESSAGE_EDIT) || protocol.type === 14;
+    const isRevoke = (constants.REVOKE != null && protocol.type === constants.REVOKE) || protocol.type === 0;
+    if (isEdit && protocol.editedMessage) {
+      const value = this._captureContext({ key, message: protocol.editedMessage, messageTimestamp: protocol.timestampMs ? Number(protocol.timestampMs) / 1000 : message.messageTimestamp }, { edits: true });
+      if (value) this.emit('offerMessageUpdate', value);
+    } else if (isRevoke && this._captureChatAllowed(key.remoteJid, { history: true })) {
+      this.emit('offerMessageDelete', { messageId: String(key.id), chatId: key.remoteJid, deletedAt: messageTimestamp(message.messageTimestamp) || Date.now(), source: 'protocol-revoke' });
+    }
+    return isEdit || isRevoke;
+  }
+
+  _captureUpsert(event, generation) {
+    if (generation !== this.generation || !this.searchCapture.enabled) return;
+    if (event?.type === 'append') {
+      if (this.searchCapture.importHistory) this._queueCaptureHistory(event.messages, generation, 'messages.upsert.append');
+      return;
+    }
+    if (event?.type !== 'notify') return;
+    const now = Date.now();
+    for (const message of event.messages || []) {
+      if (!this._captureChatAllowed(message.key?.remoteJid)) continue;
+      if (this._captureProtocol(message)) continue;
+      const timestamp = messageTimestamp(message.messageTimestamp);
+      // requestId identifies a message recovered from the linked phone. It may
+      // have a recent timestamp, but it must never become a live search command.
+      const recovered = typeof event.requestId === 'string' && event.requestId.length > 0;
+      const history = recovered || timestamp < Math.max(this.connectStartedAt - 5000, now - 120000);
+      const context = this._captureContext(message, { history });
+      if (!context) continue;
+      const dedupeId = `${context.chatId}:${context.messageId}`;
+      if (this.seenOffers.has(dedupeId)) continue;
+      this.seenOffers.set(dedupeId, now);
+      while (this.seenOffers.size > 4000) this.seenOffers.delete(this.seenOffers.keys().next().value);
+      if (history) this.emit('offerHistory', { messages: [context], source: recovered ? 'phone-recovered-notify' : 'delayed-notify', complete: false, at: now });
+      else this.emit('offerMessage', context);
+    }
+  }
+
+  _captureUpdate(event) {
+    if (!this.searchCapture.enabled || !event?.key?.id) return;
+    const update = event.update || {};
+    const revoke = this.library?.WAMessageStubType?.REVOKE;
+    if (update.message === null && ((revoke != null && update.messageStubType === revoke) || update.messageStubType === 1)) {
+      this._captureDelete({ keys: [event.key] });
+      return;
+    }
+    if (!update.message) return;
+    const value = this._captureContext({ key: event.key, ...update }, { edits: true });
+    if (value) this.emit('offerMessageUpdate', value);
+  }
+
+  _captureDelete(event) {
+    if (!this.searchCapture.enabled) return;
+    if (event?.all === true && this._captureChatAllowed(event.jid, { history: true })) {
+      this.emit('offerMessageDelete', { chatId: event.jid, all: true, deletedAt: Date.now(), source: 'messages.delete' });
+    }
+    for (const key of event?.keys || []) if (key.id && this._captureChatAllowed(key.remoteJid, { history: true })) {
+      this.emit('offerMessageDelete', { messageId: String(key.id), chatId: key.remoteJid, deletedAt: Date.now(), source: 'messages.delete' });
+    }
+  }
+
+  _queueCaptureHistory(messages, generation, source, metadata = {}) {
+    if (!Array.isArray(messages) || !messages.length) return;
+    // The transport may deliver an enormous history event. Retain at most 5,000
+    // queued raw items; signal gaps explicitly instead of allowing unbounded memory.
+    const capacity = Math.max(0, 5000 - this.captureHistoryQueued);
+    const accepted = messages.slice(0, capacity);
+    if (messages.length > accepted.length) this.emit('captureHistoryStatus', { source, status: 'truncated', complete: false, skipped: messages.length - accepted.length, at: Date.now(), detail: 'Lote de histórico excedeu a fila limitada; existem lacunas.' });
+    if (!accepted.length) return;
+    this.captureHistoryQueued += accepted.length;
+    this.captureHistoryChain = this.captureHistoryChain.catch(() => {}).then(async () => {
+      try {
+        for (let offset = 0; offset < accepted.length; offset += 100) {
+          if (generation !== this.generation || !this.searchCapture.enabled || !this.searchCapture.importHistory) break;
+          const values = accepted.slice(offset, offset + 100).map(message => this._captureContext(message, { history: true })).filter(Boolean);
+          if (values.length) this.emit('offerHistory', { messages: values, source, complete: false, isLatest: metadata.isLatest === true, progress: Number.isFinite(Number(metadata.progress)) && metadata.progress != null ? Number(metadata.progress) : null, syncType: metadata.syncType ?? null, at: Date.now() });
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      } finally { this.captureHistoryQueued -= accepted.length; }
+    });
   }
 
   _ack(messageId) {
@@ -485,6 +689,22 @@ class WhatsAppAdapter extends EventEmitter {
     if (!/^\d{10,15}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.');
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Informe um alerta de 1 a 16.000 caracteres.');
     return this._submitVerified(`${digits}@s.whatsapp.net`, { text }, clientMessageId);
+  }
+
+  async sendSearchText(target, text, { clientMessageId } = {}) {
+    if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Resultado da busca precisa ter de 1 a 16.000 caracteres.');
+    if (typeof target !== 'string') throw definitiveError('Destinatário da busca inválido.');
+    let targetId;
+    if (/^\d{10,15}$/.test(target)) targetId = `${target}@s.whatsapp.net`;
+    else if (accountJid(target) && (target.endsWith('@lid') || phoneFromJid(target))) targetId = accountJid(target);
+    else if (target.endsWith('@g.us')) {
+      const group = this.store?.getGroup(target);
+      if ((!group || group.simulation) && !this.knownSearchGroups.has(target)) throw definitiveError('O destino da busca precisa ser um grupo real conhecido da conta.');
+      targetId = target;
+    } else throw definitiveError('Destinatário da busca inválido.');
+    // Sending to a group is permitted here only after the service explicitly authorizes
+    // the origin-recipient option; no result is broadcast or sent via unconfirmed reply().
+    return this._submitVerified(targetId, { text }, clientMessageId);
   }
 
   async _submitVerified(targetId, content, clientMessageId) {
@@ -648,4 +868,4 @@ class WhatsAppAdapter extends EventEmitter {
   }
 }
 
-module.exports = { WhatsAppAdapter, EncryptedAuthStore, phoneFromJid, hasForwardedMetadata, unwrapMessage };
+module.exports = { WhatsAppAdapter, EncryptedAuthStore, phoneFromJid, hasForwardedMetadata, unwrapMessage, accountJid, messageContent };

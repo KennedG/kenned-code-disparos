@@ -1,0 +1,74 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+const {_electron,expect}=require('@playwright/test');
+(async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-ui-'));
+  const screenshotDir=process.env.MEGA_SCREENSHOT_DIR||'docs';fs.mkdirSync(screenshotDir,{recursive:true});
+  const {createStore}=require('../src/core/store.cjs');const {MediaManager}=require('../src/core/media.cjs');
+  const preStore=await createStore(dir);await new MediaManager(preStore).importFile(path.resolve('assets/icon.png'));preStore.close();
+  let app;const errors=[];
+  try{
+    app=await _electron.launch({executablePath:require('electron'),args:['--no-sandbox','--disable-gpu',process.env.MEGA_APP_PATH||'.'],env:{...process.env,MEGA_DATA_DIR:dir},timeout:20000});
+    let page;await expect.poll(()=>{page=app.windows().find(w=>/\/ui\/index\.html$/.test(w.url()));return !!page;},{timeout:20000}).toBe(true);page.on('pageerror',error=>errors.push(error.message));page.on('dialog',dialog=>dialog.accept());
+    await page.getByRole('heading',{name:'Cadastre o dono'}).waitFor();
+    const locked=await page.evaluate(()=>window.mega.call('snapshot'));assert.equal(locked.campaigns.length,0);assert.equal(locked.auth.setupRequired,true);
+    await page.locator('#auth-form [name=name]').fill('Dono de teste');await page.locator('#auth-form [name=username]').fill('dono.teste');await page.locator('#auth-form [name=password]').fill('SenhaSegura-de-Teste-2026');await page.locator('#auth-form [name=confirmPassword]').fill('SenhaSegura-de-Teste-2026');await page.locator('#auth-form [name=phone]').fill('5511999999999');
+    await page.locator('#auth-form [type=submit]').click();await page.getByRole('heading',{name:'Guarde seus códigos de recuperação'}).waitFor();assert.equal(await page.locator('.secret-codes').count(),1);await page.getByRole('button',{name:'Guardei os códigos'}).click();
+    await page.getByRole('heading',{name:'Tudo sob controle'}).waitFor();
+    const snap=()=>page.evaluate(()=>window.mega.call('snapshot'));
+    const initial=await snap();assert.equal(initial.connection.mode,'simulated');assert.equal(initial.campaigns[0].state,'draft');assert.equal(initial.groups.length,15);assert.equal(initial.metrics.selectedGroups,15);
+    await page.screenshot({path:path.join(screenshotDir,'painel.png')});
+    for(const section of ['campaigns','contacts','groups','library','history','reports','diagnostics','alerts','users','settings','dashboard']){await page.locator(`#navigation [data-action="navigate"][data-id="${section}"]`).click();assert.equal(await page.locator('#main h1').count(),1);}
+    await page.locator('#navigation [data-id="library"]').click();await page.waitForFunction(()=>document.querySelector('.library-art img')?.naturalWidth>0);await page.locator('#navigation [data-id="dashboard"]').click();
+    await page.locator('[data-action="new-campaign"]').click();
+    await page.locator('.topbar [data-action="stop-all"]').click({trial:true});
+    await page.locator('#campaign-name').fill('Validação pela interface');
+    await page.locator('[data-action="add-text"]').click();
+    await page.locator('[data-item-field="text"]').fill('Olá 👋\n*Primeiro conteúdo*');
+    await page.locator('[data-action="add-text"]').click();
+    await page.locator('[data-item-field="text"]').nth(1).fill('Segundo conteúdo\nhttps://example.org');
+    await page.locator('[data-action="item-up"]').nth(1).click();
+    await page.locator('[data-select-group]').first().check();
+    await page.locator('[name="startTime"]').fill('00:00');await page.locator('[name="endTime"]').fill('00:00');
+    await page.locator('[data-action="save-campaign"]').click();
+    await page.locator('.modal').waitFor({state:'hidden'});
+    const saved=(await snap()).campaigns.find(c=>c.name==='Validação pela interface');
+    assert(saved);assert.equal(saved.state,'draft');assert.equal(saved.items[0].text,'Segundo conteúdo\nhttps://example.org');assert.equal(saved.groupIds.length,1);
+    assert.equal((await snap()).metrics.confirmed,0);
+    await page.locator(`[data-action="activate"][data-id="${saved.id}"]`).click();
+    await page.getByRole('heading',{name:'Confirmar ativação'}).waitFor();
+    assert((await page.locator('.summary-pre').innerText()).includes('Estimativa máxima'));
+    await page.locator('[data-action="confirm-activation"]').click();
+    await expect.poll(async()=>(await snap()).metrics.confirmed,{timeout:10000}).toBe(2);
+    await page.locator('[data-action="stop-all"]').click();
+    assert.equal((await snap()).metrics.activeCampaigns,0);assert.equal((await snap()).metrics.confirmed,2,'Parada preserva confirmações');
+    await page.locator('[data-action="navigate"][data-id="settings"]').click();
+    assert.equal(await page.locator('#close-behavior').inputValue(),'ask');
+    await page.locator('#admin-numbers').fill('5511999999999');await page.locator('#theme').selectOption('light');
+    await page.waitForTimeout(5500);assert.equal(await page.locator('#admin-numbers').inputValue(),'5511999999999');
+    await page.locator('#sound-volume').fill('37');await page.locator('#sound-volume').dispatchEvent('input');
+    await page.locator('#settings-form [type="submit"]').click();
+    await page.waitForFunction(()=>document.body.dataset.theme==='light');
+    assert.equal((await snap()).metrics.confirmed,2,'Salvar configurações preserva confirmações');assert.equal((await snap()).settings.closeBehavior,'ask');assert.equal((await snap()).settings.sound.volume,37);
+    const silent=await page.evaluate(()=>window.mega.call('testSound',{sound:{enabled:true,volume:0,sound:'soft',events:['disconnect','critical'],repeat:false,intervalSeconds:30,maxRepeats:3,quiet:{enabled:false,start:'22:00',end:'07:00'}}}));assert.equal(silent.soundStatus,'silent');assert.equal((await snap()).metrics.confirmed,2,'Teste de som preserva confirmações');
+    const reply=await page.evaluate(()=>window.mega.call('testSimulation',{senderNumber:'5511999999999',text:'!mega status'}));assert(reply.text.includes('Conexão'));assert.equal((await snap()).metrics.confirmed,2,'Comando status preserva confirmações');
+    const unauthorized=await page.evaluate(()=>window.mega.call('testSimulation',{senderNumber:'5511888888888',text:'!mega parar tudo'}));assert(unauthorized.error?.includes('vinculado')||unauthorized.text?.includes('ignorado'),JSON.stringify(unauthorized));
+    
+    await page.locator('[data-action="clear-history"]').click();await page.getByRole('heading',{name:'Apagar todos os históricos'}).waitFor();
+    await page.locator('#cleanup-form [name=confirmation]').fill('ERRADO');await page.locator('[data-action=confirm-cleanup]').click();assert.equal((await snap()).metrics.confirmed,2,JSON.stringify({metrics:(await snap()).metrics,authUser:(await snap()).auth.user?.username,campaignCount:(await snap()).campaigns.length}));assert(await page.locator('.modal').count());
+    await page.locator('#cleanup-form [name=confirmation]').fill('APAGAR');await page.locator('[data-action=confirm-cleanup]').click();await page.locator('.modal').waitFor({state:'hidden'});assert.equal((await snap()).metrics.confirmed,2);assert.equal((await snap()).campaigns.length,2);
+    const cleared=await page.evaluate(()=>window.mega.call('historyPage',{categories:['sends'],limit:50,offset:0}));assert.equal(cleared.total,0);
+    const audit=await page.evaluate(()=>window.mega.call('auditPage',{limit:100}));assert(audit.items.some(r=>r.action==='history.clear'));
+    await page.locator('#navigation [data-id="users"]').click();await page.locator('[data-action=new-user]').click();
+    await page.locator('#user-form [name=name]').fill('Vendedor de teste');await page.locator('#user-form [name=username]').fill('vendedor.teste');await page.locator('#user-form [name=password]').fill('SenhaTemporaria-2026');await page.locator('#user-form [name=roleId]').selectOption('role-seller');await page.locator('#user-form [name=campaignScope]').selectOption('own');await page.locator('[data-action=save-user]').click();await page.locator('.modal').waitFor({state:'hidden'});
+    await page.locator('[data-action=logout]').click();await page.getByRole('heading',{name:'Bem-vindo de volta'}).waitFor();assert.equal((await snap()).campaigns.length,0);
+    await page.locator('#auth-form [name=username]').fill('vendedor.teste');await page.locator('#auth-form [name=password]').fill('SenhaTemporaria-2026');await page.locator('#auth-form [type=submit]').click();await page.getByRole('heading',{name:'Defina sua nova senha'}).waitFor();
+    await page.locator('#auth-form [name=currentPassword]').fill('SenhaTemporaria-2026');await page.locator('#auth-form [name=newPassword]').fill('SenhaFinalVendedor-2026');await page.locator('#auth-form [name=confirmPassword]').fill('SenhaFinalVendedor-2026');await page.locator('#auth-form [type=submit]').click();await page.getByRole('heading',{name:'Tudo sob controle'}).waitFor();
+    assert.equal((await snap()).campaigns.length,0);assert.equal(await page.locator('#navigation [data-id="users"]').count(),0);assert.equal(await page.locator('#navigation [data-id="settings"]').count(),0);
+    const denied=await page.evaluate(()=>window.mega.call('clearHistory',{categories:['sends'],confirmation:'APAGAR'}));assert(denied.error);
+    await page.locator('[data-action=logout]').click();await page.locator('#auth-form [name=username]').fill('dono.teste');await page.locator('#auth-form [name=password]').fill('SenhaSegura-de-Teste-2026');await page.locator('#auth-form [type=submit]').click();await page.getByRole('heading',{name:'Tudo sob controle'}).waitFor();
+    await page.locator('#navigation [data-id="history"]').click();await page.locator('[data-action=reload-page]').click();assert.equal(await page.locator('.pagination').count(),1);
+    await page.locator('[data-action="navigate"][data-id="dashboard"]').click();await page.evaluate(()=>document.querySelectorAll('#toast-region .toast').forEach(el=>el.remove()));await page.screenshot({path:path.join(screenshotDir,'painel-claro.png')});
+
+    assert.deepEqual(errors,[]);console.log('GUI: cadastro dono, proteção pré-login, 11 seções, 15 destinos, criação desativada, ordem, prévia, ativação simulada, parada, configurações preservadas, volume 37%, teste em volume zero, temas, autorização, limpeza APAGAR com auditoria e ledger preservado, cadastro vendedor, troca obrigatória de senha, escopo próprio e permissões backend verificados.');
+  }finally{if(app)await app.close();if(process.env.MEGA_KEEP_TEST_DATA)console.log('Test data:',dir);else fs.rmSync(dir,{recursive:true,force:true});}
+})().catch(error=>{console.error(error);process.exitCode=1;});

@@ -53,6 +53,7 @@
   const empty = (ico,title,desc,action='',label='') => `<div class="empty-state"><div class="empty-icon">${icon(ico)}</div><h3>${e(title)}</h3><p>${e(desc)}</p>${action ? button(action,label,'primary','','plus') : ''}</div>`;
   const pageTitle = (eyebrow,title,desc,action='') => `<div class="page-heading"><div><div class="eyebrow">${e(eyebrow)}</div><h1>${e(title)}</h1><p class="subtitle">${e(desc)}</p></div>${action}</div>`;
   const state = {page:'dashboard',data:null,search:'',filter:'all',libraryTab:'media',modal:null,draft:null,pending:false,refreshing:false,settingsDirty:false,authScreen:null,authKey:null,history:null,diagnostics:null,users:[],roles:[],contacts:[],recipients:[],alerts:null,audit:null,pageOffset:0,pageLimit:50,pageFilters:{},pageLoading:false,pageRequest:0};
+  let buscasUI;
 
   function toast(message,error=false) {
     const div = document.createElement('div');
@@ -103,11 +104,11 @@
   const permittedGroups = () => groups().filter(g => g.authorized && Boolean(g.simulation) === (currentMode() === 'simulated'));
   const selectedLimit = () => Math.max(1,number(settings().maxSelectedGroups,15));
 
-  function render() {
+  function render(force=false) {
     const d = data();
     if (!d) return;
     if (renderAuth()) return;
-    const nav = [['dashboard','Painel','dashboard'],['campaigns','Campanhas','campaign'],['contacts','Contatos','groups'],['groups','Grupos','groups'],['library','Biblioteca','library'],['history','Histórico','history'],['reports','Relatórios','history'],['diagnostics','Diagnóstico','shield'],['alerts','Alertas','whatsapp'],['users','Usuários e perfis','shield'],['settings','Configurações','settings']].filter(([key])=>canPage(key));
+    const nav = [['dashboard','Painel','dashboard'],['campaigns','Campanhas','campaign'],['buscas','BUSCAS','search'],['contacts','Contatos','groups'],['groups','Grupos','groups'],['library','Biblioteca','library'],['history','Histórico','history'],['reports','Relatórios','history'],['diagnostics','Diagnóstico','shield'],['alerts','Alertas','whatsapp'],['users','Usuários e perfis','shield'],['settings','Configurações','settings']].filter(([key])=>canPage(key));
     if (!canPage(state.page)) state.page='dashboard';
     $('#navigation').innerHTML = nav.map(([key,label,ico]) => `<button class="nav-item${state.page===key?' active':''}" data-action="navigate" data-id="${key}" ${state.page===key?'aria-current="page"':''}><span class="nav-icon"><svg viewBox="0 0 24 24">${icons[ico]}</svg></span><span>${label}</span>${key==='campaigns' ? `<span class="nav-count">${campaigns().length}</span>` : ''}</button>`).join('');
     const conn = d.connection || {state:'disconnected'};
@@ -118,8 +119,9 @@
     $('#theme-toggle').disabled=!can('settings.edit');
     $('#theme-toggle').innerHTML = icon(document.body.dataset.theme==='dark'?'sun':'moon');
     $('#version').textContent = d.version || '1.0';
-    const renderers = {dashboard:renderDashboard,campaigns:renderCampaigns,groups:renderGroups,library:renderLibrary,history:renderHistory,settings:renderSettings,reports:renderReports,diagnostics:renderDiagnostics,users:renderUsers,contacts:renderContacts,alerts:renderAlerts};
-    if (state.page==='settings' && $('#settings-form') && (state.settingsDirty || $('#settings-form').contains(document.activeElement))) return;
+    const renderers = {dashboard:renderDashboard,campaigns:renderCampaigns,buscas:()=>buscasUI.render(),groups:renderGroups,library:renderLibrary,history:renderHistory,settings:renderSettings,reports:renderReports,diagnostics:renderDiagnostics,users:renderUsers,contacts:renderContacts,alerts:renderAlerts};
+    if (!force && state.page==='settings' && $('#settings-form') && (state.settingsDirty || $('#settings-form').contains(document.activeElement))) return;
+    if (!force && state.page==='buscas' && buscasUI.shouldPreserveDOM()) {buscasUI.updateStatus();return;}
     const focused=document.activeElement?.id;
     const selection=focused==='page-search'?document.activeElement.selectionStart:null;
     $('#main').innerHTML = renderers[state.page]();
@@ -191,7 +193,7 @@
   const can = permission => !data()?.auth || (auth().permissions||[]).includes('*') || (auth().permissions||[]).includes(permission);
   const actionPermissions = {'new-campaign':'campaign.create','edit-campaign':'campaign.edit','save-campaign':'campaign.edit','confirm-save':'campaign.edit','duplicate':'campaign.create','delete-campaign':'campaign.delete','activate':'campaign.start','resume':'campaign.start','confirm-activation':'campaign.start','pause':'campaign.pause','stop-all':'campaign.stop','refresh-groups':'groups.view','import-media':'media.create','import-editor-media':'media.create','save-template':'media.create','delete-template':'media.delete','connection':'connection.view','connect':'connection.manage','disconnect':'connection.manage','backup':'settings.edit','restore':'settings.edit','open-data':'settings.edit','toggle-theme':'settings.edit','clear-history':'history.clear','export-history':'history.export','export-diagnostics':'diagnostics.export','export-reports':'reports.export','new-user':'users.create','edit-user':'users.edit','delete-user':'users.delete','reset-user':'users.edit','new-role':'users.roles','edit-role':'users.roles','delete-role':'users.roles','new-contact':'contacts.create','edit-contact':'contacts.edit','delete-contact':'contacts.delete','new-recipient':'notifications.manage','edit-recipient':'notifications.manage','delete-recipient':'notifications.manage','test-recipient':'notifications.manage','import-audio':'settings.edit','test-sound':'settings.edit','confirm-job':'campaign.edit','discard-job':'campaign.edit','confirm-alert':'notifications.manage','discard-alert':'notifications.manage','save-user':'users.edit','save-role':'users.roles'};
   const canAction = action => !actionPermissions[action] || can(actionPermissions[action]) || (action==='save-campaign'&&state.draft&&!campaign(state.draft.id)&&can('campaign.create')) || (action==='save-user'&&!state.modal?.userId&&can('users.create'));
-  const canPage = page => ({dashboard:()=>true,campaigns:()=>can('campaign.view'),groups:()=>can('groups.view'),library:()=>can('media.view'),contacts:()=>can('contacts.view'),history:()=>can('history.view'),reports:()=>can('reports.view'),diagnostics:()=>can('diagnostics.view'),alerts:()=>can('notifications.view'),users:()=>can('users.view'),settings:()=>can('settings.view')})[page]?.() || false;
+  const canPage = page => ({dashboard:()=>true,campaigns:()=>can('campaign.view'),buscas:()=>can('search.view')&&(data()?.buscas?.authorized===true||auth().user?.isOwner),groups:()=>can('groups.view'),library:()=>can('media.view'),contacts:()=>can('contacts.view'),history:()=>can('history.view'),reports:()=>can('reports.view'),diagnostics:()=>can('diagnostics.view'),alerts:()=>can('notifications.view'),users:()=>can('users.view'),settings:()=>can('settings.view')})[page]?.() || false;
   const field = (label,name,value='',type='text',extra='') => `<div class="field"><label for="field-${e(name)}">${e(label)}</label><input id="field-${e(name)}" name="${e(name)}" type="${e(type)}" value="${e(value)}" ${extra}></div>`;
   const panel = (title,body,action='') => `<div class="panel"><div class="panel-header"><h2>${e(title)}</h2>${action}</div><div class="panel-body">${body}</div></div>`;
   const authFields = setup => `${setup?field('Seu nome','name','','text','required maxlength="140"'):''}${field('Nome de usuário','username','','text','required autocomplete="username" maxlength="80"')}${field('Senha','password','','password',`required autocomplete="${setup?'new-password':'current-password'}" ${setup?'minlength="12"':''}`)}${setup?`${field('Confirme a senha','confirmPassword','','password','required minlength="12" autocomplete="new-password"')}${field('WhatsApp para alertas (país + DDD, opcional)','phone','','tel','placeholder="5511999999999"')}<div class="info-note">Cadastre o dono deste computador. Depois, somente usuários autorizados poderão criar novos acessos. Use uma senha de pelo menos 12 caracteres.</div>`:''}`;
@@ -202,7 +204,7 @@
     const locked = !a.authenticated || a.user?.requirePasswordChange;
     $('.app-shell').hidden=locked;$('#auth-root').hidden=!locked;
     if(!locked){state.authKey=null;$('#auth-root').replaceChildren();return false;}
-    if(!a.authenticated){$('#main').replaceChildren();$('#navigation').replaceChildren();$('#user-bar').replaceChildren();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.alerts=null;state.settingsDirty=false;}
+    if(!a.authenticated){$('#main').replaceChildren();$('#navigation').replaceChildren();$('#user-bar').replaceChildren();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.alerts=null;state.settingsDirty=false;buscasUI?.reset();}
     if(state.modal?.kind!=='recovery-codes') closeModal();
     const screen = a.setupRequired?'setup':a.user?.requirePasswordChange?'password':state.authScreen==='recovery'?'recovery':'login';
     const key=`${screen}:${a.user?.id||''}`;
@@ -253,6 +255,7 @@
       else if(page==='users')result=await Promise.all([call('listUsers'),call('listRoles')]);
       else if(page==='contacts')result=await call('listContacts');
       else if(page==='alerts')result=await Promise.all([call('listAlertRecipients'),call('alertsPage',filters)]);
+      else if(page==='buscas'){await buscasUI.load();return;}
       else return;
       if(request!==state.pageRequest||page!==state.page)return;
       if(page==='users'){[state.users,state.roles]=result;}else if(page==='alerts'){[state.recipients,state.alerts]=result;}else state[page]=result;
@@ -505,10 +508,11 @@
   async function onAction(action,el) {
     const id=el.dataset.id;
     if (!canAction(action)) throw new Error('Seu perfil não permite esta ação.');
+    if(action.startsWith('buscas-'))return buscasUI.onAction(action,el);
     switch(action) {
       case 'auth-recovery': state.authScreen='recovery';state.authKey=null;render();break;
       case 'auth-login': state.authScreen='login';state.authKey=null;render();break;
-      case 'logout': await call('logout');closeModal();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.authScreen=null;state.settingsDirty=false;state.page='dashboard';await refresh();break;
+      case 'logout': await call('logout');closeModal();buscasUI.reset();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.authScreen=null;state.settingsDirty=false;state.page='dashboard';await refresh();break;
       case 'account': {
         state.modal={kind:'account'};
         showModal('account','Minha conta','Troque sua senha ou gere novos códigos de recuperação.',`<form id="account-form">${field('Senha atual','currentPassword','','password','required autocomplete="current-password"')}${field('Nova senha (mínimo 12 caracteres)','newPassword','','password','minlength="12" autocomplete="new-password"')}${field('Confirme a nova senha','confirmPassword','','password','minlength="12" autocomplete="new-password"')}</form>`,`${button('rotate-recovery','Novos códigos','','','shield')}${button('save-password','Alterar senha','primary','','check')}`,true);break;
@@ -589,6 +593,7 @@
 
       case 'navigate':
         if(state.settingsDirty && state.page==='settings' && id!=='settings' && !confirm('Sair de Configurações e descartar alterações não salvas?'))break;
+        if(state.page==='buscas' && id!=='buscas' && buscasUI.hasUnsaved()){if(!confirm('Sair de BUSCAS e descartar alterações não salvas?'))break;buscasUI.reset();}
         state.settingsDirty=false;state.page=id;state.search='';state.filter='all';state.pageOffset=0;state.pageFilters=id==='history'?{categories:['sends']}:{};render();await loadPageData();break;
       case 'toggle-theme': {const theme=document.body.dataset.theme==='dark'?'light':'dark';await perform('saveSettings',{settings:{theme}});if(state.settingsDirty&&$('#settings-form'))$('#settings-form').elements.theme.value=theme;break;}
       case 'window-minimize': await call('windowMinimize');break;
@@ -700,6 +705,7 @@
   document.addEventListener('change',async event=>{
     const el=event.target;
     try {
+      if(el.closest('#buscas-page'))await buscasUI.onChange(el);
       if(el.dataset.cleanupCategory){state.modal.categories=$$('[data-cleanup-category]:checked').map(x=>x.dataset.cleanupCategory);await renderCleanup();}
       if(el.dataset.authorizeGroup)await perform('authorizeGroup',{id:el.dataset.authorizeGroup,authorized:el.checked});
       if(el.closest('#settings-form'))state.settingsDirty=true;
@@ -726,6 +732,7 @@
 
   document.addEventListener('input',event=>{
     const el=event.target;
+    if(el.closest('#buscas-page'))buscasUI.onInput(el);
     if(el.closest('#settings-form'))state.settingsDirty=true;
     if(el.id==='page-search'){
       const cursor=el.selectionStart;
@@ -740,6 +747,7 @@
   document.addEventListener('submit',async event=>{
     event.preventDefault();
     try{
+      if(event.target.id.startsWith('buscas-')){await buscasUI.onSubmit(event.target);return;}
       if(event.target.id==='auth-form'){
         const f=event.target;if(!f.reportValidity()||state.authSubmitting)return;
         const get=name=>f.elements.namedItem(name)?.value;const screen=f.dataset.screen;
@@ -782,7 +790,8 @@
     }
   });
 
-  $('.brand').addEventListener('click',event=>{event.preventDefault();if(state.settingsDirty&&!confirm('Sair e descartar alterações não salvas?'))return;state.settingsDirty=false;state.page='dashboard';state.search='';state.filter='all';render();});
+  $('.brand').addEventListener('click',event=>{event.preventDefault();if((state.settingsDirty||buscasUI.hasUnsaved())&&!confirm('Sair e descartar alterações não salvas?'))return;state.settingsDirty=false;buscasUI.reset();state.page='dashboard';state.search='';state.filter='all';render();});
+  buscasUI=window.MegaBuscasUI.create({call,toast,data,auth,groups,showModal,closeModal,render});
   if(window.mega?.onUpdate)window.mega.onUpdate(()=>refresh());
   refresh();
 })();

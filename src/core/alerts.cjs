@@ -209,6 +209,11 @@ class AlertService extends EventEmitter {
   }
 
   async _flush() {
+    if (this.scheduler?.runExternalSubmission) return this.scheduler.runExternalSubmission(() => this._flushBatch());
+    return this._flushBatch();
+  }
+
+  async _flushBatch() {
     const channel = this.adapter?.status?.state === 'connected' ? undefined : 'webhook';
     const pending = this.store.listPendingAlerts ? this.store.listPendingAlerts({ at: this.now(), channel, limit: 50 }) : this._list('alerts', { status: 'pending' }).filter(a => (!channel || a.channel === channel) && (a.nextAttemptAt || 0) <= this.now()).sort((a, b) => a.createdAt - b.createdAt).slice(0, 50);
     if (!pending.length) return;
