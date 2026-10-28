@@ -1,0 +1,117 @@
+
+> mega-disparos@1.0.0 test
+> node scripts/test.cjs
+
+
+adapter.test.cjs
+✔ simulação identifica grupos fictícios e oferece falha antes do envio e resultado incerto (3.276766ms)
+✔ integração real exige Windows e proteção do sistema operacional (0.674672ms)
+✔ sessão e chaves ficam cifradas e gravadas atomicamente, sem arquivos de texto de autenticação (35.433671ms)
+✔ sendMessage sem ACK retorna incerto; ACK autenticado confirma inclusive após timeout (35.591095ms)
+✔ erro após submissão não autoriza retentativa e restrição pausa transporte (1.953239ms)
+✔ desconexão libera envio pendente como incerto sem aguardar um transporte travado (3.9402ms)
+✔ mídia usa bytes verificados da biblioteca e rejeita caminho externo ou conteúdo alterado (9.410165ms)
+✔ identidade vem do protocolo, LID sem número é rejeitado e histórico/replay não entram (3.175229ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 100.389469
+
+commands.test.cjs
+✔ somente administradores autenticados em conversa direta podem comandar (5.989176ms)
+✔ telefone real verificado suporta LID; mensagens não verificadas e número LID não autenticam (1.026462ms)
+✔ comando repetido não é processado novamente, inclusive após recriar controlador (0.534159ms)
+✔ sem administradores configurados os comandos permanecem desabilitados (0.220066ms)
+✔ criar e editar campanhas não as ativa e preserva texto/legendas (2.970828ms)
+✔ ativação exige resumo e confirmação de uso único (4.649085ms)
+✔ confirmação expirada, cancelada ou de revisão antiga nunca ativa (1.509588ms)
+✔ confirmação pertence ao administrador que recebeu o resumo (1.463174ms)
+✔ alteração de destinos ativa somente após resumo; fila velha é pausada antes da retomada (1.170619ms)
+✔ pausar e parar tudo invalidam confirmações pendentes (1.938322ms)
+✔ grupos não autorizados, outra integração e excesso de grupos são recusados (0.772925ms)
+✔ mídias só são importadas em uma sessão de conteúdo da campanha selecionada (0.878719ms)
+✔ sessão expirada não baixa nem associa mídias (0.259041ms)
+✔ mídia de outro administrador não é associada à sessão alheia (0.773884ms)
+✔ menu configura horários, dias, intervalo, modo e ordena conteúdos (2.875487ms)
+✔ configuração individual recebe seu próprio conteúdo sem alterar outros grupos (1.774003ms)
+✔ edição de conteúdo ativo aguarda confirmação, e alteração concorrente invalida sessão (1.393766ms)
+ℹ tests 17
+ℹ suites 0
+ℹ pass 17
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 43.720218
+
+persistence.test.cjs
+✔ SQLite persists every write before close and preserves campaign revisions (95.035395ms)
+✔ process exit without close cannot erase the durable pre-send marker (229.764719ms)
+✔ restart cancels old queued work, preserves uncertain outcomes and never resumes campaigns (36.564382ms)
+✔ SQLite rejects duplicate round/group/item dispatches and preserves confirmed outcomes (16.031212ms)
+✔ refresh cannot grant publication authorization to a previously denied group (12.390261ms)
+✔ first-use example contains exactly 15 simulated groups and stays disabled across restarts (20.632077ms)
+✔ campaign validation ignores a request to autoactivate a newly created campaign (14.949286ms)
+✔ managed media survives moving the original and store restart (10.084043ms)
+✔ media manager rejects paths outside its managed folder and unsupported files (4.802094ms)
+✔ backup roundtrip restores campaign content and files as drafts without credentials (20.509481ms)
+✔ corrupted media checksums reject restore without changing existing data (8.659416ms)
+✔ backup supplied media paths, IDs and names cannot escape the managed folder (9.522917ms)
+✔ restore rejects missing media references and cleans files written before validation (8.00407ms)
+✔ restore rejects duplicate media IDs and removes partially restored files (11.217863ms)
+ℹ tests 14
+ℹ suites 0
+ℹ pass 14
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 514.181159
+
+scheduler-integration.test.cjs
+✔ real SQLite + local simulator: 15 deliveries are durable before transport and restart rebases without replay (323.209154ms)
+✔ real SQLite + local simulator: uncertain delivery survives restart, blocks resume and reconciles by durable ID (115.263348ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 444.638933
+
+scheduler.test.cjs
+✔ creating a campaign never activates it; 15 authorized destinations preserve media/text order (34.12258ms)
+✔ interval counts from round start; separate spacing is enforced and early ticks do nothing (2.648379ms)
+✔ a slow round skips elapsed slots with no simultaneous round or backlog (1.103192ms)
+✔ one global worker serializes campaigns and concurrent ticks (3.460713ms)
+✔ a synchronous transport event cannot reenter the worker and create a second round (1.426761ms)
+✔ a durable queue write failure blocks submissions and further activation (1.743544ms)
+✔ pause cancels pending destinations, allows the in-flight result to settle, and resume avoids recent duplicates (1.84173ms)
+✔ stop all interrupts a wait immediately and does not leave active campaigns (1.551636ms)
+✔ disconnection pauses active campaigns and prevents pending sends or disconnected activation (0.894062ms)
+✔ uncertain outcomes pause immediately and are never retried; late server receipt reconciles (1.083568ms)
+✔ ambiguous exceptions have one attempt and do not expose adapter secrets in history (0.723198ms)
+✔ only definitive pre-submission failures get bounded retries using the same durable message ID (1.354671ms)
+✔ a restriction stops attempts even when a failure was definitely before submission (0.701025ms)
+✔ daily send and round limits defer to the next local day instead of accumulating slots (2.973758ms)
+✔ a simulated suspension creates one current round rather than all missed rounds (0.74273ms)
+✔ group override intervals can be shorter and rotation advances per group participation (2.34561ms)
+✔ individual windows run independently, including outside the main campaign window (1.394885ms)
+✔ local weekday, inclusive dates and overnight windows use the opening day (0.359888ms)
+✔ expired scheduling stops rather than replaying previous dates (0.835523ms)
+✔ restart marks in-flight work uncertain and stale queued work cancelled without any submission (1.7702ms)
+✔ activation rejects unauthorized, mixed integration groups, invalid limits, duplicate destinations and missing media (0.561271ms)
+✔ summary includes content, authorized groups, frequency, individual settings and sending estimate (0.703307ms)
+ℹ tests 22
+ℹ suites 0
+ℹ pass 22
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 73.405671

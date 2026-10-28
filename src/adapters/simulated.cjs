@@ -1,0 +1,107 @@
+'use strict';
+
+const { EventEmitter } = require('node:events');
+const { randomUUID } = require('node:crypto');
+
+/** A local test transport. Its groups and receipts never represent WhatsApp. */
+class SimulatedAdapter extends EventEmitter {
+  constructor({ store, delayMs = 20 } = {}) {
+    super();
+    this.store = store;
+    this.delayMs = delayMs;
+    this.nextOutcome = null;
+    this.replies = [];
+    this.sent = [];
+    this.status = { state: 'disconnected', mode: 'simulated', detail: 'Simulação local: nenhum envio pelo WhatsApp.' };
+  }
+
+  _status(state, detail) {
+    this.status = { state, mode: 'simulated', detail };
+    this.emit('status', this.status);
+  }
+
+  async connect() {
+    this._status('connected', 'Simulação local conectada. Grupos e resultados são fictícios.');
+    return this.status;
+  }
+
+  async disconnect() {
+    this._status('disconnected', 'Simulação desconectada. Nenhum envio real foi realizado.');
+  }
+
+  async listGroups() {
+    return Array.from({ length: 15 }, (_, index) => ({
+      id: `sim-${String(index + 1).padStart(2, '0')}@simulation`,
+      name: `Grupo simulado ${String(index + 1).padStart(2, '0')}`,
+      authorized: false,
+      simulation: true
+    }));
+  }
+
+  setNextOutcome(outcome) {
+    if (!['confirmed', 'failed', 'uncertain'].includes(outcome)) throw new Error('Resultado de simulação inválido.');
+    this.nextOutcome = outcome;
+  }
+
+  async send(groupId, item, media) {
+    if (this.status.state !== 'connected') {
+      throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
+    }
+    if (!/^sim-\d+@simulation$/.test(groupId)) {
+      throw Object.assign(new Error('O modo de simulação aceita apenas grupos simulados.'), { safeToRetry: false });
+    }
+    if (!item || !['text', 'image', 'video', 'document'].includes(item.type)) {
+      throw Object.assign(new Error('Tipo de conteúdo inválido.'), { safeToRetry: false });
+    }
+    if (item.type !== 'text' && !media) {
+      throw Object.assign(new Error('Mídia não encontrada na biblioteca.'), { safeToRetry: false });
+    }
+    const outcome = this.nextOutcome || this.store?.getSetting('simulationNextOutcome', 'confirmed') || 'confirmed';
+    this.nextOutcome = null;
+    if (this.store?.getSetting('simulationNextOutcome', null)) this.store.setSetting('simulationNextOutcome', null);
+    if (outcome === 'failed') {
+      throw Object.assign(new Error('Falha temporária simulada antes do envio.'), { safeToRetry: true });
+    }
+    const messageId = item.clientMessageId || `SIM-${randomUUID()}`;
+    this.sent.push({ groupId, item: { ...item }, mediaId: media?.id, messageId, at: new Date().toISOString(), simulation: true });
+    if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
+    const result = { status: outcome === 'uncertain' ? 'uncertain' : 'confirmed', messageId };
+    if (result.status === 'confirmed') this.emit('receipt', { messageId, status: 'confirmed', simulation: true });
+    return result;
+  }
+
+  async reply(chatId, text) {
+    this.replies.push({ chatId, text: String(text), at: new Date().toISOString(), simulation: true });
+    this.emit('reply', this.replies[this.replies.length - 1]);
+    return { status: 'confirmed', messageId: `SIM-REPLY-${randomUUID()}` };
+  }
+
+  async downloadIncoming(context) {
+    const media = context?.simulatedMedia;
+    if (!media || !Buffer.isBuffer(media.buffer)) throw new Error('Anexe uma mídia de teste válida.');
+    return { buffer: media.buffer, name: media.name || 'anexo-simulado', mime: media.mime || 'application/octet-stream', type: media.type || 'document' };
+  }
+
+  /** Test-only ingress; authorization still runs through the command controller. */
+  injectIncoming(context = {}) {
+    const senderNumber = String(context.senderNumber || '').replace(/\D/g, '');
+    const event = {
+      messageId: context.messageId || `SIM-IN-${randomUUID()}`,
+      senderNumber,
+      verified: context.verified ?? true,
+      isGroup: context.isGroup ?? false,
+      forwarded: context.forwarded ?? false,
+      fromMe: context.fromMe ?? false,
+      chatId: context.chatId || `${senderNumber}@s.whatsapp.net`,
+      text: context.text || '',
+      type: context.type || 'text',
+      timestamp: context.timestamp || Date.now(),
+      ...context,
+      simulation: true
+    };
+    this.emit('incoming', event);
+    return event;
+  }
+}
+
+module.exports = { SimulatedAdapter };

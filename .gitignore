@@ -1,0 +1,12 @@
+node_modules/
+release/
+dist/
+credentials/
+backups/
+.env
+*.sqlite
+*.sqlite-*
+*.db
+*.dpapi
+*.exe
+*.7z
