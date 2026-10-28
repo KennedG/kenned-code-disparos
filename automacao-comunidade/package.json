@@ -1,6 +1,6 @@
 {
   "name": "automacao-comunidade",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Convites autorizados e organizados para comunidades pelo WhatsApp",
   "main": "src/main.cjs",
   "author": "Kenned Code",
@@ -50,7 +50,7 @@
       ],
       "icon": "assets/icon.ico",
       "signExecutable": false,
-      "artifactName": "Automacao-Comunidade-Setup-1.0.0-${arch}.exe"
+      "artifactName": "Automacao-Comunidade-Setup-${version}-${arch}.exe"
     },
     "nsis": {
       "script": "scripts/installer.nsi",

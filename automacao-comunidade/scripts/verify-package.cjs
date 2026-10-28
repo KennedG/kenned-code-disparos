@@ -8,7 +8,7 @@ const appExe=path.join(path.dirname(archive),'..','Automação Comunidade.exe');
 const entries=asar.listPackage(archive),checks=[];
 function pass(name){checks.push(name);process.stdout.write(`PASS ${name}\n`);}
 const packageInfo=JSON.parse(asar.extractFile(archive,'package.json').toString());
-assert.equal(packageInfo.name,'automacao-comunidade');assert.equal(packageInfo.version,'1.0.0');
+assert.equal(packageInfo.name,'automacao-comunidade');assert.equal(packageInfo.version,require('../package.json').version);
 assert.equal(packageInfo.main,'src/main.cjs');pass('Identidade independente e ponto de entrada');
 for(const name of ['@whiskeysockets/baileys','pino','qrcode','@cacheable/node-cache','@hapi/boom','libsignal','lru-cache','music-metadata','p-queue','protobufjs','whatsapp-rust-bridge','ws']){
  assert(entries.includes(`/node_modules/${name}/package.json`),`Dependência ausente: ${name}`);

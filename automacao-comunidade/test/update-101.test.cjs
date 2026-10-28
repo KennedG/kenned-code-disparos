@@ -1,0 +1,32 @@
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict');
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const {createStore}=require('../src/core/store.cjs');
+const {WorkerClient}=require('../src/core/worker-client.cjs');
+
+test('atualização 1.0.1 mantém dados e provas de convite do esquema 1.0.0 sem limpar restrições',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'community-patch-preservation-'));
+ let worker; t.after(async()=>{await worker?.shutdown();fs.rmSync(dir,{recursive:true,force:true});});
+ const store=createStore(dir),group='15555550100-123@g.us';
+ store.replaceGroups([{id:group,name:'Grupo de teste autorizado'}]);
+ store.importParticipants(group,[{externalId:'15555550101@s.whatsapp.net',identifiers:['15555550101@s.whatsapp.net'],phone:'15555550101',name:'Contato identificado'}, {externalId:'999888777@lid',identifiers:['999888777@lid'],name:'Identidade sem telefone'}]);
+ const before=store.listAll('contacts'),known=before.find(c=>c.phone),unknown=before.find(c=>!c.phone);
+ store.save('contacts',{...known,authorized:false,blocked:true,consentNote:'Registro anterior à atualização',authorizedAt:1000,authorizationRevokedAt:2000});
+ store.markRecipient(known,'previously-confirmed','accepted',{messageId:'CONTROLLED-PREVIOUS-ACK',at:3000});
+ store.save('templates',{id:'previous-template',name:'Modelo anterior',message:'Olá {nome}! 👋\n{link_comunidade}'});
+ store.save('campaigns',{id:'previous-campaign',name:'Rascunho anterior',status:'draft',contactIds:[known.id],groupIds:[group],intervalValue:2,intervalUnit:'minutes',intervalMs:120000});
+ store.setSetting('settings',{defaultIntervalValue:2,defaultIntervalUnit:'minutes',unofficialAcknowledged:true});
+ store.close();
+ const host=async action=>action==='secureStorage.status'?{available:false,backend:'basic_text',platform:'linux'}:null;
+ worker=new WorkerClient({dir,version:'1.0.1',host});await worker.ready;
+ const snapshot=await worker.call('snapshot'),contacts=(await worker.call('listContacts')).items;
+ assert.equal(snapshot.version,'1.0.1');assert.equal(snapshot.groups[0].id,group);
+ assert.equal(snapshot.campaigns[0].id,'previous-campaign');assert.equal(snapshot.campaigns[0].status,'draft');
+ assert.equal(snapshot.settings.defaultIntervalUnit,'minutes');assert.equal(snapshot.settings.defaultIntervalValue,2);
+ assert.equal((await worker.call('listTemplates')).items[0].id,'previous-template');
+ assert.equal(contacts.length,2);assert.equal(contacts.find(c=>c.id===known.id).blocked,true);
+ assert.equal(contacts.find(c=>c.id===known.id).previouslyInvited,true);
+ assert.equal(contacts.find(c=>c.id===unknown.id).phone,null);
+ assert.equal(contacts.find(c=>c.id===unknown.id).authorized,false);
+ assert.equal((await worker.call('listRuns')).total,0);
+});

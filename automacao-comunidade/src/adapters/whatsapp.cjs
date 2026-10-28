@@ -89,7 +89,7 @@ class WhatsAppAdapter extends EventEmitter {
       this.authState = auth;
       if (generation !== this.generation || this.manual || this.closed) return this.status;
       const makeSocket = this.library.default || this.library.makeWASocket;
-      const socket = makeSocket({ auth, logger: silentLogger, browser: ['Automação Comunidade', 'Desktop', '1.0.0'], markOnlineOnConnect: false, syncFullHistory: false, shouldSyncHistoryMessage: () => false, printQRInTerminal: false, getMessage: async key => this.sentMessages.get(key.id) });
+      const socket = makeSocket({ auth, logger: silentLogger, browser: ['Automação Comunidade', 'Desktop', '1.0.1'], markOnlineOnConnect: false, syncFullHistory: false, shouldSyncHistoryMessage: () => false, printQRInTerminal: false, getMessage: async key => this.sentMessages.get(key.id) });
       this.socket = socket;
       const current = () => generation === this.generation && socket === this.socket && !this.manual;
       socket.ev.on('creds.update', update => { if (current()) this.authStore.updateCreds(update).catch(() => { this._diagnostic('auth.persist', 'WA_AUTH_WRITE_FAILED', 'Não foi possível persistir a sessão protegida; os envios foram pausados.'); this.disconnect({ manual: true }).catch(() => {}); }); });
@@ -171,7 +171,13 @@ class WhatsAppAdapter extends EventEmitter {
     const externalId = normalizeJid(participant.id); if (!externalId) return null;
     const identifiers = [...new Set([externalId, participant.lid, participant.phoneNumber].map(normalizeJid).filter(Boolean))];
     if (externalId.endsWith('@lid') && !this.aliases.has(externalId)) {
-      const mapped = normalizeJid(await socket.signalRepository?.lidMapping?.getPNForLID?.(externalId));
+      let mapped = null;
+      try { mapped = normalizeJid(await socket.signalRepository?.lidMapping?.getPNForLID?.(externalId)); }
+      catch {
+        // A missing/unreadable local LID mapping is not permission to guess a phone,
+        // nor should it prevent importing the other identifiable group members.
+        this._diagnostic('identity.resolve', 'WA_PARTICIPANT_PHONE_UNAVAILABLE', 'O número de um participante não pôde ser resolvido. Ele permanece sem telefone confiável; os demais participantes continuam disponíveis.');
+      }
       if (phoneFromJid(mapped)) { identifiers.push(mapped); this._rememberContacts([{ id: externalId, phoneNumber: mapped }]); }
     }
     const pn = this.aliases.get(externalId) || identifiers.find(phoneFromJid);

@@ -27,7 +27,7 @@
   ];
   const state = {
     page: 'painel', snapshot: null, contacts: { items: [], total: 0, limit: 25, offset: 0 }, history: { items: [], total: 0, limit: 25, offset: 0 },
-    templates: [], contactSearch: '', contactStatus: '', contactGroup: '', selectedContacts: new Set(), historyStatus: '', historySearch: '',
+    templates: [], contactSearch: '', contactStatus: '', contactGroup: '', selectedContacts: new Set(), contactCache: new Map(), authorizationPreview: null, editingContact: null, historyStatus: '', historySearch: '',
     groupSearch: '', selectedGroupIds: new Set(), campaignSearch: '', modalKind: null, preview: null, busy: false, pageEpoch: 0,
   };
   const statusText = {
@@ -60,7 +60,12 @@
     const node = document.createElement('div'); node.className = `toast ${type}`; node.textContent = message;
     $('#toasts').append(node); setTimeout(() => node.remove(), type === 'error' ? 14000 : 6500);
   }
-  function errorMessage(error) { return error?.message || String(error || 'Não foi possível concluir a operação.'); }
+  function errorMessage(error) {
+    let message = error?.message || String(error || 'Não foi possível concluir a operação.');
+    for (let pass = 0; pass < 3; pass++) message = message.replace(/^Error invoking remote method ['"][^'"]+['"]:\s*/i, '').replace(/^Error:\s*/i, '');
+    const code = error?.code;
+    return code && /^[A-Z0-9_]{2,80}$/.test(code) && !message.includes(code) ? `${message} [${code}]` : message;
+  }
   async function rpc(action, payload = {}) {
     if (!bridge?.call) throw new Error('A ponte segura do aplicativo não está disponível. Abra o aplicativo instalado.');
     const result = await bridge.call(action, payload);
@@ -120,7 +125,7 @@
     const previousMode = state.snapshot?.mode;
     state.snapshot = snapshot;
     if (previousMode && previousMode !== snapshot.mode) {
-      state.selectedContacts.clear(); state.selectedGroupIds.clear(); state.contactGroup = ''; state.contacts = { items: [], total: 0, limit: 25, offset: 0 };
+      state.selectedContacts.clear(); state.contactCache.clear(); state.selectedGroupIds.clear(); state.authorizationPreview = null; state.editingContact = null; state.contactGroup = ''; state.contacts = { items: [], total: 0, limit: 25, offset: 0 };
       state.history = { items: [], total: 0, limit: 25, offset: 0 }; state.templates = []; state.preview = null;
       closeModal();
     }
@@ -139,6 +144,7 @@
         const result = await rpc('listContacts', filters({ search: state.contactSearch, status: state.contactStatus, groupId: state.contactGroup, limit: 25, offset: state.contacts.offset }));
         if (epoch !== state.pageEpoch) return;
         state.contacts = listResult(result);
+        state.contacts.items.forEach((contact) => state.contactCache.set(contact.id, contact));
       } else if (state.page === 'historico') {
         const result = await rpc('listHistory', filters({ status: state.historyStatus, search: state.historySearch, limit: 25, offset: state.history.offset }));
         if (epoch !== state.pageEpoch) return;
@@ -195,13 +201,29 @@
   function contactBadges(contact) {
     return `<span class="status-stack">${badge('identified')}${contact.authorized ? badge('authorized') : ''}${contact.invitationState || contact.previouslyInvited ? badge(contact.invitationState || 'invited') : ''}${contact.blocked ? badge('blocked') : ''}${contact.optOut ? badge('blocked', 'Não deseja receber') : ''}${contact.muted ? badge('blocked', 'Silenciado') : ''}${contact.ambiguous ? badge('uncertain', 'Identidade ambígua') : ''}${contact.self ? badge('dark', 'Sua conta') : ''}</span>`;
   }
+  function contactAuthorization(contact) {
+    if (typeof contact?.authorizationEligible === 'boolean') return { eligible: contact.authorizationEligible, code: contact.authorizationBlockCode, reason: contact.authorizationBlockReason };
+    if (!contact) return { eligible: false, code: 'CONTACT_NOT_FOUND', reason: 'Contato não encontrado. Atualize os participantes.' };
+    if (contact.optOut) return { eligible: false, code: 'CONTACT_OPT_OUT', reason: 'Este contato pediu para não receber convites.' };
+    if (contact.blocked) return { eligible: false, code: 'CONTACT_BLOCKED', reason: 'Contato bloqueado. Revise o bloqueio antes de autorizar.' };
+    if (contact.muted) return { eligible: false, code: 'CONTACT_MUTED', reason: 'Contato silenciado. Revise o silenciamento antes de autorizar.' };
+    if (contact.self) return { eligible: false, code: 'CONTACT_SELF', reason: 'Esta é a conta conectada ao aplicativo.' };
+    if (contact.ambiguous) return { eligible: false, code: 'CONTACT_IDENTITY_AMBIGUOUS', reason: 'A integração informou uma identidade ambígua. Atualize os participantes.' };
+    if (!/^\+?[1-9]\d{7,14}$/.test(contact.phone || '')) return { eligible: false, code: 'CONTACT_PHONE_UNAVAILABLE', reason: 'O WhatsApp não disponibilizou um telefone confiável. Um LID não pode ser convertido em número.' };
+    return { eligible: true, code: null, reason: null };
+  }
+  function authorizationNote(contact) {
+    const eligibility = contactAuthorization(contact);
+    return eligibility.eligible ? '<small class="authorization-eligible">Pode registrar autorização explícita.</small>' : `<small class="authorization-block" data-authorization-code="${esc(eligibility.code)}">${esc(eligibility.reason)}</small>`;
+  }
   function renderContacts() {
     const list = state.contacts;
+    const eligibleSelected = [...state.selectedContacts].filter((id) => contactAuthorization(state.contactCache.get(id)).eligible).length;
     return `${heading('Contatos com controle.', 'Identificação, autorização e convite são registros separados. Nomes não substituem a identidade da conta.', '<button class="button secondary" data-action="reload-page">↻ Atualizar</button>')}
       <div class="toolbar"><div class="toolbar-group">${searchInput('contact-search', state.contactSearch, 'Buscar por nome ou telefone')}<select id="contact-group" class="input" aria-label="Filtrar contatos por grupo">${option('', 'Todos os grupos', state.contactGroup)}${snapshotGroups().map((group) => option(group.id, group.name, state.contactGroup)).join('')}</select><select id="contact-status" class="input" aria-label="Filtrar contatos por situação">${[['', 'Todas as situações'], ['identified', 'Identificados'], ['authorized', 'Autorizados'], ['invited', 'Já convidados'], ['blocked', 'Bloqueados']].map(([value, label]) => option(value, label, state.contactStatus)).join('')}</select></div></div>
-      <section class="panel"><div class="panel-header"><div class="toolbar-group"><button class="button secondary compact" data-action="select-filtered-contacts">Selecionar todos os resultados</button><button class="button ghost compact" data-action="clear-contact-selection">Desmarcar todos</button><span class="selection-count">${count(state.selectedContacts.size)} selecionado(s)</span></div><button class="button compact" data-action="authorize-selected" ${!state.selectedContacts.size ? 'disabled' : ''}>Registrar autorização</button></div>
-      ${list.items.length ? `<div class="table-scroll"><table><thead><tr><th><input id="select-visible-contacts" type="checkbox" aria-label="Selecionar os contatos desta página" ${list.items.every((contact) => state.selectedContacts.has(contact.id)) ? 'checked' : ''}></th><th>Contato</th><th>Telefone / identidade</th><th>Situação</th><th>Primeira identificação</th><th></th></tr></thead><tbody>${list.items.map((contact) => `<tr><td class="checkbox-cell"><input type="checkbox" data-contact-select="${esc(contact.id)}" aria-label="Selecionar ${esc(contactName(contact))}" ${state.selectedContacts.has(contact.id) ? 'checked' : ''}></td><td><strong>${esc(contactName(contact))}</strong>${contact.name && contact.displayName && contact.name !== contact.displayName ? `<small>Perfil WhatsApp: ${esc(contact.displayName)}</small>` : ''}<small>${(contact.groupIds || []).map(groupName).map(esc).join(' · ') || 'Grupo não informado'}</small></td><td><strong>${esc(phone(contact))}</strong><small class="code">${esc(contact.externalId || contact.id)}</small></td><td>${contactBadges(contact)}</td><td>${esc(date(contact.firstSeenAt))}</td><td><button class="button secondary compact" data-action="edit-contact" data-id="${esc(contact.id)}">Revisar</button></td></tr>`).join('')}</tbody></table></div>` : empty('Nenhum contato nesta seleção', 'Atualize os participantes de um grupo e revise os contatos. Números indisponíveis ou identidades ambíguas não ficam elegíveis para envio.', '<a class="button" href="#grupos">Consultar grupos</a>', 'contacts')}
-      ${pagination(list, 'contacts')}</section><p class="help">“Selecionar todos os resultados” inclui todas as páginas da pesquisa e dos filtros atuais. Selecionar não autoriza nem envia mensagens.</p>`;
+      <section class="panel"><div class="panel-header"><div class="toolbar-group"><button class="button secondary compact" data-action="select-filtered-contacts">Selecionar todos os resultados</button><button class="button ghost compact" data-action="clear-contact-selection">Desmarcar todos</button><span class="selection-count" id="contact-selection-count">${count(state.selectedContacts.size)} selecionado(s) · ${count(eligibleSelected)} apto(s) para autorização</span></div><button class="button compact" data-action="authorize-selected" ${!eligibleSelected ? 'disabled' : ''}>Registrar autorização dos aptos</button></div>
+      ${list.items.length ? `<div class="table-scroll"><table><thead><tr><th><input id="select-visible-contacts" type="checkbox" aria-label="Selecionar os contatos desta página" ${list.items.every((contact) => state.selectedContacts.has(contact.id)) ? 'checked' : ''}></th><th>Contato</th><th>Telefone / identidade</th><th>Situação</th><th>Primeira identificação</th><th></th></tr></thead><tbody>${list.items.map((contact) => `<tr><td class="checkbox-cell"><input type="checkbox" data-contact-select="${esc(contact.id)}" aria-label="Selecionar ${esc(contactName(contact))}" ${state.selectedContacts.has(contact.id) ? 'checked' : ''}></td><td><strong>${esc(contactName(contact))}</strong>${contact.name && contact.displayName && contact.name !== contact.displayName ? `<small>Perfil WhatsApp: ${esc(contact.displayName)}</small>` : ''}<small>${(contact.groupIds || []).map(groupName).map(esc).join(' · ') || 'Grupo não informado'}</small></td><td><strong>${esc(phone(contact))}</strong><small class="code">${esc(contact.externalId || contact.id)}</small></td><td>${contactBadges(contact)}${authorizationNote(contact)}</td><td>${esc(date(contact.firstSeenAt))}</td><td><button class="button secondary compact" data-action="edit-contact" data-id="${esc(contact.id)}">Revisar</button></td></tr>`).join('')}</tbody></table></div>` : empty('Nenhum contato nesta seleção', 'Atualize os participantes de um grupo e revise os contatos. Números indisponíveis ou identidades ambíguas não ficam elegíveis para envio.', '<a class="button" href="#grupos">Consultar grupos</a>', 'contacts')}
+      ${pagination(list, 'contacts')}</section><p class="help">“Selecionar todos os resultados” inclui todas as páginas da pesquisa e dos filtros atuais. Selecionar não autoriza nem envia mensagens. A autorização será registrada apenas para contatos com telefone confiável, sem bloqueios, após sua confirmação.</p>`;
   }
   function intervalLabel(campaign) { return `${campaign.intervalValue || (campaign.intervalMs ? campaign.intervalMs / 1000 : 30)} ${campaign.intervalUnit === 'minutes' ? 'minuto(s)' : 'segundo(s)'}`; }
   function renderCampaigns() {
@@ -266,11 +288,22 @@
   async function editContact(id) {
     const contact = state.contacts.items.find((entry) => entry.id === id);
     if (!contact) throw new Error('Atualize a lista para revisar este contato.');
-    openModal('contact', 'Revisar contato', 'O nome salvo não altera o nome de perfil nem a identidade do WhatsApp.', `<form id="contact-form" data-id="${esc(id)}"><div class="field-row"><div class="field"><label for="contact-name">Nome salvo no aplicativo</label><input name="name" id="contact-name" value="${esc(contact.name || '')}" placeholder="Nome para seu cadastro"></div><div class="field"><label>Telefone disponível</label><input value="${esc(phone(contact))}" readonly><small>Identidade: ${esc(contact.externalId || contact.id)}</small></div></div><div class="notice info space-bottom"><span>Nome no WhatsApp: ${esc(contact.displayName || 'Não disponibilizado pela integração')}. Primeiro registro: ${esc(date(contact.firstSeenAt))}.</span></div><div class="form-stack"><label class="checkbox-line"><input name="authorized" type="checkbox" ${contact.authorized ? 'checked' : ''}><span><strong>Contato autorizado a receber os convites</strong>Participar do grupo, por si só, não é autorização.</span></label><div class="field"><label for="consent-note">Registro da autorização</label><textarea name="consentNote" id="consent-note" rows="2" placeholder="Descreva como e quando o contato autorizou o envio">${esc(contact.consentNote || '')}</textarea></div><label class="checkbox-line"><input name="blocked" type="checkbox" ${contact.blocked ? 'checked' : ''}><span><strong>Bloquear envios para este contato</strong>Vale também para campanhas de reenvio.</span></label><label class="checkbox-line"><input name="optOut" type="checkbox" ${contact.optOut ? 'checked' : ''}><span><strong>Este contato pediu para não receber mensagens</strong>Preserva o cadastro e impede novos convites.</span></label><label class="checkbox-line"><input name="muted" type="checkbox" ${contact.muted ? 'checked' : ''}><span><strong>Silenciar temporariamente</strong>Impede o processamento das próximas mensagens.</span></label></div></form>`, '<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button" data-action="save-contact">Salvar alterações</button>');
+    state.editingContact = { ...contact };
+    const eligibility = contactAuthorization(contact);
+    openModal('contact', 'Revisar contato', 'O nome salvo não altera o nome de perfil nem a identidade do WhatsApp.', `<form id="contact-form" data-id="${esc(id)}">${!eligibility.eligible ? `<div class="notice warning space-bottom" id="contact-authorization-warning"><span><strong>Autorização indisponível.</strong> ${esc(eligibility.reason)} <small>[${esc(eligibility.code)}]</small> Você pode editar o nome e as restrições sem autorizar envios.</span></div>` : ''}<div class="field-row"><div class="field"><label for="contact-name">Nome salvo no aplicativo</label><input name="name" id="contact-name" value="${esc(contact.name || '')}" placeholder="Nome para seu cadastro"></div><div class="field"><label>Telefone disponível</label><input value="${esc(phone(contact))}" readonly><small>Identidade: ${esc(contact.externalId || contact.id)}</small></div></div><div class="notice info space-bottom"><span>Nome no WhatsApp: ${esc(contact.displayName || 'Não disponibilizado pela integração')}. Primeiro registro: ${esc(date(contact.firstSeenAt))}.</span></div><div class="form-stack"><label class="checkbox-line"><input name="authorized" id="contact-authorized" type="checkbox" ${contact.authorized ? 'checked' : ''} ${!eligibility.eligible ? 'disabled' : ''}><span><strong>Contato autorizado a receber os convites</strong>Participar do grupo, por si só, não é autorização.</span></label><div class="field"><label for="consent-note">Registro da autorização</label><textarea name="consentNote" id="consent-note" rows="2" maxlength="1000" ${!eligibility.eligible ? 'disabled' : ''} placeholder="Descreva como e quando o contato autorizou o envio">${esc(contact.consentNote || '')}</textarea></div><label class="checkbox-line"><input name="blocked" type="checkbox" ${contact.blocked ? 'checked' : ''}><span><strong>Bloquear envios para este contato</strong>Vale também para campanhas de reenvio.</span></label><label class="checkbox-line"><input name="optOut" type="checkbox" ${contact.optOut ? 'checked' : ''}><span><strong>Este contato pediu para não receber mensagens</strong>Preserva o cadastro e impede novos convites.</span></label><label class="checkbox-line"><input name="muted" type="checkbox" ${contact.muted ? 'checked' : ''}><span><strong>Silenciar temporariamente</strong>Impede o processamento das próximas mensagens.</span></label></div></form>`, '<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button" data-action="save-contact">Salvar alterações</button>');
   }
   async function authorizeSelected() {
     if (!state.selectedContacts.size) return;
-    openModal('authorize', 'Registrar autorização', 'Selecionar contatos não envia mensagens.', `<p class="description space-bottom">Você está registrando a autorização de <strong>${count(state.selectedContacts.size)} contato(s)</strong>. Números indisponíveis, identidades ambíguas e restrições continuam sendo verificados pelo aplicativo.</p><form id="authorize-form"><div class="field"><label for="bulk-consent">Como esses contatos autorizaram o convite?</label><textarea id="bulk-consent" name="consentNote" required placeholder="Descreva a origem e a data da autorização"></textarea></div><label class="checkbox-line space-top"><input type="checkbox" name="confirmed" required><span><strong>Confirmo que os contatos selecionados autorizaram o recebimento.</strong>A participação no grupo não substitui essa autorização.</span></label></form>`, '<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button" data-action="confirm-authorize">Registrar autorização</button>');
+    const current = new Map((await allContacts()).map((contact) => [contact.id, contact]));
+    current.forEach((contact, id) => state.contactCache.set(id, contact));
+    const eligible = [], skipped = [];
+    for (const id of state.selectedContacts) {
+      const contact = current.get(id), eligibility = contactAuthorization(contact);
+      if (eligibility.eligible) eligible.push(contact);
+      else skipped.push({ id, name: contact ? contactName(contact) : 'Contato removido', code: eligibility.code, reason: eligibility.reason });
+    }
+    state.authorizationPreview = { eligible, skipped, selected: state.selectedContacts.size };
+    openModal('authorize', 'Conferir autorização dos contatos', 'Selecionar contatos não envia mensagens. A elegibilidade foi conferida novamente no cadastro.', `<div class="summary-grid"><div class="summary-cell"><strong>${count(state.selectedContacts.size)}</strong><span>Contatos selecionados</span></div><div class="summary-cell"><strong>${count(eligible.length)}</strong><span>Aptos para registrar autorização</span></div><div class="summary-cell"><strong>${count(skipped.length)}</strong><span>Não serão autorizados</span></div></div>${skipped.length ? `<div class="notice warning space-top"><span><strong>${count(skipped.length)} contato(s) ficarão fora desta autorização.</strong> Nenhum telefone será inventado nem bloqueio removido.</span></div><details class="space-bottom authorization-exclusions" open><summary>Motivos por contato</summary><div class="inline-errors">${skipped.map((entry) => `<p><strong>${esc(entry.name)}</strong>: ${esc(entry.reason)} <small>[${esc(entry.code)}]</small></p>`).join('')}</div></details>` : ''}${eligible.length ? `<details class="space-top space-bottom"><summary>Conferir ${count(eligible.length)} contato(s) apto(s)</summary><div class="inline-errors">${eligible.map((contact) => `<p>${esc(contactName(contact))} · ${esc(phone(contact))}</p>`).join('')}</div></details><form id="authorize-form"><div class="field"><label for="bulk-consent">Como esses contatos autorizaram o convite?</label><textarea id="bulk-consent" name="consentNote" required minlength="3" maxlength="1000" placeholder="Descreva a origem e a data da autorização"></textarea></div><label class="checkbox-line space-top"><input type="checkbox" name="confirmed" required><span><strong>Confirmo que os ${count(eligible.length)} contatos aptos autorizaram o recebimento.</strong>A participação no grupo não substitui essa autorização.</span></label></form>` : '<div class="notice warning"><span>Nenhum contato selecionado pode ser autorizado neste momento. Revise os motivos acima e atualize os participantes quando necessário.</span></div>'}`, `<button class="button secondary" data-action="close-modal">Cancelar</button><button class="button" data-action="confirm-authorize" ${!eligible.length ? 'disabled' : ''}>Registrar autorização de ${count(eligible.length)} contato(s)</button>`);
   }
   function localDateInput(value) {
     if (!value) return '';
@@ -282,7 +315,7 @@
     const campaign = snapshotCampaigns().find((entry) => entry.id === id) || {};
     const settings = state.snapshot.settings || {};
     const templatesResult = listResult(await rpc('listTemplates', { limit: 200 }));
-    const contacts = (await allContacts()).filter((contact) => contact.authorized && !contact.blocked && !contact.optOut);
+    const contacts = (await allContacts()).filter((contact) => contact.authorized && contactAuthorization(contact).eligible);
     const selectedContacts = new Set(campaign.contactIds || []); const selectedGroups = new Set(campaign.groupIds || []);
     state.editorContacts = contacts; state.editorCampaign = campaign;
     const groups = snapshotGroups();
@@ -359,11 +392,37 @@
     'refresh-participants': async (node) => { const result = await rpc('refreshParticipants', { groupId: node.dataset.id }); await refreshSnapshot(); const summary = result?.summary || result; toast(`Consulta concluída: ${count(summary.identified)} identificado(s), ${count(summary.newContacts)} novo(s), ${count(summary.unavailable)} sem número disponível. Nenhuma autorização foi criada.`); },
     'view-group-contacts': (node) => { state.contactGroup = node.dataset.id; state.contacts.offset = 0; location.hash = 'contatos'; if (state.page === 'contatos') return loadPage(); },
     'edit-contact': (node) => editContact(node.dataset.id),
-    'save-contact': async () => { const form = $('#contact-form'); if (!form.reportValidity()) return; const data = new FormData(form); if (data.has('authorized') && !data.get('consentNote').trim()) throw new Error('Descreva a autorização antes de liberar convites.'); await rpc('updateContact', { id: form.dataset.id, changes: { name: data.get('name').trim(), authorized: data.has('authorized'), consentNote: data.get('consentNote').trim(), blocked: data.has('blocked'), optOut: data.has('optOut'), muted: data.has('muted') } }); closeModal(); await refreshSnapshot(false); await loadPage(); toast('Contato persistido. As próximas tarefas respeitarão as alterações.'); },
-    'select-filtered-contacts': async () => { const contacts = await allContacts({ search: state.contactSearch, status: state.contactStatus, groupId: state.contactGroup }); contacts.forEach((contact) => state.selectedContacts.add(contact.id)); renderPage(); toast(`${count(contacts.length)} contato(s) da pesquisa selecionado(s), incluindo outras páginas. Nenhum convite foi enviado.`); },
+    'save-contact': async () => {
+      const form = $('#contact-form'); if (!form.reportValidity()) return;
+      const data = new FormData(form), original = state.editingContact;
+      if (!original || original.id !== form.dataset.id) throw new Error('Atualize o contato antes de salvar as alterações.');
+      const changes = {}, name = data.get('name').trim(), authorizedInput = $('#contact-authorized');
+      if (name !== (original.name || '')) changes.name = name;
+      for (const key of ['blocked', 'optOut', 'muted']) if (data.has(key) !== !!original[key]) changes[key] = data.has(key);
+      // Disabled permission controls are omitted: editing a name never retries an
+      // authorization rejected by identity resolution or a contact restriction.
+      if (!authorizedInput.disabled && authorizedInput.checked !== !!original.authorized) changes.authorized = authorizedInput.checked;
+      const consentNote = String(data.get('consentNote') || '').trim();
+      if (!authorizedInput.disabled && authorizedInput.checked && consentNote !== (original.consentNote || '').trim()) { changes.authorized = true; changes.consentNote = consentNote; }
+      if (changes.authorized === true) { if (consentNote.length < 3) throw new Error('Descreva como o contato autorizou o envio, com pelo menos 3 caracteres.'); changes.consentNote = consentNote; }
+      if (!Object.keys(changes).length) { closeModal(); toast('Nenhuma alteração foi necessária.'); return; }
+      await rpc('updateContact', { id: form.dataset.id, changes }); closeModal(); await refreshSnapshot(false); await loadPage(); toast('Contato persistido. As próximas tarefas respeitarão as alterações.');
+    },
+    'select-filtered-contacts': async () => { const contacts = await allContacts({ search: state.contactSearch, status: state.contactStatus, groupId: state.contactGroup }); contacts.forEach((contact) => { state.selectedContacts.add(contact.id); state.contactCache.set(contact.id, contact); }); renderPage(); toast(`${count(contacts.length)} contato(s) da pesquisa selecionado(s), incluindo outras páginas. Nenhum convite foi enviado.`); },
     'clear-contact-selection': () => { state.selectedContacts.clear(); renderPage(); },
     'authorize-selected': authorizeSelected,
-    'confirm-authorize': async () => { const form = $('#authorize-form'); if (!form.reportValidity()) return; const data = new FormData(form); if (!data.has('confirmed')) throw new Error('Confirme a autorização dos contatos selecionados.'); const result = await rpc('authorizeContacts', { ids: [...state.selectedContacts], authorized: true, consentNote: data.get('consentNote').trim() }); closeModal(); state.selectedContacts.clear(); await refreshSnapshot(false); await loadPage(); toast(result?.message || 'Autorizações persistidas. As restrições de identidade e bloqueio continuam valendo.'); },
+    'confirm-authorize': async () => {
+      const form = $('#authorize-form'), preview = state.authorizationPreview;
+      if (!form || !preview?.eligible.length) throw new Error('Confira os contatos aptos antes de registrar a autorização.');
+      if (!form.reportValidity()) return;
+      const data = new FormData(form); if (!data.has('confirmed')) throw new Error('Confirme a autorização dos contatos aptos selecionados.');
+      const result = await rpc('authorizeContacts', { ids: preview.eligible.map((contact) => contact.id), authorized: true, consentNote: data.get('consentNote').trim() });
+      const saved = result?.summary?.authorized ?? result?.items?.length ?? 0;
+      const skipped = [...preview.skipped, ...(result?.skipped || [])];
+      closeModal(); state.authorizationPreview = null; state.selectedContacts.clear(); await refreshSnapshot(false); await loadPage();
+      if (skipped.length) openModal('authorization-result', 'Resultado da autorização', 'Somente os contatos elegíveis foram atualizados. Nenhum convite foi enviado.', `<div class="notice ${saved ? 'info' : 'warning'}"><span><strong>${count(saved)} autorização(ões) persistida(s).</strong> ${count(skipped.length)} contato(s) não foram autorizados.</span></div><div class="inline-errors space-top">${skipped.map((entry) => `<p><strong>${esc(entry.name || entry.id)}</strong>: ${esc(entry.reason)} <small>[${esc(entry.code)}]</small></p>`).join('')}</div>`, '<button class="button" data-action="close-modal">Entendi</button>');
+      else toast(`${count(saved)} autorização(ões) persistida(s). Nenhum convite foi enviado.`);
+    },
     'previous-contacts': () => { state.contacts.offset = Math.max(0, state.contacts.offset - 25); return loadPage(); },
     'next-contacts': () => { state.contacts.offset += 25; return loadPage(); },
     'previous-history': () => { state.history.offset = Math.max(0, state.history.offset - 25); return loadPage(); },
@@ -438,7 +497,13 @@
     if (target.id === 'history-status') { state.historyStatus = target.value; state.history.offset = 0; loadPage(); }
     if (target.id === 'preview-recipient') { const contact = state.preview?.recipients?.[Number(target.value)]; $('#recipient-preview').textContent = contact?.text || contact?.textSnapshot || ''; }
     if (target.id === 'campaign-template') { const selected = target.selectedOptions[0]; if (selected?.value) $('#campaign-message').value = selected.dataset.message || ''; }
-    if ((target.name === 'blocked' || target.name === 'optOut') && target.checked && $('#contact-form input[name="authorized"]')) $('#contact-form input[name="authorized"]').checked = false;
+    if (['blocked', 'optOut', 'muted'].includes(target.name) && $('#contact-form')) {
+      const restricted = ['blocked', 'optOut', 'muted'].some((key) => $(`#contact-form input[name="${key}"]`)?.checked);
+      const authorization = $('#contact-authorized');
+      authorization.disabled = restricted || !contactAuthorization(state.editingContact).eligible;
+      if (restricted) authorization.checked = false;
+      $('#consent-note').disabled = authorization.disabled;
+    }
     if (target.name === 'groupIds' || target.name === 'contactIds') updateEditorCounts();
     if (target.id === 'unofficial-ack') rpc('saveSettings', { settings: { unofficialAcknowledged: target.checked } }).then(() => refreshSnapshot(false)).catch((error) => toast(errorMessage(error), 'error'));
   });

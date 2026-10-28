@@ -1,10 +1,18 @@
-# Automação Comunidade 1.0.0
+# Automação Comunidade 1.0.1
 
 Aplicativo independente para Windows 10/11 de 64 bits. Organiza participantes de grupos e envia convites privados **somente aos contatos com autorização registrada**. Não utiliza o banco, a sessão nem as configurações do Kenned Code Disparos.
 
+## Atualização 1.0.1 — autorização de contatos
+
+A autorização em lote agora separa os contatos elegíveis dos que não podem ser autorizados. Um participante sem telefone confirmado, a própria conta conectada, um contato bloqueado ou um pedido para não receber não desfazem mais a autorização dos demais. A tela mostra a quantidade efetivamente atualizada e os motivos individuais das exclusões; selecionar não envia convites.
+
+Se aparecer **Telefone indisponível**, use **Grupos e participantes → Atualizar participantes** com a conta conectada. Se o WhatsApp continuar fornecendo apenas um LID sem associação confiável, o contato permanece indisponível. Digitar ou adivinhar um telefone não substitui essa associação. Bloqueios e pedidos para não receber não são removidos pela autorização em lote.
+
+Para atualizar da 1.0.0, faça backup em Configurações, encerre o aplicativo pela bandeja e instale a 1.0.1 na mesma pasta exclusiva. O appId, o perfil, o banco e a sessão são mantidos; esta correção não exige migração ou exclusão dos dados. O instalador anterior continua disponível para recuperação.
+
 ## Instalar e conectar
 
-1. Abra `Automacao-Comunidade-Setup-1.0.0-x64.exe` e mantenha uma pasta exclusiva para o aplicativo. O atalho da área de trabalho é opcional.
+1. Abra `Automacao-Comunidade-Setup-1.0.1-x64.exe` e mantenha uma pasta exclusiva para o aplicativo. O atalho da área de trabalho é opcional.
 2. Em **Configurações**, leia e confirme a identificação da integração não oficial. Clique em **Conectar** e, se solicitado, leia o QR Code em **WhatsApp → Dispositivos conectados → Conectar dispositivo**.
 3. Em **Grupos e participantes**, sincronize os grupos reais e clique em **Atualizar participantes** no grupo escolhido.
 4. Em **Contatos**, selecione os destinatários e registre como autorizaram os convites. Participar do grupo não autoriza mensagens privadas. Contatos sem telefone confiável permanecem indisponíveis para envio.

@@ -6,6 +6,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const { randomBytes, createCipheriv, createDecipheriv } = require('node:crypto');
 const { WhatsAppAdapter, EncryptedAuthStore, phoneFromJid, normalizeJid } = require('../src/adapters/whatsapp.cjs');
 const { SimulatedAdapter } = require('../src/adapters/simulated.cjs');
@@ -60,6 +61,61 @@ test('list participants trusts PN/LID metadata and stored mappings; names never 
 test('conflicting aliases are flagged and cannot become a recipient', async t => {
   const { adapter } = await harness(t, { participants: [{ id: '10001@lid', phoneNumber: '5562988881111@s.whatsapp.net' }, { id: '10001@lid', phoneNumber: '5562988882222@s.whatsapp.net' }] });
   const list = await adapter.listParticipants('123-456@g.us'); assert.equal(list[1].ambiguous, true); assert.equal(list[1].phone, null);
+});
+
+test('installed Baileys metadata parser preserves verified PN/LID pairs without treating raw LID digits as phones', async t => {
+  // Exercise the actual installed SDK shape, not an invented participant schema.
+  // This is an offline SDK compatibility check, not a connected WhatsApp test.
+  const { extractGroupMetadata } = await import(pathToFileURL(path.join(path.dirname(require.resolve('@whiskeysockets/baileys')), 'Socket/groups.js')).href);
+  const group = extractGroupMetadata({ tag: 'iq', attrs: {}, content: [{ tag: 'group', attrs: { id: '123-456', subject: 'Grupo de teste' }, content: [
+    { tag: 'participant', attrs: { jid: '20001@lid', phone_number: '5562988881111@s.whatsapp.net' } },
+    { tag: 'participant', attrs: { jid: '5562988882222@s.whatsapp.net', lid: '20002@lid' } },
+    { tag: 'participant', attrs: { jid: '20003@lid', phone_number: '5562988883333' } }
+  ] }] });
+  const { adapter } = await harness(t, { participants: group.participants });
+  const list = await adapter.listParticipants(group.id);
+  assert.equal(list[0].externalId, '20001@lid');
+  assert.equal(list[0].phone, '5562988881111');
+  assert.deepEqual(list[0].identifiers, ['20001@lid', '5562988881111@s.whatsapp.net']);
+  assert.equal(list[1].phone, '5562988882222');
+  assert(list[1].identifiers.includes('20002@lid'));
+  assert.equal(list[2].externalId, '20003@lid');
+  assert.equal(list[2].phone, null);
+  assert.equal(list[2].ambiguous, false);
+});
+
+test('PN/LID contact and mapping events resolve later refreshes without authorizing contacts or sending probes', async t => {
+  const { adapter, socket } = await harness(t, { participants: [{ id: '20001@lid' }, { id: '20002@lid' }] });
+  assert.deepEqual((await adapter.listParticipants('123-456@g.us')).map(p => p.phone), [null, null]);
+  socket.ev.emit('lid-mapping.update', { lid: '20001@lid', pn: '5562988881111@s.whatsapp.net' });
+  socket.ev.emit('contacts.update', [{ id: '20002@lid', phoneNumber: '5562988882222@s.whatsapp.net', notify: 'Mesmo nome' }]);
+  const list = await adapter.listParticipants('123-456@g.us');
+  assert.deepEqual(list.map(p => p.phone), ['5562988881111', '5562988882222']);
+  assert(list.every(p => p.authorized !== true));
+  assert.equal(socket.sends.length, 0);
+});
+
+test('one unreadable local LID mapping leaves that contact unavailable without losing other participants', async t => {
+  const { adapter, socket } = await harness(t, { participants: [{ id: '20001@lid' }, { id: '5562988882222@s.whatsapp.net' }] });
+  socket.signalRepository.lidMapping.getPNForLID = async () => { throw new Error('PRIVATE_SECRET_FROM_STORAGE'); };
+  const diagnostics = []; adapter.on('diagnostic', event => diagnostics.push(event));
+  const list = await adapter.listParticipants('123-456@g.us');
+  assert.equal(list.length, 2);
+  assert.equal(list[0].phone, null);
+  assert.equal(list[0].externalId, '20001@lid');
+  assert.equal(list[1].phone, '5562988882222');
+  assert.equal(diagnostics[0].code, 'WA_PARTICIPANT_PHONE_UNAVAILABLE');
+  assert(!JSON.stringify(diagnostics).includes('PRIVATE_SECRET_FROM_STORAGE'));
+  assert.equal(socket.sends.length, 0);
+});
+
+test('an already available metadata PN does not depend on a successful fallback mapping query', async t => {
+  const { adapter, socket } = await harness(t, { participants: [{ id: '20001@lid', phoneNumber: '5562988881111:4@s.whatsapp.net' }] });
+  socket.signalRepository.lidMapping.getPNForLID = async () => { throw new Error('must not query'); };
+  const list = await adapter.listParticipants('123-456@g.us');
+  assert.equal(list[0].phone, '5562988881111');
+  assert.equal(list[0].ambiguous, false);
+  assert.equal(socket.sends.length, 0);
 });
 
 test('group rename keeps ID; stale metadata response after reconnection is rejected', async t => {

@@ -1,6 +1,18 @@
-# Validação — Automação Comunidade 1.0.0
+# Validação — Automação Comunidade 1.0.1
 
 Data: 15/10/2026. Projeto independente; nenhum banco ou sessão do Kenned Code Disparos foi usado para testar este aplicativo.
+
+## Correção 1.0.1 — autorização de contatos
+
+Causa reproduzida do erro genérico: o lote de autorização usava uma transação que lançava uma exceção ao encontrar um participante sem telefone confirmado, a própria conta ou um contato com restrição. Isso revertia também as autorizações dos contatos válidos. A seleção geral não diferenciava gestão de contatos e autorização de envio.
+
+A correção mantém a transação para falhas de gravação, mas separa previamente a elegibilidade: os contatos aptos podem ser autorizados com consentimento explícito, e cada exclusão tem código e orientação. O backend reavalia a situação na gravação, inclusive se ela mudar depois da prévia. Edição somente de nome não tenta reautorizar nem muda a identidade ou a data do consentimento. Bloqueio, recusa e silêncio prevalecem sobre um checkbox antigo de autorização.
+
+Falha secundária reproduzida: uma exceção na consulta local de vínculo PN/LID de um participante interrompia a importação dos demais. Essa consulta agora é isolada; o participante afetado continua sem telefone confirmado. Não se comprovou que essa falha secundária ocorreu na sessão do usuário. Os testes com o parser real do Baileys instalado não indicaram descarte de telefone legítimo no formato suportado.
+
+Resultado da atualização: **171 testes automatizados aprovados**, incluindo 12 novos de autorização, quatro novos do adaptador e um de preservação do conjunto de dados da versão anterior. **Sete fluxos específicos de autorização e os dez fluxos gerais da interface foram aprovados no Electron com SQLite real**, sem conexão ao WhatsApp e sem envio de convites.
+
+Não houve migração do esquema, limpeza de dados, troca do appId ou compartilhamento de sessão. A versão anterior e o backup de código foram preservados. Validação com a sessão e os participantes reais do computador do usuário continua pendente.
 
 ## O que foi implementado
 
@@ -33,7 +45,7 @@ Data: 15/10/2026. Projeto independente; nenhum banco ou sessão do Kenned Code D
 
 ## Categorias de teste
 
-Resultado: **154 testes automatizados aprovados, sem falhas ou testes ignorados**, além de **10 fluxos aprovados na interface Electron**, sem erros de JavaScript no renderer. Os arquivos de teste acompanham o código-fonte. A suíte usa **SQLite real** e, para transporte, **adaptadores controlados ou simulação explícita**. Foram exercitados:
+Na versão inicial, foram aprovados 154 testes automatizados e dez fluxos na interface. Na atualização 1.0.1, a suíte completa passou a **171 testes, sem falhas ou testes ignorados**. Os arquivos de teste acompanham o código-fonte. A suíte usa **SQLite real** e, para transporte, **adaptadores controlados ou simulação explícita**. Foram exercitados:
 
 - Mesmo participante em vários grupos, aliases confiáveis, identidade ambígua e número indisponível.
 - Contato identificado sem autorização, autorização explícita, bloqueio, silêncio e recusa.

@@ -20,7 +20,7 @@ const boundedPage = input => {
 };
 const safeDescription = value => String(value || 'Não foi possível concluir a operação.').replace(/(?:Bearer\s+|token[=: ]+|password[=: ]+|secret[=: ]+)[^\s,;]+/gi, '[credencial omitida]').slice(0,1200);
 
-async function createService({ dir, host=async()=>null, secureStorage, adapterFactory, now=()=>Date.now(), version='1.0.0' }={}) {
+async function createService({ dir, host=async()=>null, secureStorage, adapterFactory, now=()=>Date.now(), version='1.0.1' }={}) {
   if(!dir)throw error('Pasta de dados independente não configurada.','DATA_DIRECTORY_REQUIRED');
   fs.mkdirSync(dir,{recursive:true,mode:0o700});
   for(const name of ['credentials','media','backups','exports'])fs.mkdirSync(path.join(dir,name),{recursive:true,mode:0o700});
@@ -36,11 +36,28 @@ async function createService({ dir, host=async()=>null, secureStorage, adapterFa
   const taskRunning=()=>store.listAll('jobs',{status:'processing'}).length>0;
   const getContact=id=>read('contacts',id);
   const groupIds=value=>[...new Set(Array.isArray(value)?value:[])];
+  const authorizationBlock=contact=>{
+    if(contact.optOut)return {code:'CONTACT_OPTED_OUT',reason:'Este contato pediu para não receber mensagens. A autorização não pode ignorar essa restrição.'};
+    if(contact.blocked)return {code:'CONTACT_BLOCKED',reason:'Este contato está bloqueado. Revise o bloqueio no cadastro antes de registrar uma nova autorização.'};
+    if(contact.muted)return {code:'CONTACT_MUTED',reason:'Este contato está silenciado. Retire o silenciamento no cadastro antes de registrar uma nova autorização.'};
+    if(contact.self)return {code:'CONTACT_SELF',reason:'Este participante é a própria conta do WhatsApp conectada e não é destinatário elegível de convites.'};
+    const normalized=models.normalizePhone(contact.phone);
+    const linkedPhones=[...new Set([contact.externalId,...(Array.isArray(contact.identifiers)?contact.identifiers:[])].filter(value=>typeof value==='string').map(value=>value.match(/^(\d+)(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/i)?.[1]).filter(Boolean))];
+    if(contact.ambiguous||linkedPhones.length>1||(normalized&&linkedPhones.some(phone=>phone!==normalized)))return {code:'CONTACT_IDENTITY_AMBIGUOUS',reason:'A integração forneceu uma identidade ou vínculo de telefone ambíguo. Atualize os participantes e revise a identificação; não associe um número por suposição.'};
+    if(!normalized){
+      const lidOnly=[contact.externalId,...(Array.isArray(contact.identifiers)?contact.identifiers:[])].some(value=>typeof value==='string'&&value.endsWith('@lid'));
+      return {code:contact.phone?'CONTACT_PHONE_INVALID':'CONTACT_PHONE_UNAVAILABLE',reason:contact.phone?'O telefone disponível não é um número completo válido com país e DDD. Atualize os participantes; não é possível liberar o envio com esse cadastro.':lidOnly?'A integração disponibilizou apenas um identificador interno (LID), sem telefone confiável. Clique em Atualizar participantes; o envio só será liberado se a integração fornecer o telefone ou um vínculo confiável.':'A integração não disponibilizou um telefone confiável. Clique em Atualizar participantes; um nome ou identificador interno não substitui o número.'};
+    }
+    return null;
+  };
+  const contactLabel=contact=>String(contact.name||contact.displayName||contact.phone||contact.externalId||contact.id).replace(/[\r\n]/g,' ').slice(0,160);
+  const validateConsent=note=>{if(typeof note!=='string'||note.trim().length<3||note.trim().length>1000)throw error('Registre como o contato autorizou o recebimento do convite, usando de 3 a 1.000 caracteres.','CONSENT_REQUIRED');return note.trim();};
   const decorateContact=contact=>{
       const ledger=store.ledger(contact);
-      const unavailable=!contact.phone||contact.ambiguous||contact.self;
+      const block=authorizationBlock(contact);
+      const unavailable=!!block&&!contact.blocked&&!contact.optOut&&!contact.muted;
       const invitationState=contact.blocked||contact.optOut||contact.muted?'blocked':unavailable?'unavailable':ledger?.uncertain?'uncertain':ledger?.previouslyInvited?'invited':contact.authorized?'authorized':'identified';
-      return {...contact,invitationState,previouslyInvited:ledger?.previouslyInvited===true,lastInviteAt:ledger?.lastAcceptedAt||ledger?.lastUncertainAt||null,hasUncertain:ledger?.uncertain===true};
+      return {...contact,invitationState,authorizationEligible:!block,authorizationBlockCode:block?.code||null,authorizationBlockReason:block?.reason||null,previouslyInvited:ledger?.previouslyInvited===true,lastInviteAt:ledger?.lastAcceptedAt||ledger?.lastUncertainAt||null,hasUncertain:ledger?.uncertain===true};
   };
   const contactsWithState=filter=>store.listAll('contacts',filter).map(decorateContact);
   function metrics(){
@@ -84,21 +101,23 @@ async function createService({ dir, host=async()=>null, secureStorage, adapterFa
     participantsSync.set(groupId,operation);try{return await operation;}finally{if(participantsSync.get(groupId)===operation)participantsSync.delete(groupId);}
   }
   function updateContact(id,changes){
+    if(!changes||typeof changes!=='object'||Array.isArray(changes))throw error('Alterações do contato inválidas.','CONTACT_CHANGES_INVALID');
     const c=getContact(id),next={...c};
     if(changes.name!==undefined){if(typeof changes.name!=='string'||changes.name.length>120)throw error('Nome: use até 120 caracteres.');next.name=changes.name.trim();}
     for(const key of ['blocked','muted','optOut'])if(changes[key]!==undefined){if(typeof changes[key]!=='boolean')throw error('Situação do contato inválida.');next[key]=changes[key];}
     if(changes.authorized!==undefined){
       if(typeof changes.authorized!=='boolean')throw error('Autorização inválida.');
-      if(changes.authorized){
-        const note=String(changes.consentNote||'').trim();if(note.length<3||note.length>1000)throw error('Registre como o contato autorizou o recebimento do convite.');
-        if(!c.phone||c.ambiguous||c.self||next.blocked||next.optOut)throw error('Contato sem telefone confiável, bloqueado ou sem elegibilidade. Revise o cadastro.');
+      const restricting=['blocked','muted','optOut'].some(key=>changes[key]===true);
+      if(changes.authorized&&!restricting){
+        const block=authorizationBlock(next);if(block)throw Object.assign(error(`${contactLabel(c)} (ID: ${c.id}): ${block.reason}`,block.code),{contactId:c.id});
+        const note=validateConsent(changes.consentNote);
         next.consentNote=note;next.authorizedAt=now();
       }
-      next.authorized=changes.authorized;
+      next.authorized=changes.authorized&&!restricting;
       if(!changes.authorized)next.authorizationRevokedAt=now();
     }
-    if(next.optOut||next.blocked)next.authorized=false;
-    next.updatedAt=now();const saved=store.save('contacts',next);audit('contact.update',{contactId:id,authorized:next.authorized,blocked:next.blocked,optOut:next.optOut});return saved;
+    if(next.optOut||next.blocked||next.muted){if(c.authorized)next.authorizationRevokedAt=now();next.authorized=false;}
+    next.updatedAt=now();return store.transaction(()=>{const saved=store.save('contacts',next);audit('contact.update',{contactId:id,authorized:next.authorized,blocked:next.blocked,muted:next.muted,optOut:next.optOut});return decorateContact(saved);});
   }
   function stateFingerprint(c,preview){return digest({revision:c.revision,campaign:c,recipients:preview.recipients.map(r=>({id:r.id,phone:r.phone,text:models.renderMessage(c,r),authorizedAt:r.authorizedAt,blocked:r.blocked,optOut:r.optOut,muted:r.muted,ledger:store.ledger(r)}))});}
   function validateCampaignReferences(c){for(const id of c.groupIds||[])read('groups',id);for(const id of c.contactIds||[])getContact(id);}
@@ -114,7 +133,25 @@ async function createService({ dir, host=async()=>null, secureStorage, adapterFa
     listParticipants:async p=>actions.listContacts({...p,groupId:p.groupId||p.id}),
     listContacts:async p=>{const page=store.list('contacts',boundedPage(p));return {...page,items:page.items.map(decorateContact)};},
     updateContact:async p=>updateContact(p.id,p.changes||p.contact||p),
-    authorizeContacts:async p=>{if(!Array.isArray(p.ids)||p.ids.length<1||p.ids.length>5000||p.ids.some(id=>typeof id!=='string'))throw error('Selecione de 1 a 5.000 contatos.');return store.transaction(()=>({items:[...new Set(p.ids)].map(id=>updateContact(id,{authorized:p.authorized!==false,consentNote:p.consentNote}))}));},
+    authorizeContacts:async p=>{
+      if(!Array.isArray(p.ids)||p.ids.length<1||p.ids.length>5000||p.ids.some(id=>typeof id!=='string'||!id||id.length>512))throw error('Selecione de 1 a 5.000 contatos.','CONTACT_SELECTION_INVALID');
+      if(p.authorized!==undefined&&typeof p.authorized!=='boolean')throw error('Autorização inválida.','AUTHORIZATION_INVALID');
+      const authorized=p.authorized!==false,consentNote=authorized?validateConsent(p.consentNote):undefined,ids=[...new Set(p.ids)];
+      return store.transaction(()=>{
+        const items=[],skipped=[];
+        for(const id of ids){
+          const contact=store.get('contacts',id);
+          if(!contact){skipped.push({id,name:null,code:'CONTACT_NOT_FOUND',reason:'O contato não existe mais neste ambiente. Atualize a lista de participantes.'});continue;}
+          const block=authorized?authorizationBlock(contact):null;
+          if(block){skipped.push({id,name:contactLabel(contact),code:block.code,reason:block.reason});continue;}
+          items.push(updateContact(id,{authorized,consentNote}));
+        }
+        const summary={selected:ids.length,authorized:authorized?items.length:0,revoked:authorized?0:items.length,skipped:skipped.length};
+        const message=items.length?`${items.length} ${authorized?'autorização(ões) registrada(s)':'autorização(ões) revogada(s)'}.${skipped.length?` ${skipped.length} contato(s) não alterado(s); confira os motivos.`:''}`:`Nenhum contato foi ${authorized?'autorizado':'alterado'}. Confira o motivo de cada contato não alterado.`;
+        audit('contacts.authorization.batch',{...summary,requestedAuthorization:authorized,skipped:skipped.map(({id,code})=>({id,code}))});
+        return {items,skipped,summary,message};
+      });
+    },
     listCampaigns:async p=>store.list('campaigns',boundedPage(p)),
     saveCampaign:async p=>{
       const input=p.campaign||p,old=input.id?store.get('campaigns',input.id):null;
