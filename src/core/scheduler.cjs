@@ -137,6 +137,8 @@ class Scheduler extends EventEmitter {
     this.externalPending = new Set();
     this.externalInFlight = 0;
     this.campaignInFlight = 0;
+    this.submissionTurn = null;
+    this.submissionTurnWaiters = [];
     this.automationBlocked = store.getSetting?.('automationState', {})?.stopped === true;
     this.receipts = new Map();
     this.attemptTimeoutMs = attemptTimeoutMs;
@@ -570,6 +572,72 @@ class Scheduler extends EventEmitter {
   getInFlightCount() { return this.externalInFlight + this.campaignInFlight; }
   getCampaignInFlightCount() { return this.campaignInFlight; }
 
+  getSubmissionQueueState() {
+    const pending = [...this.externalPending].filter(entry => !entry.cancelled && !entry.started).length;
+    return { active: this.submissionTurn?.kind || null, waitingPrivate: pending,
+      waitingCampaign: this.submissionTurnWaiters.filter(entry => entry.kind === 'campaign').length,
+      reason: pending ? this.submissionTurn?.kind === 'campaign' ? 'Aguardando a mensagem em andamento, sem esperar a rodada inteira.' : 'Aguardando o próximo turno de envio privado.' : null };
+  }
+
+  _acquireSubmissionTurn(kind, signal) {
+    // A round retains its immutable jobs while yielding only the transport.
+    // FIFO arbitration prevents overlapping submissions and lets a waiting
+    // campaign progress between finite private batches, without restarting it.
+    if (!this.submissionTurn && !this.submissionTurnWaiters.length && !signal?.aborted) return this._takeSubmissionTurn({ kind });
+    return new Promise((resolve, reject) => {
+      const entry = { kind, signal, resolve, reject, abort: null };
+      entry.abort = () => {
+        const index = this.submissionTurnWaiters.indexOf(entry);
+        if (index !== -1) this.submissionTurnWaiters.splice(index, 1);
+        reject(Object.assign(new Error('Envio cancelado antes de obter o próximo turno.'), { code: 'SUBMISSION_ABORTED', definitive: true, submitted: false, safeToRetry: false }));
+      };
+      if (signal?.aborted) return entry.abort();
+      signal?.addEventListener('abort', entry.abort, { once: true });
+      this.submissionTurnWaiters.push(entry);
+      this._grantSubmissionTurn();
+    });
+  }
+
+  _grantSubmissionTurn() {
+    if (this.submissionTurn) return;
+    const entry = this.submissionTurnWaiters.shift();
+    if (!entry) return;
+    entry.signal?.removeEventListener('abort', entry.abort);
+    if (entry.signal?.aborted) { entry.abort(); this._grantSubmissionTurn(); return; }
+    entry.resolve(this._takeSubmissionTurn(entry));
+  }
+
+  _takeSubmissionTurn(entry) {
+    this.submissionTurn = entry;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.submissionTurn === entry) this.submissionTurn = null;
+      this._grantSubmissionTurn();
+    };
+  }
+
+  _campaignSubmissionTurn(job, signal) {
+    if (signal.aborted) return Promise.reject(Object.assign(new Error('Campanha interrompida antes do envio.'), { code: 'SUBMISSION_ABORTED', definitive: true, submitted: false }));
+    const acquired = this._acquireSubmissionTurn('campaign', signal);
+    const inspect = release => {
+      try {
+      const campaign = this.store.getCampaign(job.campaignId);
+      const spacing = this.lastSubmissionGroupId === job.groupId ? campaign?.messageSpacingSeconds ?? campaign?.spacingSeconds : campaign?.groupSpacingSeconds ?? campaign?.spacingSeconds;
+      const minimum = Math.max(Number(this.adapter.minimumSpacingSeconds) || 3, Number(spacing) || 3) * 1000;
+      const remaining = this.lastSubmissionAt === null ? 0 : minimum - (this.now() - this.lastSubmissionAt);
+      if (remaining <= 0) return release;
+      // Do not own the transport during the configured campaign delay. A
+      // private response may use it now; re-evaluate its resulting timestamp
+      // after reacquiring instead of sending immediately behind that response.
+      release();
+      return this._wait(remaining, signal).then(() => this._campaignSubmissionTurn(job, signal));
+      } catch (error) { release(); throw error; }
+    };
+    return typeof acquired === 'function' ? inspect(acquired) : acquired.then(inspect);
+  }
+
   _timeoutMs(campaign) {
     if (Number.isFinite(this.attemptTimeoutMs) && this.attemptTimeoutMs > 0) return this.attemptTimeoutMs;
     const seconds = campaign?.sendTimeoutSeconds ?? this.store.getSetting?.('submissionTimeoutSeconds', 30) ?? 30;
@@ -622,13 +690,15 @@ class Scheduler extends EventEmitter {
     this.externalPending.add(entry);
     const operation = this.externalSubmissions.catch(() => {}).then(async () => {
       if (entry.cancelled) return;
-      await this.waitForIdle();
+      const releaseTurn = await this._acquireSubmissionTurn('private', entry.controller.signal);
+      try {
       if (entry.cancelled) return;
       if (this.closed || this.persistenceFailed || this.store.persistenceFailed) throw new Error('Envios externos bloqueados: processamento indisponível.');
       if(!controlOnly)this.licenseGuard();
       if (!entry.manual && this._automationStopped()) throw this._automationError();
       entry.started = true;
       this.externalInFlight++;
+      this.lastSubmissionGroupId = null;
       try { return await this.runBoundedAttempt(context => {
         const beforeSubmit = () => {
           context.beforeSubmit();
@@ -640,6 +710,7 @@ class Scheduler extends EventEmitter {
         return task({ ...context, beforeSubmit });
       }, { timeoutMs, onLateResult, onLateError, signal: entry.controller.signal }); }
       finally { this.externalInFlight--; }
+      } finally { releaseTurn(); }
     });
     this.externalSubmissions = operation.catch(() => {});
     operation.then(resolve, reject).finally(() => this.externalPending.delete(entry));
@@ -777,7 +848,7 @@ class Scheduler extends EventEmitter {
     this.emit('change');
   }
 
-  async _sendJob(job, signal) {
+  async _sendJob(job, signal, { ownsSubmissionTurn = false } = {}) {
     const campaign = this.store.getCampaign(job.campaignId);
     const policy = campaign?.retryPolicy || { maxAttempts: 3, delaySeconds: 3 };
     try { assertCampaignSchemaCompatible(campaign, job.itemSnapshot); }
@@ -794,6 +865,12 @@ class Scheduler extends EventEmitter {
       return 'failed';
     }
     for (let attempt = attemptsAlreadyUsed + 1; attempt <= policy.maxAttempts; attempt++) {
+      let releaseTurn = () => {};
+      try {
+      if (!ownsSubmissionTurn) {
+        try { const turn = this._campaignSubmissionTurn(job, signal); releaseTurn = typeof turn === 'function' ? turn : await turn; }
+        catch (error) { if (error.code === 'SUBMISSION_ABORTED') return preservePending() ? 'queued' : 'cancelled'; throw error; }
+      }
       if (signal.aborted || !maySend()) return preservePending() ? 'queued' : 'cancelled';
       const at = this.now();
       const live = this.store.getCampaign(job.campaignId);
@@ -877,6 +954,7 @@ class Scheduler extends EventEmitter {
           const retryDelayMs = Math.max(Math.min(3600000, policy.delaySeconds * 1000 * (policy.backoffFactor ?? 2) ** (attempt - 1)), (this.adapter.minimumSpacingSeconds ?? 3) * 1000);
           this._persist('updateJob', job.id, { status: 'queued', nextAttemptAt: this.now() + retryDelayMs, error: 'Falha confirmada anterior à submissão; tentativa limitada pendente.' });
           this._diagnostic(job, code, 'Falha temporária anterior à submissão.', attempt, 'Nova tentativa limitada, com intervalo progressivo.');
+          releaseTurn();
           await this._wait(retryDelayMs, signal);
           continue;
         }
@@ -894,6 +972,7 @@ class Scheduler extends EventEmitter {
         this.emit('change');
         return status;
       }
+      } finally { releaseTurn(); }
     }
     return 'failed';
   }
@@ -975,7 +1054,7 @@ class Scheduler extends EventEmitter {
         const write = () => { this._persist('insertRound', round); const saved = this._persist('insertJob', job); if (saved) Object.assign(job, saved); this._persist('updateJob', current.id, { manualResendJobId: job.id, reviewedBy: userId, reviewedAt: at, reviewDecision: 'resend-with-duplication-risk' }); };
         if (typeof this.store.transaction === 'function') this.store.transaction(write); else write();
         if (this.lastSubmissionAt !== null) await this._wait(Math.max(0, (campaign.spacingSeconds || 3) * 1000 - (this.now() - this.lastSubmissionAt)), context.signal);
-        const status = await this._sendJob(job, context.signal);
+        const status = await this._sendJob(job, context.signal, { ownsSubmissionTurn: true });
         if (status === 'cancelled') this._persist('updateJob', job.id, { status, resultAt: this.now(), error: 'Reenvio cancelado antes de submeter.' });
         this._persist('updateRound', round.id, { status: 'completed', finishedAt: this.now() });
         return this.store.getJob(job.id);

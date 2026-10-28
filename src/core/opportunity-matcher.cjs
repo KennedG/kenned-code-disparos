@@ -18,7 +18,7 @@ const modelPatterns = [
 function closureRequest(text) {
   const value = normalize(text).replace(/\s+/g, ' ').trim();
   const closures = new Set(['ja consegui', 'consegui', 'achei', 'nao preciso mais', 'pode cancelar', 'pode cancelar o pedido', 'pode cancelar minha procura', 'ja achei', 'ja encontrei', 'encontrei']);
-  return closures.has(value) ? { closure: true, closureType: value, recognized: false, complete: false, models: [], reviewReasons: [], intentKey: null, familyKey: null } : null;
+  return closures.has(value) ? { closure: true, closureType: value, recognized: false, complete: false, safe: false, needsReview: false, models: [], reviewReasons: [], intentConfidence: 'none', intentReasons: ['request_closed'], intentKey: null, familyKey: null } : null;
 }
 
 function priceToCents(value) {
@@ -73,7 +73,8 @@ function parseSpec(model, tail, prefix, aliases) {
   else if (batteries.length === 1) minBattery = batteries[0];
   rest = rest.replace(/\b(?:bateria|saude(?: da bateria)?|battery)\s*(?:minima|minimo|min|de|acima de|a partir de)?\s*\d{1,3}\s*(?:por cento)?\b/g, ' ');
   rest = rest.replace(/\b(32|64|128|256|512|1024|2048)\b(?!\s*(?:gb|tb)\b)/g, '$1 gb');
-  rest = rest.replace(/\b(?:alguem|quem|tem|teria|consegue|conseguiria|procuro|procurando|busco|buscando|preciso|precisando|quero|queria|necessito|de|um|uma|algum|alguma|por favor|favor|bom dia|boa tarde|boa noite|pessoal|galera|para hoje|hoje|ai|ainda|com|e|ou)\b/g, ' ').replace(/\s+/g, ' ').trim();
+  rest = rest.replace(/\b(?:para (?:um )?cliente|para meu cliente|pronta entrega|disponivel|disponiveis|urgente)\b/g, ' ');
+  rest = rest.replace(/\b(?:alguem|quem|tem|teria|consegue|conseguiria|procuro|procurando|busco|buscando|preciso|precisando|quero|queria|necessito|compro|compraria|comprar|voces|voce|vcs|vc|de|um|uma|algum|alguma|por favor|favor|bom dia|boa tarde|boa noite|pessoal|galera|para hoje|hoje|ai|ainda|com|e|ou)\b/g, ' ').replace(/\s+/g, ' ').trim();
   const query = parseQuery(`${model} ${rest}`, { aliases });
   if (!query.valid) reasons.push(...query.errors.map(() => 'request_constraints_unclear'));
   const knownStorages = query.storageGB == null || CAPACITIES.has(query.storageGB) || /\btb\b/.test(rest);
@@ -87,26 +88,52 @@ function parseSpec(model, tail, prefix, aliases) {
   };
 }
 
+function classifyPurchaseIntent(raw, { text, spans, models } = {}) {
+  // A question mark alone is not buying intent. Advertisements, technical
+  // questions and opinion requests can mention the same exact model as a
+  // genuine search. Keep every decision deterministic and explainable.
+  const body = text ?? requestInput(String(raw ?? ''));
+  const references = spans ?? modelSpans(body);
+  const candidates = models ?? [];
+  const result = (confidence, code, recognized = confidence !== 'none') => ({ intentConfidence: confidence, intentReasons: [code], recognized });
+  if (!references.length) return result('none', 'model_not_recognized');
+  const procurement = /\b(?:quem|alguem|voces|voce|vcs|vc)\s+(?:ai\s+)?(?:tem|teria|consegue|conseguiria)\b/.test(body);
+  const explicit = /\b(?:procuro|procurando|busco|buscando|preciso|precisando|necessito|compro|compraria|quero|queria|comprar)\b/.test(body);
+  const first = references[0], last = references.at(-1);
+  const directQuestion = /\b(?:tem|teria|consegue|conseguiria)\s+(?:um\s+|uma\s+|algum\s+|alguma\s+)?$/.test(body.slice(0, first.start).trim()) || /^\s*(?:quem\s+|alguem\s+)?(?:tem|teria)\b/.test(body.slice(last.end));
+  const buying = procurement || explicit || directQuestion;
+  if (/\b(?:nao quero|nao preciso(?: mais)?|nao procuro|nao estou (?:mais )?procurando|ja consegui|ja achei|ja encontrei|pode cancelar)\b/.test(body)) return result('none', 'negative_or_closed_request');
+  if (/\b(?:vale a pena|compensa|qual (?:e )?(?:o )?melhor|recomenda|recomendam|opiniao|comparacao|comparando|comparar|versus|vs|diferenca|quanto vale|preco de revenda|por quanto (?:vendo|revendo)|quero saber|queria saber|preciso saber|como (?:usar|configurar|formatar|resetar|desbloquear|arrumar))\b/.test(body)) return result('none', 'discussion_not_purchase');
+  if (/\b(?:conserto|consertar|reparo|reparar|assistencia|assistencia tecnica|desbloqueio|desbloquear|display|carcaca|pelicula|capinha|carregador|cabo|acessorio|acessorios)\b/.test(body) || /\b(?:troca|trocar|trocando)\s+(?:(?:a|o|de|do|da)\s+)*(?:tela|bateria|camera|conector)\b/.test(body) || /\b(?:tela|bateria|camera|conector)\s+(?:(?:de|do|da)\s+)?(?:iphone|samsung|galaxy)\b/.test(body)) return result('none', 'service_or_accessory_not_phone_request');
+  if (/\b(?:tem (?:um )?defeito|tem problema|esta com problema|nao liga|nao carrega|esquentando|travando|parou de funcionar)\b/.test(body)) return result(buying ? 'ambiguous' : 'none', 'technical_context_needs_review');
+  const seller = /\b(?:tenho|vendo|vendendo|venda|a vista|parcelas?|entrada|quem quer|alguem quer|tem interesse|estou com)\b/.test(body) || !buying && /\b(?:disponivel|disponiveis|pronta entrega)\b/.test(body);
+  const statedPrice = /\br\s*\$/i.test(raw) && !/\bmaxbudget\b/.test(body);
+  if (seller || statedPrice) return result(buying && !/\b(?:quem quer|alguem quer|tem interesse)\b/.test(body) ? 'ambiguous' : 'none', 'seller_or_mixed_intent');
+  if (buying) return result('high', explicit ? 'explicit_purchase_request' : 'availability_request');
+  // Accepted shop shorthand must contain nothing beyond known product
+  // constraints and a question mark. Unknown words are retained for review.
+  if (/\?/.test(raw) && candidates.length && candidates.every(model => model.complete)) return result('high', 'product_question_shorthand');
+  if (/\?/.test(raw)) return result('ambiguous', 'purchase_intent_unclear');
+  return result('none', 'no_purchase_intent');
+}
+
 function parseRequest(raw, { aliases } = {}) {
-  if (typeof raw !== 'string' || raw.length > MAX_REQUEST) return { recognized: false, complete: false, models: [], reviewReasons: ['request_too_long'], intentKey: null, familyKey: null };
+  if (typeof raw !== 'string' || raw.length > MAX_REQUEST) return { recognized: false, complete: false, safe: false, needsReview: false, models: [], reviewReasons: ['request_too_long'], intentConfidence: 'none', intentReasons: ['request_too_long'], intentKey: null, familyKey: null };
   const closure = closureRequest(raw); if (closure) return closure;
   const text = requestInput(raw, aliases), spans = modelSpans(text);
-  if (!spans.length) return { recognized: false, complete: false, models: [], reviewReasons: ['model_not_recognized'], intentKey: null, familyKey: null, closure: false };
-  const hasQuestion = /\?/.test(raw) || /\b(?:alguem|quem|tem|teria|procuro|procurando|busco|buscando|preciso|precisando|quero|queria|necessito|consegue)\b/.test(text);
-  // An advertisement is not a purchase request merely because it names a
-  // phone. Explicit requests are still recognized when they include a budget.
-  const looksLikeAdvertisement = /\br\s*\$/i.test(raw) && !/\bmaxbudget\b/.test(text) || /\b(?:vendo|vendendo|disponivel|pronta entrega|a vista|parcelas?|entrada)\b/.test(text);
-  const recognized = hasQuestion && (!looksLikeAdvertisement || /\b(?:procuro|preciso|busco|quero|queria)\b/.test(text));
+  if (!spans.length) return { recognized: false, complete: false, safe: false, needsReview: false, models: [], reviewReasons: ['model_not_recognized'], intentConfidence: 'none', intentReasons: ['model_not_recognized'], intentKey: null, familyKey: null, closure: false };
   const models = spans.slice(0, 10).map((span, index) => {
     const prefix = text.slice(index ? spans[index - 1].end : 0, span.start);
     let tail = text.slice(span.end, spans[index + 1]?.start ?? text.length);
     if (spans[index + 1]) tail = tail.replace(/\b(?:e|ou)\s+quantidadepedido\s+\d+\s*$/, ' ');
     return parseSpec(span.text, index ? tail : `${prefix} ${tail}`, index ? prefix : '', aliases);
   });
-  const reasons = [...new Set(models.flatMap(model => model.reviewReasons))];
+  const intent = classifyPurchaseIntent(raw, { text, spans, models });
+  const reasons = [...new Set([...models.flatMap(model => model.reviewReasons), ...(intent.intentConfidence === 'high' ? [] : intent.intentReasons)])];
   if (spans.length > 10) reasons.push('too_many_requested_models');
   const canonical = models.map(model => [model.modelKey, model.storageGB, model.colorKey, model.condition, model.minBattery, model.maxPriceCents, model.quantity]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-  return { recognized, complete: recognized && reasons.length === 0 && models.every(model => model.complete), models,
+  const complete = intent.recognized && intent.intentConfidence === 'high' && reasons.length === 0 && models.every(model => model.complete);
+  return { ...intent, complete, safe: complete, needsReview: intent.recognized && !complete, models,
     reviewReasons: reasons, intentKey: digest(canonical), familyKey: digest([...new Set(models.map(model => model.modelKey))].sort()), closure: false,
     originalText: raw };
 }
@@ -182,13 +209,13 @@ function parseCampaignOffer(item = {}, campaign = {}, media = {}, options = {}) 
     }
     const mediaFingerprint = [media?.sha256, item.mediaFingerprint, media?.hash].find(value => typeof value === 'string' && /^[a-f\d]{64}$/i.test(value)) || null;
     const candidate = { ...offer, ...(parsed.length === 1 ? { originalExcerpt: rawText } : {}), ...identity, id: identity.offerKey, offerId: identity.offerKey, campaignId: campaign.id ?? null, itemId: item.id ?? null,
-      rawText, contentFingerprint: materialFingerprint(rawText), mediaFingerprint, available, availabilityConfirmedAt, quantityAvailable, originalAt: timestamp(options.originalAt ?? item.sourceOriginalAt ?? item.originalAt) };
+      rawText, contentFingerprint: materialFingerprint(rawText), mediaFingerprint, available, availabilityConditional: conditionalAvailability, availabilityConfirmedAt, quantityAvailable, originalAt: timestamp(options.originalAt ?? item.sourceOriginalAt ?? item.originalAt) };
     candidate.offerRevision = digest([offer.modelKey, offer.storageGB, offer.colorKey, offer.condition, offer.batteryPercent, offer.priceCents, offer.priceKind, rawText, quantityAvailable]);
     return candidate;
   });
 }
 
-function matchOffer(spec, offer, { now = Date.now(), availabilityMaxAgeMinutes = 120, availabilityTTL } = {}) {
+function matchOffer(spec, offer, { now = Date.now(), availabilityMaxAgeMinutes = 120, availabilityTTL, availabilityMode = 'confirmed' } = {}) {
   const blocked = (code, reason, needsReview = false) => ({ eligible: false, code, reason, needsReview });
   if (!spec?.modelKey || spec.complete === false || spec.reviewReasons?.length) return blocked('REQUEST_NEEDS_REVIEW', 'O pedido precisa de revisão antes de uma resposta automática.', true);
   if (!offer?.modelKey || spec.modelKey !== offer.modelKey) return blocked('MODEL_MISMATCH', 'O modelo ou a versão é diferente do pedido.');
@@ -202,15 +229,19 @@ function matchOffer(spec, offer, { now = Date.now(), availabilityMaxAgeMinutes =
   if (offer.confidence !== 'confirmed' || !Number.isSafeInteger(offer.priceCents) || offer.priceCents <= 0 || offer.priceKind !== 'cash') return blocked('TOTAL_PRICE_UNCONFIRMED', 'O preço total à vista não está confirmado.', true);
   const maxPrice = spec.maxPriceCents ?? spec.priceMaxCents;
   if (maxPrice != null && offer.priceCents > maxPrice) return blocked('PRICE_TOO_HIGH', 'O preço está acima do orçamento solicitado.');
-  if (offer.unavailable || ['unavailable', 'deleted', 'cancelled'].includes(offer.status) || offer.available === false || offer.quantityAvailable === 0) return blocked('OFFER_UNAVAILABLE', 'A oferta não está disponível.');
-  if (offer.available !== true) return blocked('AVAILABILITY_UNCONFIRMED', 'Disponibilidade precisa de confirmação.', true);
-  const at = timestamp(offer.availabilityConfirmedAt);
-  const maxAgeMs = availabilityTTL ?? Number(availabilityMaxAgeMinutes) * 60000;
-  if (!at || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0 || at > now + 30000 || now - at > maxAgeMs) return blocked('AVAILABILITY_STALE', 'Disponibilidade precisa de confirmação: a última atualização venceu ou não tem horário confiável.', true);
+  if (offer.unavailable || offer.captureDeleted === true || ['unavailable', 'deleted', 'cancelled', 'sold', 'reserved'].includes(offer.status) || offer.available === false || offer.quantityAvailable === 0) return blocked('OFFER_UNAVAILABLE', 'A oferta não está disponível.');
+  if (offer.available !== true || offer.availabilityConditional === true) return blocked('AVAILABILITY_UNCONFIRMED', 'Disponibilidade precisa de confirmação.', true);
+  const campaignMode = availabilityMode === 'campaign';
+  if (campaignMode && offer.campaignEligible !== true) return blocked('CAMPAIGN_ITEM_UNCONFIRMED', 'A oferta precisa pertencer a uma campanha selecionada e continuar habilitada.', true);
+  if (!campaignMode) {
+    const at = timestamp(offer.availabilityConfirmedAt);
+    const maxAgeMs = availabilityTTL ?? Number(availabilityMaxAgeMinutes) * 60000;
+    if (!at || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0 || at > now + 30000 || now - at > maxAgeMs) return blocked('AVAILABILITY_STALE', 'Disponibilidade precisa de confirmação: a última atualização venceu ou não tem horário confiável.', true);
+  }
   if (spec.quantity > 1 && !Number.isSafeInteger(offer.quantityAvailable)) return blocked('QUANTITY_UNKNOWN', 'A quantidade disponível não está confirmada.', true);
   if (spec.quantity > 1 && offer.quantityAvailable < spec.quantity) return blocked('QUANTITY_INSUFFICIENT', 'A quantidade disponível é menor que a solicitada.');
-  if (offer.identityConfidence !== 'verified') return blocked('OFFER_IDENTITY_UNCONFIRMED', 'A unidade ou referência original da oferta precisa de confirmação.', true);
-  return { eligible: true, code: 'MATCH_CONFIRMED', reason: 'Pedido e oferta compatíveis com disponibilidade confirmada.', needsReview: false };
+  if (offer.identityConfidence !== 'verified' && !(campaignMode && offer.identityConfidence === 'campaign')) return blocked('OFFER_IDENTITY_UNCONFIRMED', 'A unidade ou referência original da oferta precisa de confirmação.', true);
+  return { eligible: true, code: 'MATCH_CONFIRMED', reason: campaignMode ? 'Pedido exato e item habilitado em uma campanha selecionada.' : 'Pedido e oferta compatíveis com disponibilidade confirmada.', needsReview: false };
 }
 
-module.exports = { parseRequest, closureRequest, parseCampaignOffer, matchOffer, stableOfferIdentity };
+module.exports = { parseRequest, classifyPurchaseIntent, closureRequest, parseCampaignOffer, matchOffer, stableOfferIdentity };

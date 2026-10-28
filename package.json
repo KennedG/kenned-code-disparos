@@ -5,13 +5,6 @@
   "main": "src/main.cjs",
   "author": "Kenned Code Disparos",
   "license": "MIT",
-  "scripts": {
-    "start": "electron .",
-    "test": "node scripts/test.cjs",
-    "test:ui": "node scripts/smoke-ui.cjs",
-    "dist:win": "node scripts/build-win.cjs",
-    "check": "node scripts/check.cjs"
-  },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "exceljs": "4.4.0",
@@ -19,58 +12,5 @@
     "qrcode": "^1.5.4",
     "stream-json": "1.9.1"
   },
-  "devDependencies": {
-    "@playwright/test": "^1.56.0",
-    "electron": "44.5.1",
-    "electron-builder": "^26.0.12"
-  },
-  "build": {
-    "appId": "br.com.megadisparos.desktop",
-    "productName": "Kenned Code Disparos",
-    "compression": "maximum",
-    "publish": [],
-    "asar": true,
-    "afterPack": "scripts/ownership-manifest.cjs",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "src/**/*",
-      "assets/**/*",
-      "package.json",
-      "docs/**/*"
-    ],
-    "asarUnpack": [
-      "node_modules/whatsapp-rust-bridge/**/*",
-      "node_modules/@whiskeysockets/baileys/node_modules/whatsapp-rust-bridge/**/*"
-    ],
-    "win": {
-      "target": [
-        "nsis"
-      ],
-      "icon": "assets/icon.ico",
-      "signExecutable": false,
-      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Recuperacao-${arch}.exe"
-    },
-    "nsis": {
-      "script": "scripts/installer.nsi",
-      "differentialPackage": false,
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Kenned Code Disparos",
-      "deleteAppDataOnUninstall": false,
-      "installerLanguages": [
-        "pt_BR"
-      ],
-      "language": "1046"
-    },
-    "electronLanguages": [
-      "pt-BR",
-      "en-US"
-    ]
-  },
-  "releaseRevision": "recuperacao-r2"
+  "releaseRevision": "oportunidades-r3"
 }

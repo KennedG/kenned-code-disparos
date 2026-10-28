@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const { randomUUID, createHash, timingSafeEqual } = require('node:crypto');
 const { normalizePhone } = require('./phone.cjs');
 const { parseRequest, parseCampaignOffer, matchOffer } = require('./opportunity-matcher.cjs');
+const { assessCampaignItem, campaignItemFingerprint } = require('./opportunity-campaign.cjs');
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const list = value => Array.isArray(value) ? value : value?.items || [];
@@ -16,7 +17,7 @@ const MONEY = cents => (cents / 100).toLocaleString('pt-BR', { style: 'currency'
 
 function normalizeOpportunityConfig(input = {}, old = {}, now = Date.now(), actorId = null) {
   const out = { enabled: false, monitoredGroupIds: [], campaignIds: [], mode: 'evaluation', automatic: false, evaluation: true,
-    repeatHours: 24, contactIntervalMinutes: 30, maxPerDay: 3, validityMinutes: 120, availabilityMaxAgeMinutes: 120,
+    repeatHours: 24, contactIntervalMinutes: 30, maxPerDay: 3, validityMinutes: 120, availabilityMaxAgeMinutes: 120, availabilityMode: 'campaign',
     automaticOfferLimit: 1, autoMaxOffers: 1, multiModelMax: 5, requestMaxModels: 5, priority: 'cashAscending', timezone: 'America/Sao_Paulo',
     retryMax: 2, retryIntervalSeconds: 30, sound: { enabled: true, volume: 70, durationSeconds: 2, minIntervalSeconds: 30, burstSeconds: 2,
       quiet: { enabled: false, start: '22:00', end: '08:00' } }, ...structuredClone(old), ...structuredClone(input) };
@@ -25,6 +26,7 @@ function normalizeOpportunityConfig(input = {}, old = {}, now = Date.now(), acto
   if (Object.hasOwn(input, 'mode')) { if (!['evaluation', 'manual', 'automatic'].includes(input.mode)) throw error('Modo de oportunidades inválido.', 'OPPORTUNITY_CONFIG_INVALID'); out.automatic = input.mode === 'automatic'; out.evaluation = input.mode === 'evaluation'; }
   else if (Object.hasOwn(input, 'automatic') || Object.hasOwn(input, 'evaluation')) out.mode = out.automatic && !out.evaluation ? 'automatic' : out.evaluation ? 'evaluation' : 'manual';
   out.automatic = out.mode === 'automatic'; out.evaluation = out.mode === 'evaluation'; if (out.priority === 'priceAsc') out.priority = 'cashAscending';
+  if (!['campaign', 'confirmed'].includes(out.availabilityMode)) throw error('Origem da disponibilidade inválida.', 'OPPORTUNITY_CONFIG_INVALID');
   for (const key of ['monitoredGroupIds', 'campaignIds']) { if (!Array.isArray(out[key]) || out[key].length > 1000 || out[key].some(v => typeof v !== 'string' || !v || v.length > 512)) throw error('Selecione identificadores válidos.', 'OPPORTUNITY_CONFIG_INVALID'); out[key] = [...new Set(out[key])]; }
   if (Object.hasOwn(input, 'autoMaxOffers') && !Object.hasOwn(input, 'automaticOfferLimit')) out.automaticOfferLimit = input.autoMaxOffers;
   if (Object.hasOwn(input, 'requestMaxModels') && !Object.hasOwn(input, 'multiModelMax')) out.multiModelMax = input.requestMaxModels;
@@ -61,6 +63,7 @@ class OpportunityService extends EventEmitter {
     super(); if (!store?.ingestOpportunity || !store?.reserveOpportunitySend) throw new Error('Armazenamento persistente de oportunidades obrigatório.');
     Object.assign(this, { store, adapter, scheduler, now, assertCanCapture, assertCanOperate, assertOwnerPermissions, isAutomationStopped, onLocalAlert, sleep });
     this.started = false; this.closed = false; this.suspended = false; this.pump = null; this.notifyIds = new Set(); this.controllers = new Set();
+    this.offerIndex = null; this.offerParseCount = 0; this.freshOpportunityIds = new Set(); this.dueTimer = null;
     this.listener = ctx => { try { this.handleIncoming(ctx); } catch (e) { this._failure(e); } };
     this.statusListener = () => { this._schedulePump(); this.emit('change'); };
     this.receiptListener = receipt => this._receipt(receipt);
@@ -80,10 +83,10 @@ class OpportunityService extends EventEmitter {
   _detach() { this.adapter?.off('opportunityMessage', this.listener); this.adapter?.off('opportunityMessageUpdated', this.updateListener); this.adapter?.off('opportunityMessageDeleted', this.deleteListener); this.adapter?.off('status', this.statusListener); this.adapter?.off('receipt', this.receiptListener); }
   _configure() { const c = this._config(); this.adapter?.configureOpportunityCapture?.({ enabled: c.enabled && !this.suspended && !this.closed, monitoredGroupIds: c.monitoredGroupIds, allowOwnMessages: c.allowOwnMessages, activatedAt: c.enabledAt }); }
   start() { if (this.started || this.closed) return; this.started = true; this.store.recoverOpportunityTasks?.(this.now()); this._attach(); this._configure(); this.timer = setInterval(() => { if (!this.closed) { this._expire(); this._schedulePump(); } }, 15_000); this.timer.unref?.(); this._schedulePump(); }
-  async stop() { if (this.closed) return; this.closed = true; clearInterval(this.timer); clearTimeout(this.notifyTimer); this._detach(); this._configure(); for (const controller of this.controllers) controller.abort(); await this.pump?.catch(() => {}); }
+  async stop() { if (this.closed) return; this.closed = true; clearInterval(this.timer); clearTimeout(this.dueTimer); clearTimeout(this.notifyTimer); this._detach(); this._configure(); for (const controller of this.controllers) controller.abort(); await this.pump?.catch(() => {}); }
   shutdown() { return this.stop(); }
-  setAdapter(adapter) { this._detach(); for (const controller of this.controllers) controller.abort(); this.adapter = adapter; if (this.started) this._attach(); this._configure(); this._schedulePump(); }
-  async suspendCapture() { this.suspended = true; this._configure(); for (const controller of this.controllers) controller.abort(); await this.pump?.catch(() => {}); }
+  setAdapter(adapter) { this._detach(); for (const controller of this.controllers) controller.abort(); this.adapter = adapter; this.offerIndex = null; this.freshOpportunityIds.clear(); if (this.started) this._attach(); this._configure(); this._schedulePump(); }
+  async suspendCapture() { this.suspended = true; clearTimeout(this.dueTimer); this._configure(); for (const controller of this.controllers) controller.abort(); await this.pump?.catch(() => {}); }
   resumeCapture() { this.suspended = false; this._configure(); this._schedulePump(); }
   cancelAutomatic(reason = 'Envios automáticos interrompidos.') { const result = this.store.cancelOpportunityTasks({ automaticOnly: true, now: this.now(), reason }); for (const controller of this.controllers) controller.abort(); this.emit('change'); return result.cancelled; }
   saveConfig(input, actorId) {
@@ -92,7 +95,7 @@ class OpportunityService extends EventEmitter {
     for (const id of c.monitoredGroupIds) { const g = groups.get(id); if (!g || Boolean(g.simulation) !== simulated || g.available === false || (simulated ? !/@simulation$/.test(id) : !/@g\.us$/.test(id))) throw error('Selecione grupos disponíveis no modo atual.', 'OPPORTUNITY_GROUP_INVALID'); }
     const campaigns = new Set(this.store.listCampaigns().map(v => v.id)); if (c.campaignIds.some(id => !campaigns.has(id))) throw error('Selecione campanhas existentes.', 'OPPORTUNITY_CAMPAIGN_INVALID');
     if (c.enabled && this.assertCanCapture(actorId) === false || c.automatic && this.assertOwnerPermissions(actorId, 'automatic') === false) throw error('Sem permissão para ativar oportunidades.', 'OPPORTUNITY_FORBIDDEN');
-    this.store.setOpportunityConfig(c); if (!c.enabled || !c.automatic) this.cancelAutomatic('Modo automático desativado.'); this._configure(); this._schedulePump(); this.emit('change'); return this._config();
+    this.store.setOpportunityConfig(c); this.offerIndex = null; this.freshOpportunityIds.clear(); if (!c.enabled || !c.automatic) this.cancelAutomatic('Modo automático desativado.'); this._configure(); this._schedulePump(); this.emit('change'); return this._config();
   }
   _identity(ctx) {
     if (ctx.identityVerified !== true || ctx.identityAmbiguous === true) return null;
@@ -123,7 +126,7 @@ class OpportunityService extends EventEmitter {
     const result = this.store.ingestOpportunity({ event: { ...identity, chatId: groupId, groupId, groupName: this.store.getGroup?.(groupId)?.name || '', messageId: ctx.messageId,
       originalAt, text: ctx.text, quotedMessageId: ctx.quotedMessageId || null }, request }, this.now());
     const op = result.opportunity; this._trace(op?.id, 'received', result.duplicate ? 'OPPORTUNITY_DUPLICATE_EVENT' : result.grouped ? 'OPPORTUNITY_GROUPED' : 'OPPORTUNITY_RECEIVED', result.duplicate ? 'Evento já registrado; nenhuma nova resposta.' : result.grouped ? 'Pedido repetido agrupado com suas origens.' : 'Pedido registrado.', { opportunityId: op?.id, senderKey: identity.senderKey, messageId: ctx.messageId });
-    if (!result.duplicate && op) { this.evaluate(op.id, { automatic: !result.changedRelevant }); this.emit('change'); }
+    if (!result.duplicate && op) { this.lastProcessedAt = this.now(); this.lastMessageAt = originalAt; if (!result.grouped && originalAt >= this.now() - 60000 && c.automatic && !op.needsReview) this.freshOpportunityIds.add(op.id); this.evaluate(op.id, { automatic: !result.changedRelevant }); this.emit('change'); }
     return result;
   }
   handleUpdate(ctx) {
@@ -150,37 +153,71 @@ class OpportunityService extends EventEmitter {
     this._trace(opportunity.id, 'closed', 'OPPORTUNITY_REQUEST_CLOSED', 'Pedido encerrado pelo autor; tarefas não iniciadas canceladas.'); this.emit('change'); return { closed: true, opportunity: result };
   }
   _syncOffers() {
-    const c = this._config(), all = new Map();
-    for (const campaign of this.store.listCampaigns()) {
+    const c = this._config(), campaigns = this.store.listCampaigns({ ids: c.campaignIds }), frames = [], sources = new Map(), mediaRecords = new Map();
+    for (const campaign of campaigns) {
       if (!c.campaignIds.includes(campaign.id)) continue;
       for (const item of campaign.items || []) {
-        if (item.captureDeleted || item.ready === false) continue;
-        const source = item.sourcePublicationId && this.store.getSourcePublication?.(item.sourcePublicationId);
-        const media = item.mediaId && this.store.getMedia?.(item.mediaId);
-        for (const parsed of parseCampaignOffer(item, campaign, media, { originalAt: source?.originalAt, now: this.now() }) || []) {
-          const id = parsed.offerKey || parsed.offerId || parsed.id; if (!id) continue;
-          const candidate = { ...parsed, id, offerId: id, offerKey: id, campaignName: campaign.name, sourceMode: this._mode(), copyConflict: false, eligible: parsed.confidence === 'confirmed' && parsed.priceKind === 'cash' && Number.isInteger(parsed.priceCents) && parsed.priceCents > 0 }; 
-          candidate.sourceBlocker = null;
-          if (source && source.status !== 'ready') candidate.sourceBlocker = { code: source.status === 'removed' ? 'OFFER_SOURCE_REMOVED' : 'OFFER_SOURCE_NOT_READY', reason: source.status === 'removed' ? 'A publicação original foi retirada; a cópia não pode ser oferecida automaticamente.' : 'A publicação original está pendente ou em revisão; confirme o conteúdo antes de oferecer.' };
-          else if (source && (!Number.isSafeInteger(item.sourcePublicationRevision) || item.sourcePublicationRevision < source.revisionAt)) candidate.sourceBlocker = { code: 'OFFER_SOURCE_REVISION_STALE', reason: 'A publicação original foi atualizada; esta cópia precisa de revisão.' };
-          if (candidate.sourceBlocker) Object.assign(candidate, { eligible: false, available: source?.status === 'removed' ? false : null, availabilityConfirmedAt: null, identityConfidence: 'review' });
-          const prior = all.get(id);
-          if (!prior) all.set(id, candidate);
-          else {
-            const refs = [...(prior.campaignReferences || [{ campaignId: prior.campaignId, itemId: prior.itemId }]), { campaignId: candidate.campaignId, itemId: candidate.itemId }];
-            const conflict = prior.copyConflict || prior.offerRevision !== candidate.offerRevision || prior.available !== candidate.available || prior.quantityAvailable !== candidate.quantityAvailable;
-            if (conflict) all.set(id, { ...prior, copyConflict: true, campaignReferences: refs, available: prior.available === false || candidate.available === false ? false : null, eligible: false, identityConfidence: 'review', identityReason: 'conflicting_copies_of_original_offer', availabilityConfirmedAt: null });
-            else all.set(id, { ...((candidate.availabilityConfirmedAt || 0) > (prior.availabilityConfirmedAt || 0) ? candidate : prior), campaignReferences: refs });
-          }
+        if (item.sourcePublicationId && !sources.has(item.sourcePublicationId)) sources.set(item.sourcePublicationId, this.store.getSourcePublication?.(item.sourcePublicationId));
+        if (item.mediaId && !mediaRecords.has(item.mediaId)) mediaRecords.set(item.mediaId, this.store.getMedia?.(item.mediaId));
+        const source = sources.get(item.sourcePublicationId), media = mediaRecords.get(item.mediaId);
+        frames.push({ campaign, item, source, media, fingerprint: campaignItemFingerprint(item, campaign, { source, media }) });
+      }
+    }
+    const signature = hash([this._mode(), c.campaignIds, c.availabilityMode, frames.map(frame => [frame.campaign.id, frame.campaign.name, frame.fingerprint])]);
+    if (this.offerIndex?.signature === signature) return this.offerIndex.offers;
+    const all = new Map();
+    for (const { campaign, item, source, media, fingerprint } of frames) {
+      const assessment = assessCampaignItem(item, campaign, { source, media, availabilityMode: c.availabilityMode, now: this.now() });
+      this.offerParseCount++;
+      const parsedOffers = parseCampaignOffer(item, campaign, media, { originalAt: source?.originalAt, now: this.now() }) || [];
+      for (const parsed of parsedOffers) {
+        if (c.availabilityMode === 'campaign' && parsedOffers.length === 1 && parsed.identityConfidence !== 'verified' && assessment.identityReference) {
+          Object.assign(parsed, { id: assessment.identityReference, offerKey: assessment.identityReference, offerId: assessment.identityReference, identityConfidence: 'campaign', identityReason: 'campaign_item_reference' });
+        }
+        const id = parsed.offerKey || parsed.offerId || parsed.id; if (!id) continue;
+        const candidate = { ...parsed, id, offerId: id, offerKey: id, campaignName: campaign.name, sourceMode: this._mode(), copyConflict: false,
+          campaignItemFingerprint: fingerprint, availabilitySource: c.availabilityMode, opportunityAvailable: item.opportunityAvailable !== false, singleItemOffer: parsedOffers.length === 1,
+          campaignEligible: assessment.eligible && c.availabilityMode === 'campaign', mediaId: item.mediaId || null, mediaType: item.type,
+          eligible: assessment.eligible && parsed.confidence === 'confirmed' && parsed.priceKind === 'cash' && Number.isInteger(parsed.priceCents) && parsed.priceCents > 0,
+          sourceBlocker: assessment.blocker || null };
+        if (c.availabilityMode === 'campaign' && assessment.eligible) Object.assign(candidate, { available: parsed.available === false ? false : true, availabilityConfirmedAt: null, availabilityDeclared: true });
+        if (assessment.quantityAvailable !== null) candidate.quantityAvailable = assessment.quantityAvailable;
+        if (!assessment.eligible) Object.assign(candidate, { eligible: false, available: assessment.available, availabilityConfirmedAt: null, identityConfidence: 'review' });
+        const prior = all.get(id);
+        if (!prior) all.set(id, candidate);
+        else {
+          const refs = [...(prior.campaignReferences || [{ campaignId: prior.campaignId, itemId: prior.itemId }]), { campaignId: candidate.campaignId, itemId: candidate.itemId }];
+          const conflict = prior.copyConflict || prior.offerRevision !== candidate.offerRevision || prior.available !== candidate.available || prior.quantityAvailable !== candidate.quantityAvailable || Boolean(prior.sourceBlocker) !== Boolean(candidate.sourceBlocker);
+          if (conflict) all.set(id, { ...prior, copyConflict: true, campaignReferences: refs, available: prior.available === false || candidate.available === false ? false : null, eligible: false, campaignEligible: false, identityConfidence: 'review', identityReason: 'conflicting_copies_of_original_offer', availabilityConfirmedAt: null });
+          else all.set(id, { ...((candidate.availabilityConfirmedAt || 0) > (prior.availabilityConfirmedAt || 0) ? candidate : prior), campaignReferences: refs });
         }
       }
     }
     for (const candidate of all.values()) {
       const old = this.store.getOpportunityOffer(candidate.id);
-      if (!candidate.copyConflict && !candidate.sourceBlocker && old?.offerRevision === candidate.offerRevision && old.availabilityConfirmedAt && candidate.available !== false && (!candidate.availabilityConfirmedAt || old.availabilityConfirmedAt > candidate.availabilityConfirmedAt)) Object.assign(candidate, { available: old.available, availabilityConfirmedAt: old.availabilityConfirmedAt, quantityAvailable: old.quantityAvailable, ...(old.explicitUnitReference ? { explicitUnitReference: old.explicitUnitReference, identityConfidence: 'verified', identityReason: 'manual_unit_reference' } : {}) });
-      if (!old || ['offerRevision', 'available', 'availabilityConfirmedAt', 'quantityAvailable', 'identityConfidence', 'explicitUnitReference', 'contentFingerprint', 'mediaFingerprint', 'eligible', 'campaignId', 'itemId', 'copyConflict', 'campaignReferences', 'sourceBlocker'].some(key => JSON.stringify(old[key] ?? null) !== JSON.stringify(candidate[key] ?? null))) this.store.saveOpportunityOffer(candidate);
+      if (c.availabilityMode === 'confirmed' && !candidate.copyConflict && !candidate.sourceBlocker && old?.offerRevision === candidate.offerRevision && old.availabilityConfirmedAt && candidate.available !== false && (!candidate.availabilityConfirmedAt || old.availabilityConfirmedAt > candidate.availabilityConfirmedAt)) Object.assign(candidate, { available: old.available, availabilityConfirmedAt: old.availabilityConfirmedAt, quantityAvailable: old.quantityAvailable, ...(old.explicitUnitReference ? { explicitUnitReference: old.explicitUnitReference, identityConfidence: 'verified', identityReason: 'manual_unit_reference' } : {}) });
+      if (!old || ['offerRevision', 'available', 'availabilityConfirmedAt', 'quantityAvailable', 'identityConfidence', 'explicitUnitReference', 'contentFingerprint', 'mediaFingerprint', 'eligible', 'campaignId', 'itemId', 'copyConflict', 'campaignReferences', 'sourceBlocker', 'campaignItemFingerprint', 'availabilitySource', 'campaignEligible', 'opportunityAvailable'].some(key => JSON.stringify(old[key] ?? null) !== JSON.stringify(candidate[key] ?? null))) this.store.saveOpportunityOffer(candidate);
     }
-    return [...all.keys()].map(id => this.store.getOpportunityOffer(id));
+    const offers = [...all.keys()].map(id => this.store.getOpportunityOffer(id));
+    this.offerIndex = { signature, offers, indexedAt: this.now() }; return offers;
+  }
+  invalidateCampaignOffers({ reevaluate = false } = {}) {
+    this.offerIndex = null; const offers = this._syncOffers(); let evaluated = 0;
+    if (reevaluate && this._config().automatic && !this.isAutomationStopped()) {
+      for (const id of [...this.freshOpportunityIds]) {
+        const op = this.store.getOpportunity(id);
+        if (!op || op.status !== 'open' || op.needsReview || op.expiresAt <= this.now() || this.now() - op.originalAt > 60000) { this.freshOpportunityIds.delete(id); continue; }
+        this.evaluate(id, { automatic: true, offers }); evaluated++;
+      }
+    }
+    this._schedulePump(); this.emit('change'); return { indexed: offers.length, evaluated };
+  }
+  listCampaignOffers({ limit = 100, offset = 0 } = {}) {
+    const offers = this._syncOffers(), start = Math.max(0, Number(offset) || 0), size = Math.min(100, Math.max(1, Number(limit) || 100));
+    return { total: offers.length, items: offers.slice(start, start + size).map(offer => ({ offerId: offer.id, campaignId: offer.campaignId, itemId: offer.itemId,
+      campaignName: offer.campaignName, model: offer.model, storageGB: offer.storageGB ?? null, color: offer.color || null, condition: offer.condition || null,
+      text: offer.originalExcerpt || offer.excerpt || offer.rawText || '', priceCents: offer.priceCents ?? null, available: offer.available,
+      mediaId: offer.mediaId || null, opportunityAvailable: offer.opportunityAvailable, availabilityReason: offer.sourceBlocker?.reason || (offer.availabilitySource === 'campaign' ? 'Disponibilidade declarada pelo anúncio na campanha.' : 'Exige confirmação manual atualizada.'), availabilitySource: offer.availabilitySource })) };
   }
   _candidates(op, offers = this._syncOffers()) {
     const c = this._config(), models = op.request?.models || op.requests || [];
@@ -188,7 +225,7 @@ class OpportunityService extends EventEmitter {
       const matches = models.map(spec => {
         const sameModel = spec.modelKey && spec.modelKey === offer.modelKey;
         const blocker = sameModel && (offer.sourceBlocker || (offer.copyConflict ? { code: 'OFFER_COPY_CONFLICT', reason: 'Cópias da mesma referência apresentam conteúdo ou disponibilidade divergentes; revise as campanhas vinculadas.' } : null));
-        return { spec, match: blocker ? { eligible: false, needsReview: true, ...blocker } : matchOffer(spec, offer, { now: this.now(), availabilityMaxAgeMinutes: c.availabilityMaxAgeMinutes }) };
+        return { spec, match: blocker ? { eligible: false, needsReview: true, ...blocker } : matchOffer(spec, offer, { now: this.now(), availabilityMaxAgeMinutes: c.availabilityMaxAgeMinutes, availabilityMode: c.availabilityMode }) };
       });
       const best = matches.find(v => v.match.eligible) || matches.find(v => v.match.needsReview) || matches[0];
       const response = this.store.getOpportunityOfferSent?.(op.senderKey, offer.id) || (this.store.getOpportunitySentOffers?.(op.senderKey) || []).filter(v => v.offerId === offer.id && ['queued', 'sending', 'accepted', 'delivered', 'uncertain', 'outside'].includes(v.status)).at(-1);
@@ -230,7 +267,7 @@ class OpportunityService extends EventEmitter {
     const origins=this.store.listOpportunityOrigins(op.id),groups=new Set(origins.map(v=>v.chatId||v.groupId)),origin=origins.find(v=>!v.deleted)||origins[0],blockers=this._blockers(op,candidates,null,!candidates.length);
     const matched=candidates.find(v=>v.compatible===true),campaign=matched&&this.store.getCampaign(matched.campaignId),item=campaign?.items?.find(v=>v.id===matched.itemId);
     const matchPreview=matched&&campaign&&item?{offerId:matched.id,campaignId:campaign.id,campaignName:campaign.name,itemId:item.id,mediaId:item.mediaId||null,mediaType:item.type,model:matched.model,storageGB:matched.storageGB??null,color:matched.color??null,condition:matched.condition??null,priceCents:matched.priceCents,text:matched.originalExcerpt||matched.excerpt||matched.rawText||'',available:matched.available,availabilityConfirmedAt:matched.availabilityConfirmedAt,sentBefore:matched.sentBefore===true}:null;
-    return {...op,senderPhone:op.senderPhone||op.recipient||null,senderName:op.senderName||'',originalAt:op.originalAt||op.firstAt,requests:op.request?.models||[],originalText:origin?.text||'',originPreview:origin?{messageId:origin.messageId,groupId:origin.groupId||origin.chatId,groupName:origin.groupName||this.store.getGroup?.(origin.groupId||origin.chatId)?.name||'',originalAt:origin.originalAt,text:origin.text||''}:null,matchPreview,blockers,reason:blockers[0]?.reason||op.reviewReason||op.lastResponseReason||'',originCount:origins.length,groupCount:groups.size,groupedLabel:groups.size>1?`Pedido repetido em ${groups.size} grupos.`:null};
+    return {...op,senderPhone:op.senderPhone||op.recipient||null,senderName:op.senderName||'',originalAt:op.originalAt||op.firstAt,requests:op.request?.models||[],intentConfidence:op.request?.intentConfidence||null,intentReasons:op.request?.intentReasons||[],originalText:origin?.text||'',originPreview:origin?{messageId:origin.messageId,groupId:origin.groupId||origin.chatId,groupName:origin.groupName||this.store.getGroup?.(origin.groupId||origin.chatId)?.name||'',originalAt:origin.originalAt,text:origin.text||''}:null,matchPreview,blockers,reason:blockers[0]?.reason||op.reviewReason||op.lastResponseReason||'',originCount:origins.length,groupCount:groups.size,groupedLabel:groups.size>1?`Pedido repetido em ${groups.size} grupos.`:null};
   }
   _blockers(op, candidates = [], reservation, summary = false) {
     const reasons = []; if ((op.request?.models?.length || 0) > this._config().multiModelMax) reasons.push({ code: 'REQUEST_TOO_MANY_MODELS', reason: 'Pedido com vários modelos requer revisão.' }); const currentCheck = this.store.checkOpportunitySend?.({ opportunityId: op.id, offerIds: [], now: this.now(), automatic: true, evaluationOnly: true, automationAllowed: !this.isAutomationStopped() });
@@ -248,13 +285,13 @@ class OpportunityService extends EventEmitter {
   list(filters = {}, actorId) { this._assert(actorId, 'view'); this._expire(); const page = this.store.listOpportunities(filters),offers=this._syncOffers(); return { ...page, items: list(page).map(op => this._present(op,this._candidates(op,offers))) }; }
   invalidateCampaign(id) { this.previewGeneration=(this.previewGeneration||0)+1; const result=this.store.cancelOpportunityCampaign?.(id,this.now())||{cancelled:0,inProgress:0}; this.emit('change'); return result; }
   getDetail(id, actorId) { this._assert(actorId, 'view'); const result = this.evaluate(typeof id === 'object' ? id.id : id); return { ...result, origins: this.store.listOpportunityOrigins(result.opportunity.id), tasks: list(this.store.listOpportunityTasks({ opportunityId: result.opportunity.id, limit: 100 })) }; }
-  getState(actorId) { this._assert(actorId, 'view'); const config = this._config(); return { config, metrics: this.store.getOpportunityMetrics?.() || {}, monitor: { enabled: config.enabled, mode: config.mode, connection: this.adapter?.status?.state || 'disconnected', suspended: this.suspended, blockedReason: this.blockedReason || null }, queue: list(this.store.listOpportunityTasks({ status: 'queued', limit: 20 })) }; }
+  getState(actorId) { this._assert(actorId, 'view'); const config = this._config(), catalog = this.listCampaignOffers(), queue = list(this.store.listOpportunityTasks({ status: 'queued', limit: 20 })); return { config, metrics: this.store.getOpportunityMetrics?.() || {}, campaignOffers: catalog.items, campaignOfferTotal: catalog.total, monitor: { enabled: config.enabled, mode: config.mode, connection: this.adapter?.status?.state || 'disconnected', suspended: this.suspended, blockedReason: this.blockedReason || null, lastMessageAt: this.lastMessageAt || null, lastProcessedAt: this.lastProcessedAt || null }, queue, queueState: { connected: this.adapter?.status?.state === 'connected', busy: Boolean(this.pump), nextAttemptAt: this.store.getNextOpportunityTaskAt?.() ?? (queue.length ? Math.min(...queue.map(task => task.nextAttemptAt || this.now())) : null), minSpacingMs: Math.max(3, this.adapter?.minimumSpacingSeconds || 3) * 1000, blockedReason: this.blockedReason || null }, index: { indexedAt: this.offerIndex?.indexedAt || null, parsedItems: this.offerParseCount } }; }
   _previewData(id, offerIds, actorId, expiresAt, options = {}) {
     const { opportunity: op, candidates } = this.evaluate(id), c = this._config(), selected = offerIds.map(offerId => candidates.find(v => v.id === offerId));
     if (!offerIds.length || offerIds.length > c.multiModelMax || new Set(offerIds).size !== offerIds.length || selected.some(v => !v)) throw error('Selecione ofertas existentes e compatíveis.', 'OPPORTUNITY_SELECTION_INVALID');
     const warnings = [], blockers = this._blockers({ ...op, lastBlocker: null }, selected).filter(v => { if (options.reviewed === true && (v.code === 'REQUEST_CHANGED_REVIEW' || v.code === 'OP_REVIEW' || v.code === 'OP_EXPIRED' || v.code === 'REQUEST_EXPIRED' || v.code === 'REQUEST_CLOSED' && op.status === 'expired')) { warnings.push(v); return false; } return !['OFFER_ALREADY_SENT', 'OFFER_UPDATED_SENT', 'OP_OFFER_UPDATED', 'OP_OFFER_SENT', 'OP_OFFER_REPOST', 'OP_ALREADY_RESPONDED', 'OP_REPEAT', 'OP_UNCERTAIN', 'OP_PENDING', 'OP_INTERVAL', 'OP_DAILY_LIMIT'].includes(v.code) || options.duplicateRiskAcknowledged !== true; }); for (const offer of selected) if (!offer.eligible) { if (offer.compatible && offer.sentBefore && options.duplicateRiskAcknowledged === true) warnings.push(...offer.blockers); else blockers.push(...offer.blockers); }
     if (!op.recipient) blockers.push({ code: 'RECIPIENT_UNAVAILABLE', reason: 'Número real do interessado indisponível.' });
-    const payload = [this._mode(), actorId, op.id, op.request?.intentKey, op.expiresAt, op.status, op.needsReview, selected.map(v => [v.id, v.offerRevision, v.availabilityConfirmedAt, v.quantityAvailable, v.available]), configHash(c), options.reviewed === true, options.duplicateRiskAcknowledged === true, expiresAt];
+    const payload = [this._mode(), actorId, op.id, op.request?.intentKey, op.expiresAt, op.status, op.needsReview, selected.map(v => [v.id, v.offerRevision, v.availabilityConfirmedAt, v.quantityAvailable, v.available, v.campaignItemFingerprint, v.availabilitySource]), configHash(c), options.reviewed === true, options.duplicateRiskAcknowledged === true, expiresAt];
     return { opportunity: op, offers: selected, text: formatOpportunityResponse(op, selected), offerIds, blockers, warnings, reviewed: options.reviewed === true, duplicateRiskAcknowledged: options.duplicateRiskAcknowledged === true, canSend: !blockers.length, previewToken: `${expiresAt}:${hash(payload)}` };
   }
   preview(input, actorId) { this._assert(actorId, 'respond'); const id = typeof input === 'string' ? input : input.id; const details = this.evaluate(id); const ids = input.offerIds || details.candidates.filter(v => v.eligible).slice(0, 1).map(v => v.id); return this._previewData(id, ids, actorId, this.now() + 5 * 60000, input); }
@@ -280,9 +317,16 @@ class OpportunityService extends EventEmitter {
   outsideAnswer(id, actorId) { return this.action({ id, action: 'outsideAnswer' }, actorId); }
   mute(id, actorId) { return this.action({ id, action: 'mute' }, actorId); }
   reactivate(id, actorId) { return this.action({ id, action: 'reactivate' }, actorId); }
-  confirmAvailable(input, actorId) { this._assert(actorId, 'manage'); const id = input.offerId || input.id; if (input.quantity !== undefined && (!Number.isInteger(input.quantity) || input.quantity < 1 || input.quantity > 10000)) throw error('Quantidade disponível inválida.', 'OPPORTUNITY_AVAILABILITY_INVALID'); const result = this.store.confirmOpportunityOfferAvailable(id, { at: this.now(), quantity: input.quantity, unitReference: input.unitReference, actorId }); this.emit('change'); return result; }
+  confirmAvailable(input, actorId) { this._assert(actorId, 'manage'); const id = input.offerId || input.id; if (input.quantity !== undefined && (!Number.isInteger(input.quantity) || input.quantity < 1 || input.quantity > 10000)) throw error('Quantidade disponível inválida.', 'OPPORTUNITY_AVAILABILITY_INVALID'); const result = this.store.confirmOpportunityOfferAvailable(id, { at: this.now(), quantity: input.quantity, unitReference: input.unitReference, actorId }); this.offerIndex = null; this.emit('change'); return result; }
   _expire() { if (this.store.expireOpportunities) return this.store.expireOpportunities(this.now()); for (const op of list(this.store.listOpportunities({ status: ['open', 'queued'], limit: 1000 }))) if (op.expiresAt <= this.now()) { this.store.updateOpportunity(op.id, { status: 'expired', updatedAt: this.now() }); for (const task of list(this.store.listOpportunityTasks({ opportunityId: op.id, status: 'queued', limit: 1000 }))) this.store.updateOpportunityTask(task.id, { status: 'cancelled', code: 'OP_EXPIRED', reason: 'Pedido expirado.', resultAt: this.now() }); } }
-  _schedulePump() { if (this.pump) { this.pumpAgain = true; return this.pump; } if (!this.started || this.closed || this.suspended || this.adapter?.status?.state !== 'connected' || this.isAutomationStopped()) return this.pump; this.pump = Promise.resolve().then(() => this._drain()).catch(e => this._failure(e)).finally(() => { this.pump = null; const again = this.pumpAgain; this.pumpAgain = false; if (again) queueMicrotask(() => this._schedulePump()); }); return this.pump; }
+  _armPump() {
+    clearTimeout(this.dueTimer); this.dueTimer = null;
+    if (!this.started || this.closed || this.suspended || this.store.persistenceFailed || this.adapter?.status?.state !== 'connected' || this.isAutomationStopped()) return;
+    const next = this.store.getNextOpportunityTaskAt?.() ?? (() => { const tasks = list(this.store.listOpportunityTasks({ status: 'queued', limit: 1000 })); return tasks.length ? Math.min(...tasks.map(task => task.nextAttemptAt || this.now())) : null; })();
+    if (next == null) return;
+    this.dueTimer = setTimeout(() => { this.dueTimer = null; this._schedulePump(); }, Math.max(1, Math.min(2147483647, next - this.now()))); this.dueTimer.unref?.();
+  }
+  _schedulePump() { if (this.pump) { this.pumpAgain = true; return this.pump; } if (!this.started || this.closed || this.suspended || this.store.persistenceFailed || this.adapter?.status?.state !== 'connected' || this.isAutomationStopped()) return this.pump; clearTimeout(this.dueTimer); this.dueTimer = null; this.pump = Promise.resolve().then(() => this._drain()).catch(e => this._failure(e)).finally(() => { this.pump = null; const again = this.pumpAgain; this.pumpAgain = false; if (again) queueMicrotask(() => this._schedulePump()); else this._armPump(); }); return this.pump; }
   async waitForIdle() { await this.pump; if (!this.closed && !this.suspended && !this.isAutomationStopped() && this.adapter?.status?.state === 'connected') { this._schedulePump(); await this.pump; } }
   async _drain() {
     this._expire();
@@ -326,7 +370,13 @@ class OpportunityService extends EventEmitter {
       this._trace(task.id, 'sending', 'OPPORTUNITY_SENDING', 'Envio privado iniciado.', { taskId: task.id, opportunityId: task.opportunityId, recipient: resolved.jid, attempts: task.attempts });
       if (this.scheduler) this.scheduler.lastSubmissionAt = this.now();
       return this._bounded(ctx => { const beforeSubmit = () => this._finalGuard(task, adapter, mode, () => { ctx.beforeSubmit(); outer.beforeSubmit?.(); }); beforeSubmit();
-        return adapter.sendSearchText(resolved.jid, text, { clientMessageId: task.clientMessageId || task.clientId, traceId: task.id, beforeSubmit, signal: ctx.signal, timeoutMs: ctx.timeoutMs });
+        const options = { clientMessageId: task.clientMessageId || task.clientId, traceId: task.id, beforeSubmit, signal: ctx.signal, timeoutMs: ctx.timeoutMs };
+        const offer = offers.length === 1 && offers[0], campaign = offer && this.store.getCampaign(offer.campaignId), item = campaign?.items?.find(row => row.id === offer.itemId);
+        if (offer?.singleItemOffer && ['image', 'video', 'document'].includes(item?.type) && typeof adapter.sendPrivateContent === 'function') {
+          const media = this.store.getMedia?.(item.mediaId); if (!media) throw error('A mídia do anúncio não está disponível; revise a campanha.', 'OPPORTUNITY_MEDIA_MISSING', { definitive: true, submitted: false });
+          return adapter.sendPrivateContent(resolved.jid, { ...item, caption: text }, media, options);
+        }
+        return adapter.sendSearchText(resolved.jid, text, options);
       }, { signal: outer.signal, onLateResult: proof => this._proof(task.id, proof, adapter, mode), onLateError: e => { if (e.definitive && e.submitted === false) this._proof(task.id, { status: 'failed', confirmedFailure: true, code: e.code }, adapter, mode); } });
     };
     try {
@@ -372,5 +422,5 @@ class OpportunityService extends EventEmitter {
     this.emit('change');
   }
 }
-function configHash(c) { return hash({ enabled: c.enabled, automatic: c.automatic, evaluation: c.evaluation, repeatHours: c.repeatHours, contactIntervalMinutes: c.contactIntervalMinutes, maxPerDay: c.maxPerDay, validityMinutes: c.validityMinutes, availabilityMaxAgeMinutes: c.availabilityMaxAgeMinutes, campaignIds: c.campaignIds, monitoredGroupIds: c.monitoredGroupIds }); }
+function configHash(c) { return hash({ enabled: c.enabled, automatic: c.automatic, evaluation: c.evaluation, repeatHours: c.repeatHours, contactIntervalMinutes: c.contactIntervalMinutes, maxPerDay: c.maxPerDay, validityMinutes: c.validityMinutes, availabilityMaxAgeMinutes: c.availabilityMaxAgeMinutes, availabilityMode: c.availabilityMode, campaignIds: c.campaignIds, monitoredGroupIds: c.monitoredGroupIds }); }
 module.exports = { OpportunityService, normalizeOpportunityConfig, formatOpportunityResponse, localDay };

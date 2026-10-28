@@ -263,16 +263,36 @@ class SimulatedAdapter extends EventEmitter {
       deletedAt: context.deletedAt ?? Date.now(), source: 'simulation-only', mode: 'simulated', simulation: true });
   }
 
-  _beforeSubmit(callback){if(!callback)return;try{const result=callback();if(result&&typeof result.then==='function')throw Object.assign(new Error('A guarda final deve ser síncrona.'),{code:'WA_SUBMISSION_GUARD_ASYNC'});}catch(error){throw Object.assign(new Error(error.message||'Envio bloqueado antes da submissão.'),{code:error.code||'WA_SUBMISSION_BLOCKED',definitive:true,safeToRetry:false,submitted:false});}}
+  _beforeSubmit(callback){if(!callback)return;try{const result=callback();if(result===false)throw Object.assign(new Error('O envio foi bloqueado pela validação final.'),{code:'WA_SUBMISSION_GUARD_REJECTED'});if(result&&typeof result.then==='function')throw Object.assign(new Error('A guarda final deve ser síncrona.'),{code:'WA_SUBMISSION_GUARD_ASYNC'});}catch(error){throw Object.assign(new Error(error.message||'Envio bloqueado antes da submissão.'),{code:error.code||'WA_SUBMISSION_BLOCKED',definitive:true,safeToRetry:false,submitted:false});}}
   async sendPrivateContent(target,item,media,options={}){
-    if(item?.type==='text')return this.sendSearchText(target,item.text,options);
-    if(item?.type!=='document'||!media?.path)throw Object.assign(new Error('Documento gerenciado não informado.'),{safeToRetry:false,submitted:false});
-    const filename=fs.realpathSync(media.path),library=fs.realpathSync(path.join(this.store.dir,'media'));
-    if(!filename.startsWith(library+path.sep)||fs.lstatSync(media.path).isSymbolicLink())throw Object.assign(new Error('Documento fora da biblioteca gerenciada.'),{safeToRetry:false,submitted:false});
-    const bytes=fs.readFileSync(filename);if(!bytes.length||bytes.length>64*1024*1024||bytes.length!==media.size||createHash('sha256').update(bytes).digest('hex')!==media.sha256)throw Object.assign(new Error('O documento foi alterado ou está indisponível.'),{safeToRetry:false,submitted:false});
-    const result=await this.sendSearchText(target,item.caption||'Documento de busca — simulação',options);
-    const sent=this.sent.find(entry=>entry.messageId===result.messageId);if(sent)Object.assign(sent,{document:{name:media.name,mime:media.mime,size:media.size,sha256:media.sha256},mediaId:media.id,type:'document'});
-    return result;
+    const invalid = (message, code) => Object.assign(new Error(message), { code, definitive: true, safeToRetry: false, submitted: false });
+    this._assertSignal(options.signal);
+    if(this.status.mode!=='simulated'||this.status.simulation===false)throw invalid('Este transporte aceita somente simulação local.','SIM_MODE_REQUIRED');
+    const beforeSubmit = () => { this._assertSignal(options.signal); this._beforeSubmit(options.beforeSubmit); };
+    const submission = { ...options, clientMessageId: options.clientMessageId || item?.clientMessageId, beforeSubmit };
+    if(item?.type==='text')return this.sendSearchText(target,item.text,submission);
+    if(!['image','video','document'].includes(item?.type))throw invalid('Tipo de mídia privada não suportado na simulação.','SIM_MEDIA_TYPE');
+    if(!media?.path||!this.store?.dir)throw invalid('Mídia não encontrada na biblioteca gerenciada.','WA_MEDIA_MISSING');
+    if(item.caption!=null&&(typeof item.caption!=='string'||item.caption.length>16000))throw invalid('Legenda precisa ter até 16.000 caracteres.','WA_CAPTION_INVALID');
+    if(media.mime!=null&&typeof media.mime!=='string'||media.type&&media.type!==item.type||['image','video'].includes(item.type)&&media.mime&&!media.mime.startsWith(`${item.type}/`))throw invalid('O tipo da mídia não corresponde ao conteúdo selecionado.','SIM_MEDIA_TYPE');
+    let filename,library,stat,link;
+    try{filename=fs.realpathSync(media.path);library=fs.realpathSync(path.join(this.store.dir,'media'));stat=fs.statSync(filename);link=fs.lstatSync(media.path);}
+    catch{throw invalid('O arquivo da biblioteca não está disponível.','WA_MEDIA_MISSING');}
+    if(!filename.startsWith(library+path.sep)||link.isSymbolicLink())throw invalid('Mídia fora da biblioteca gerenciada.','WA_MEDIA_PATH');
+    if(!stat.isFile())throw invalid('O arquivo da biblioteca não é válido.','WA_MEDIA_INVALID');
+    if(!stat.size||stat.size>64*1024*1024)throw invalid('A mídia precisa ter entre 1 byte e 64 MB.','WA_MEDIA_SIZE');
+    let bytes;
+    try{bytes=fs.readFileSync(filename);}catch{throw invalid('Não foi possível ler a mídia gerenciada.','WA_MEDIA_READ');}
+    if(bytes.length!==media.size||typeof media.sha256!=='string'||createHash('sha256').update(bytes).digest('hex')!==media.sha256)throw invalid('A mídia foi alterada ou está indisponível. Importe novamente.','WA_MEDIA_CHANGED');
+    const caption=item.caption||'',existing=submission.clientMessageId&&this.sent.find(entry=>entry.messageId===submission.clientMessageId);
+    if(existing&&(existing.type!==item.type||existing.media?.sha256!==media.sha256||existing.text!==caption))throw invalid('Identificador de envio já utilizado por outro conteúdo.','SIM_MEDIA_OPERATION_CONFLICT');
+    // This is only the local text transport's receipt simulator: no socket,
+    // WhatsApp request, media upload or delivery confirmation exists here.
+    const result=await this.sendSearchText(target,caption||'Mídia privada — simulação',submission);
+    const metadata={name:media.name,mime:media.mime,size:media.size,sha256:media.sha256};
+    const sent=this.sent.find(entry=>entry.messageId===result.messageId);
+    if(sent)Object.assign(sent,{[item.type]:metadata,media:metadata,mediaId:media.id,type:item.type,text:caption,caption,mode:'simulated',simulation:true});
+    return {...result,mode:'simulated',simulation:true,confirmationScope:result.status==='confirmed'?'simulation-only':undefined};
   }
   async sendSearchDocument(target,document,options={}){return this.sendPrivateContent(target,{type:'document',caption:document.caption||''},document,options);}
   getSearchCapabilities() {
