@@ -1,12 +1,12 @@
-# Instalação e uso da versão 2.1.0
+# Instalação e uso da versão 2.2.0
 
 ## Instalar ou atualizar
 
-1. No Windows 10/11 de 64 bits, encerre a versão anterior pelo menu da bandeja e execute **Mega-Disparos-Setup-2.1.0-x64.exe**. Para atualizar, mantenha a pasta Mega Disparos usada anteriormente. O instalador inclui o runtime e cria o atalho no menu Iniciar; o atalho na área de trabalho é opcional.
+1. No Windows 10/11 de 64 bits, encerre a versão anterior pelo menu da bandeja e execute **Kenned-Code-Disparos-Setup-2.2.0-x64.exe**. Para atualizar, mantenha a pasta dedicada usada anteriormente: **Mega Disparos** continua aceita. Em uma instalação nova, a pasta padrão é **Kenned Code Disparos**. O atalho e a identidade passam a Kenned Code Disparos; o perfil local antigo é preservado. O instalador inclui o runtime e cria o atalho no menu Iniciar; o atalho na área de trabalho é opcional.
 2. No primeiro acesso, cadastre o **Dono** com usuário e senha de pelo menos 12 caracteres. Guarde os oito códigos de recuperação apresentados uma única vez, fora dos backups comuns. Em uma atualização, campanhas, mídias e configurações anteriores são preservadas e o banco é migrado com cópia de segurança em `backups`.
-3. Em uma instalação nova, teste em **Simulação**. A campanha de exemplo tem 15 grupos fictícios, rodadas a cada 10 minutos, espaçamento de 5 segundos e começa desativada. Campanhas anteriores em execução ficam pausadas após a reabertura.
+3. Em uma instalação nova, teste em **SIMULAÇÃO — DADOS FICTÍCIOS**. A campanha de exemplo tem 15 grupos fictícios, rodadas a cada 10 minutos, espaçamento de 5 segundos e começa desativada. Campanhas anteriores em execução ficam pausadas após a reabertura.
 
-A atualização para 2.1.0 preserva campanhas, arquivos, usuários e configurações. **BUSCAS começa desativado** e tem configurações próprias; selecionar grupos para monitorar ofertas não altera os destinos das campanhas.
+A atualização para 2.2.0 preserva campanhas, arquivos, usuários, configurações e credenciais. **BUSCAS começa desativado em instalação nova** e mantém as configurações existentes em atualização; selecionar grupos para monitorar ofertas não altera os destinos das campanhas.
 
 O Windows pode exibir um aviso de editor desconhecido, pois o instalador não tem assinatura de código. Não é preciso instalar Node.js ou usar terminal.
 
@@ -14,7 +14,7 @@ O Windows pode exibir um aviso de editor desconhecido, pois o instalador não te
 
 Abra **Campanhas → Nova campanha/Editar**. Adicione textos, emojis, links e arquivos, organize a ordem, selecione destinos e configure dias, janela de horário, datas e limites. Os arquivos são copiados para a biblioteca gerenciada. Escolha repetir o conjunto ou alternar um item por rodada. O intervalo entre rodadas e o espaçamento entre envios são campos diferentes. Salve, visualize a prévia e confirme a ativação; salvar nunca inicia os envios.
 
-Para conectar uma conta real, leia [INTEGRACAO.md](INTEGRACAO.md), selecione WhatsApp em **Configurações**, reconheça que Baileys é **não oficial** e salve. Use Conectar/Reconectar. No celular, leia o QR em WhatsApp → Aparelhos conectados → Conectar aparelho. Atualize **Grupos** e autorize apenas aqueles em que tem permissão para publicar. A campanha real deve selecionar os grupos carregados dessa conta, sem destinos simulados.
+Para conectar uma conta real, leia [INTEGRACAO.md](INTEGRACAO.md), selecione WhatsApp em **Configurações**, reconheça que Baileys é **não oficial** e salve. Use Conectar/Reconectar. No celular, leia o QR em WhatsApp → Aparelhos conectados → Conectar aparelho. Atualize **Grupos** e autorize apenas aqueles em que tem permissão para publicar. A campanha real deve selecionar os grupos carregados dessa conta, sem destinos simulados. Ao sair da simulação, suas campanhas, ofertas, contatos e indicadores fictícios ficam fora das telas e consultas do modo real. Os dados reais permanecem preservados. Sem grupos carregados, a tela mostra o estado vazio e a opção de sincronizar; falhas de conexão são exibidas sem substituição por grupos de exemplo.
 
 Em **Usuários**, vincule o telefone de cada operador, com país e DDD. Em Configurações, cadastre os números autorizados para o controle. De outro número cadastrado, em conversa privada com a conta conectada, envie `!mega ajuda` ou `!mega menu`. Ativação e alterações de campanhas ativas pedem resumo e confirmação com código de uso único. Os comandos respeitam as permissões do usuário; mensagens da própria conta, de grupos, encaminhadas ou sem identidade verificável são ignoradas.
 
@@ -30,10 +30,10 @@ Sair do login protege a interface; campanhas já ativadas continuam no serviço 
 
 1. Entre com o **Dono** e abra **BUSCAS → Configurações**. Cadastre primeiro, em Usuários, o telefone real do dono que receberá resultados, com código do país e DDD.
 2. Selecione os **Grupos monitorados** onde recebe anúncios dos fornecedores. Em outra lista, selecione os **Grupos que aceitam comandos**. Você pode monitorar um grupo sem aceitar comandos nele e habilitar comandos em um grupo que não será capturado.
-3. Para comandos privados, ative a opção correspondente e informe as conversas habilitadas. Os números precisam pertencer a usuários locais ativos. A conversa habilitada é onde a solicitação chega à conta conectada, não um fornecedor a ser contatado.
+3. Para comandos privados de outros números, ative a opção correspondente e informe as conversas habilitadas. Para executar pelo próprio WhatsApp conectado, vincule o telefone autenticado ao usuário **Dono** e habilite a conversa consigo mesmo nas configurações BUSCAS. Os números precisam pertencer a usuários locais ativos. A conversa habilitada é onde a solicitação chega à conta conectada, não um fornecedor a ser contatado.
 4. Mantenha `!busca` ou altere o prefixo. O exemplo da tela acompanha a alteração. Escolha até dez resultados, validade de 24 horas, três dias, sete dias ou período personalizado. O fuso inicial é **America/Sao_Paulo**; o período exibido e as datas originais seguem o fuso configurado.
 5. Escolha o critério de preço, filtros, retenção de mensagens, sinônimos, bloqueios, limite de buscas por pessoa e, se desejado, um resultado por fornecedor. O padrão considera o **preço total anunciado à vista**, do menor para o maior.
-6. Em Destinatários, mantenha **Privado do dono** e selecione o dono com telefone. Alternativamente, escolha solicitante autorizado, responsáveis previamente cadastrados em Alertas ou conversa de origem. Publicar na origem exige habilitação explícita adicional. Não haverá contato automático com fornecedores.
+6. Em Destinatários, mantenha **Privado do dono** e selecione o dono com telefone. Alternativamente, escolha solicitante autorizado, responsáveis previamente cadastrados em Alertas ou conversa de origem. Publicar na origem exige habilitação explícita adicional. Não haverá contato automático com fornecedores. Use **Testar envio** para cada destinatário antes de depender da entrega dos resultados. Número com país e DDD será resolvido pela integração, inclusive quando for a própria conta conectada. Um destino inválido gera falha visível; ele não é trocado pela conversa de origem.
 7. Ative o módulo, salve e mantenha o aplicativo conectado. A tela mostra início, última sincronização, fila e lacunas. Atualizar a tela não consulta repetidamente o histórico do WhatsApp.
 
 Em **BUSCAS → Autorizados**, o dono ou uma pessoa com gestão explícita do módulo seleciona usuários locais ativos, concede Buscar, Consultar histórico, Alterar filtros e/ou Gerenciar o módulo, e pode editar, desativar ou remover os acessos. O perfil em **Usuários** também precisa das permissões BUSCAS correspondentes. Apenas ser administrador do grupo, fornecedor monitorado ou ter um nome conhecido não concede acesso. Usuários desativados ou com troca obrigatória de senha pendente não podem usar o módulo. Comandos não autorizados são ignorados silenciosamente.
@@ -49,7 +49,7 @@ Em um local habilitado e a partir de um usuário autorizado, envie:
 !busca Samsung S24 Ultra 256GB
 ```
 
-O prefixo deve estar no início. Maiúsculas e minúsculas são equivalentes; `ProMax`/`Pro Max` e `Silver`/`Prata` são reconhecidos. Enviar apenas `!busca` dá uma orientação curta. Ao mudar o prefixo, use o novo comando; os comandos antigos de campanhas continuam com `!mega`.
+O dono também pode enviar o comando manualmente pela própria conta conectada, na conversa consigo mesmo habilitada ou em outro local expressamente autorizado. Ecos das mensagens automáticas do aplicativo são ignorados por identificador persistente e não formam loops. O prefixo deve estar no início. Maiúsculas e minúsculas são equivalentes; `ProMax`/`Pro Max` e `Silver`/`Prata` são reconhecidos. Enviar apenas `!busca` dá uma orientação curta. Ao mudar o prefixo, use o novo comando; os comandos antigos de campanhas continuam com `!mega`.
 
 Modelo e versão são obrigatoriamente compatíveis. Quando capacidade, cor ou condição não forem filtradas, cada resultado mostra o que foi anunciado ou “não informado”. Para restringir, acrescente capacidade/cor/condição ao comando ou ajuste filtros na tela. Filtros desconhecidos pedem esclarecimento; não ampliam silenciosamente a busca para outros modelos. O resultado tem até dez ofertas; se houver menos, retorna somente elas. Sem compatíveis, informa a ausência.
 
@@ -63,7 +63,7 @@ Em **Ofertas capturadas**, filtre associações confirmadas ou aguardando revis�
 
 A publicação mais recente do mesmo fornecedor e combinação de modelo, capacidade, cor e condição prevalece sobre a anterior, mesmo que o preço antigo fosse menor. Condições diferentes continuam separadas. Indisponibilidade elimina a oferta anterior somente quando a associação é inequívoca. Edições e exclusões são aplicadas quando os eventos chegam; não há garantia de receber mudanças durante períodos sem conexão.
 
-**Histórico** registra solicitante, origem, filtros, horário e resultado da pesquisa. Entregas podem estar pendentes, confirmadas, falhas ou incertas. Confirmado exige ACK do serviço; não comprova leitura. Ao desconectar, a captura fica desatualizada e resultados exibem o aviso. Entregas ainda não submetidas podem sair após reconexão; as incertas exigem revisão e não são repetidas automaticamente.
+**Histórico** registra solicitante, origem, filtros, horário e resultado da pesquisa. Entregas mostram o destinatário e podem estar pendentes, confirmadas pelo servidor, entregues quando houver recibo, falhas ou incertas. Enfileirar não significa enviado. ACK do serviço confirma submissão; não comprova leitura. Consulte o motivo das falhas e use **Tentar novamente** somente quando a falha for comprovadamente anterior à submissão; incertezas exigem revisão. Ao desconectar, a captura fica desatualizada e resultados exibem o aviso. Entregas ainda não submetidas podem sair após reconexão; as incertas exigem revisão e não são repetidas automaticamente.
 
 Em **Dados e limpeza**, as duas ações têm efeitos diferentes:
 
@@ -76,7 +76,7 @@ Importação de histórico anterior é **parcial e oportunista**. Habilitá-la p
 
 ## Falhas, avisos e sons
 
-Em **Alertas privados**, cadastre destinatários com país e DDD e use **Testar alerta**. Selecione os destinatários e responsáveis no editor de cada campanha. Donos ativos com telefone cadastrado também recebem os avisos. Uma falha registra a ocorrência, o motivo, o horário original e o resultado de cada privado. O teste cria um aviso privado; não ativa campanhas. Em modo WhatsApp real, o botão envia uma mensagem ao número selecionado.
+Em **Alertas privados**, cadastre destinatários com país e DDD e use **Testar alerta**. Selecione os destinatários e responsáveis no editor de cada campanha. Donos ativos com telefone cadastrado também recebem os avisos. Uma falha registra separadamente a ocorrência, o motivo, o horário original e o resultado de cada privado. O teste usa a mesma fila e resolução de destino dos avisos reais; uma solicitação de teste não equivale a confirmação de envio. O teste cria um aviso privado; não ativa campanhas. Em modo WhatsApp real, o botão envia uma mensagem ao número selecionado.
 
 Se a conexão estiver indisponível, o aviso local aparece imediatamente e o privado fica pendente. Quando houver reconexão, ele mantém o horário original da falha. Confirmado significa ACK da integração ou confirmação manual identificada, sem comprovar leitura. Alertas incertos exigem revisão e não são repetidos automaticamente.
 
@@ -88,7 +88,7 @@ Opcionalmente, configure um endpoint **HTTPS** independente e um token em Config
 
 ## Histórico, diagnóstico e limpeza
 
-**Histórico** e **Diagnóstico** têm filtros e paginação. Diagnóstico mostra etapa, código, descrição sanitizada, tentativas, ação tomada e orientação; oferece copiar detalhes e exportar. Relatórios permitem consultar e exportar os resultados dentro das permissões do usuário.
+**Histórico** e **Diagnóstico** têm filtros e paginação. O identificador de rastreamento acompanha cada comando e alerta da recepção até a confirmação ou falha. Use-o para conferir autorização, quantidade encontrada, destinatário, fila e resultado da integração; senhas, tokens e credenciais não são registrados. Diagnóstico mostra etapa, código, descrição sanitizada, tentativas, ação tomada e orientação; oferece copiar detalhes e exportar. Relatórios permitem consultar e exportar os resultados dentro das permissões do usuário.
 
 Envios incertos precisam de verificação na conversa real e revisão manual: marque confirmado somente depois de conferir o envio, ou descarte sem repetição automática. A lista de revisões usa o controle operacional e permanece disponível após a limpeza dos registros visíveis.
 
@@ -100,11 +100,11 @@ Essa limpeza preserva usuários, contatos, grupos, mídias, modelos, configuraç
 
 ## Backup e funcionamento diário
 
-Use **Configurações → Backup** para exportar campanhas, biblioteca e configurações compartilháveis. Guarde o arquivo em local privado: ele contém mensagens, arquivos e telefones. O backup portátil não inclui usuários, senhas, recuperação, sessão WhatsApp, token do canal, áudio personalizado, históricos nem **base, configurações ou autorizações de BUSCAS**. Esses dados ficam no banco local. A restauração exige permissões globais, faz backup automático anterior, preserva usuários/perfis e BUSCAS locais e deixa as campanhas desativadas em simulação. Revise os destinos e os grupos de monitoramento antes de voltar à conexão real. A cópia SQLite anterior à migração contém os dados locais, inclusive os capturados, e deve permanecer protegida.
+Use **Configurações → Backup** para exportar campanhas, biblioteca e configurações compartilháveis. Guarde o arquivo em local privado: ele contém mensagens, arquivos e telefones. O backup portátil não inclui usuários, senhas, recuperação, sessão WhatsApp, token do canal, áudio personalizado, históricos nem **base, configurações ou autorizações de BUSCAS**. Esses dados ficam no banco local. A restauração exige permissões globais, faz backup automático anterior, preserva usuários/perfis e BUSCAS locais e deixa as campanhas desativadas no modo de origem informado pelo backup; em backups antigos, a presença de grupos explicitamente marcados como simulação define o modo simulado, e os demais casos usam o modo real. A base do outro modo permanece preservada. Revise conexão, destinos e grupos antes de ativar campanhas restauradas. A cópia SQLite anterior à migração contém os dados locais, inclusive os capturados, e deve permanecer protegida.
 
 **PARAR TODOS OS ENVIOS** cancela itens ainda pendentes. Uma mensagem já submetida pode concluir e não é recolhida. Minimizar para a bandeja mantém o aplicativo funcionando; encerrar interrompe os agendamentos. A opção de iniciar com o Windows inicia o aplicativo, mas não ativa campanhas por conta própria.
 
-Mantenha o computador ligado, com internet e sem suspensão. Após suspensão, desconexão ou reinício, confira resultados e conexão antes de retomar. Não há acúmulo de rodadas perdidas. Os dados locais ficam em `%APPDATA%\Mega Disparos`.
+Mantenha o computador ligado, com internet e sem suspensão. Após suspensão, desconexão ou reinício, confira resultados e conexão antes de retomar. Não há acúmulo de rodadas perdidas. Os dados locais continuam em `%APPDATA%\Mega Disparos` por compatibilidade. A mudança de identidade não cria um perfil vazio nem transfere a sessão para outra pasta. Não altere esse diretório para tentar renomear o aplicativo.
 
 Consulte [VALIDACAO.md](VALIDACAO.md). Não foram feitos envios reais nem testes em Windows físico neste ambiente. Notificações físicas, mixer de áudio, instalação e transporte WhatsApp real ainda precisam dessa validação; envios de teste reais devem ocorrer somente no grupo indicado pelo usuário.
 

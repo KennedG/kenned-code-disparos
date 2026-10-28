@@ -9,8 +9,10 @@ const { createSearchSchema, attachSearchStore } = require('./search-store.cjs');
 
 const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts']);
 const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
-const SCHEMA_VERSION = 5;
-const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
+const SCHEMA_VERSION = 6;
+const SHARED_TABLES = new Set(['settings','users','roles','recovery_tokens']);
+const MODE_SETTING = /^(buscas|search)|^recentCommandIds$|^systemAlertRecipientIds$/i;
+const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^mode:|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
 
 function atomicWrite(filename, data) {
   fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -49,11 +51,16 @@ async function createStore(dir,options={}) {
   fs.mkdirSync(dir,{recursive:true});
   const filename=path.join(dir,'mega.sqlite'),existed=fs.existsSync(filename);
   const db=new DatabaseSync(filename,{timeout:5000});
-  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0;
+  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0,modeIsolationReady=false;
   const statements=new Map();
   const prepared=sql=>{let st=statements.get(sql);if(!st){st=db.prepare(sql);if(statements.size>=128)statements.delete(statements.keys().next().value);statements.set(sql,st);}return st;};
-  const one=(table,id)=>{const row=prepared(`SELECT data FROM ${table} WHERE id=?`).get(id);return row?JSON.parse(row.data):undefined;};
-  const all=table=>parseRows(prepared(`SELECT data FROM ${table} ORDER BY rowid`).all());
+  const storageMode=()=>{const row=prepared("SELECT data FROM settings WHERE id='integrationMode'").get();return row&&JSON.parse(row.data).value==='simulated'?'simulated':'whatsapp';};
+  const isolated=table=>modeIsolationReady&&!SHARED_TABLES.has(table);
+  const modeClause=table=>isolated(table)?' AND storageMode=?':'';
+  const modeParams=table=>isolated(table)?[storageMode()]:[];
+  const oneRaw=(table,id)=>{if(typeof id!=='string'||!id)return undefined;const row=prepared(`SELECT data FROM ${table} WHERE id=?`).get(id);return row?JSON.parse(row.data):undefined;};
+  const one=(table,id)=>{if(typeof id!=='string'||!id)return undefined;const row=prepared(`SELECT data FROM ${table} WHERE id=?${modeClause(table)}`).get(id,...modeParams(table));return row?JSON.parse(row.data):undefined;};
+  const all=table=>parseRows(prepared(`SELECT data FROM ${table}${isolated(table)?' WHERE storageMode=?':''} ORDER BY rowid`).all(...modeParams(table)));
   const assertWritable=()=>{if(closed)throw new Error('Banco fechado.');if(persistenceFailed)throw new Error('Armazenamento indisponível. Os envios foram bloqueados; corrija o espaço ou as permissões e reabra o aplicativo.');};
   const isStorageError=error=>['ENOSPC','EIO','EROFS','EACCES'].includes(error?.code)||(error?.code==='ERR_SQLITE_ERROR'&&![19,5,6].includes((error.errcode||0)&255));
   function transaction(callback) {
@@ -70,7 +77,7 @@ async function createStore(dir,options={}) {
   try {
     db.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;');
     const version=Number(db.prepare('PRAGMA user_version').get().user_version);
-    if(version>SCHEMA_VERSION)throw new Error('Este banco pertence a uma versão mais recente do Mega Disparos. Atualize o aplicativo.');
+    if(version>SCHEMA_VERSION)throw new Error('Este banco pertence a uma versão mais recente do Kenned Code Disparos. Atualize o aplicativo.');
     if(existed&&version<SCHEMA_VERSION){
       db.exec('PRAGMA wal_checkpoint(FULL)');
       const backupDir=path.join(dir,'backups');fs.mkdirSync(backupDir,{recursive:true});
@@ -118,16 +125,71 @@ async function createStore(dir,options={}) {
       for(const c of all('campaigns'))if(!Number.isInteger(c.configRevision))prepared('UPDATE campaigns SET data=? WHERE id=?').run(json({...c,configRevision:c.revision||1}),c.id);
       }
       createSearchSchema(db);
+      if(version<6){
+        // Mode is provenance, never a guess based on a display name. Existing
+        // unclassified records remain real; demonstrably simulated destinations
+        // identify their campaign/operational descendants without deleting data.
+        const scopedTables=['campaigns','groups_data','media','templates','rounds','jobs','history',...ENTITY_TABLES].filter(t=>!SHARED_TABLES.has(t));
+        db.exec('DROP TRIGGER IF EXISTS audit_immutable_update; DROP TRIGGER IF EXISTS audit_immutable_delete;');
+        for(const table of scopedTables){
+          const cols=new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(r=>r.name));
+          if(!cols.has('storageMode'))db.exec(`ALTER TABLE ${table} ADD COLUMN storageMode TEXT NOT NULL DEFAULT 'whatsapp'`);
+          db.exec(`CREATE INDEX IF NOT EXISTS ${table}_mode ON ${table}(storageMode)`);
+        }
+        const provenMode=v=>v?.storageMode==='simulated'||v?.simulation===true?'simulated':v?.storageMode==='whatsapp'||v?.simulation===false?'whatsapp':null;
+        const groups=new Map();
+        for(const row of db.prepare('SELECT id,data FROM groups_data').all()){const v=JSON.parse(row.data),m=provenMode(v)||'whatsapp';groups.set(row.id,m);db.prepare('UPDATE groups_data SET storageMode=?,data=? WHERE id=?').run(m,json({...v,storageMode:m}),row.id);}
+        const campaignModes=new Map();
+        for(const row of db.prepare('SELECT id,data FROM campaigns').all()){
+          const v=JSON.parse(row.data),m=provenMode(v)||(v.groupIds?.length&&v.groupIds.every(id=>groups.get(id)==='simulated')?'simulated':'whatsapp');
+          campaignModes.set(row.id,m);db.prepare('UPDATE campaigns SET storageMode=?,data=? WHERE id=?').run(m,json({...v,storageMode:m}),row.id);
+        }
+        for(const table of ['group_rounds','group_progress']){
+          const cols=new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(r=>r.name));
+          if(!cols.has('storageMode'))db.exec(`ALTER TABLE ${table} ADD COLUMN storageMode TEXT NOT NULL DEFAULT 'whatsapp'`);
+          for(const [id,m]of campaignModes)db.prepare(`UPDATE ${table} SET storageMode=? WHERE campaignId=?`).run(m,id);
+          db.exec(`CREATE INDEX IF NOT EXISTS ${table}_mode_campaign ON ${table}(storageMode,campaignId)`);
+        }
+        const previousMode=storageMode();
+        for(const table of scopedTables.filter(t=>!['groups_data','campaigns'].includes(t)))for(const row of db.prepare(`SELECT id,data FROM ${table}`).all()){
+          const v=JSON.parse(row.data),proof=provenMode(v)||campaignModes.get(v.campaignId)||(groups.get(v.groupId)==='simulated'?'simulated':null),m=proof||'whatsapp';
+          const value=table==='audit'?v:{...v,storageMode:m};
+          if(!proof&&previousMode==='simulated'&&['alerts','jobs'].includes(table)&&['pending','queued','sending','accepted'].includes(v.status)){
+            value.status='uncertain';value.error='Origem operacional anterior sem identificação de modo; revise antes de qualquer reenvio.';value.code='MIGRATION_MODE_REVIEW';value.retryEligible=false;value.reviewRequired=true;
+          }
+          db.prepare(`UPDATE ${table} SET storageMode=?,data=?${['alerts','jobs','rounds','history','notifications','diagnostics'].includes(table)?',status=?':''} WHERE id=?`).run(m,json(value),...(['alerts','jobs','rounds','history','notifications','diagnostics'].includes(table)?[value.status??null]:[]),row.id);
+        }
+        const oldBuscas=db.prepare("SELECT data FROM settings WHERE id='buscasSettings'").get();
+        const oldBuscasValue=oldBuscas?JSON.parse(oldBuscas.data).value:null;
+        const captureIds=[...(oldBuscasValue?.monitoredGroupIds||[]),...(oldBuscasValue?.commandGroupIds||[])];
+        const buscasMode=provenMode(oldBuscasValue)||(captureIds.length&&captureIds.every(id=>groups.get(id)==='simulated')?'simulated':'whatsapp');
+        for(const row of db.prepare('SELECT id,data FROM settings').all())if(MODE_SETTING.test(row.id)){
+          const v=JSON.parse(row.data),m=/^(buscas|search)/i.test(row.id)?buscasMode:previousMode;
+          db.prepare('INSERT OR IGNORE INTO settings(id,data) VALUES(?,?)').run(`mode:${m}:${row.id}`,json({...v,id:`mode:${m}:${row.id}`}));
+          db.prepare('DELETE FROM settings WHERE id=?').run(row.id);
+        }
+        db.exec(`CREATE TABLE IF NOT EXISTS automation_outbound(id TEXT PRIMARY KEY,at INTEGER NOT NULL,storageMode TEXT NOT NULL,kind TEXT);
+          CREATE INDEX IF NOT EXISTS jobs_client_message ON jobs(json_extract(data,'$.clientMessageId'));
+          CREATE INDEX IF NOT EXISTS alerts_client_message ON alerts(json_extract(data,'$.clientMessageId'));
+          CREATE INDEX IF NOT EXISTS history_mode_category_time ON history(storageMode,category,createdAt DESC);
+          CREATE INDEX IF NOT EXISTS jobs_mode_status ON jobs(storageMode,status);
+          CREATE INDEX IF NOT EXISTS diagnostics_mode_trace ON diagnostics(storageMode,json_extract(data,'$.traceId'),createdAt DESC);
+          CREATE TRIGGER audit_immutable_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END;
+          CREATE TRIGGER audit_immutable_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END;`);
+      }
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
     });
   }catch(error){db.close();throw error;}
-  const putRaw=(table,value)=>{if(!value?.id||typeof value.id!=='string')throw new Error('Identificador obrigatório.');prepared(`INSERT INTO ${table}(id,data)VALUES(?,?) ON CONFLICT(id)DO UPDATE SET data=excluded.data`).run(value.id,json(value));return value;};
+  modeIsolationReady=true;
+  const tagged=(table,value)=>{if(!isolated(table))return value;const old=oneRaw(table,value.id);if(old&&old.storageMode!==undefined&&old.storageMode!==storageMode())throw new Error('O registro pertence a outro modo de integração.');return {...value,storageMode:storageMode()};};
+  const putRaw=(table,input)=>{if(!input?.id||typeof input.id!=='string')throw new Error('Identificador obrigatório.');const value=tagged(table,input);prepared(`INSERT INTO ${table}(id,data${isolated(table)?',storageMode':''})VALUES(?,?${isolated(table)?',?':''}) ON CONFLICT(id)DO UPDATE SET data=excluded.data`).run(value.id,json(value),...modeParams(table));return value;};
   const put=(table,value)=>transaction(()=>putRaw(table,value));
-  const remove=(table,id)=>transaction(()=>prepared(`DELETE FROM ${table} WHERE id=?`).run(id));
-  const getSetting=(id,fallback)=>one('settings',id)?.value??fallback;
+  const remove=(table,id)=>transaction(()=>prepared(`DELETE FROM ${table} WHERE id=?${modeClause(table)}`).run(id,...modeParams(table)));
+  const settingKey=id=>MODE_SETTING.test(id)?`mode:${storageMode()}:${id}`:id;
+  const getSetting=(id,fallback)=>one('settings',settingKey(id))?.value??fallback;
   function projection(category,sourceId,value) {
-    const data={...value,category},time=Number(value.at??value.resultAt??value.createdAt??value.startedAt??Date.now());
-    prepared(`INSERT INTO history(id,category,sourceId,campaignId,userId,createdAt,status,data)VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(category,sourceId)DO UPDATE SET campaignId=excluded.campaignId,userId=excluded.userId,createdAt=excluded.createdAt,status=excluded.status,data=excluded.data`).run(`${category}:${sourceId}`,category,sourceId,value.campaignId??null,value.userId??value.actorId??null,time,value.status??null,json(data));
+    const data={...value,category,storageMode:value.storageMode??storageMode()},time=Number(value.at??value.resultAt??value.createdAt??value.startedAt??Date.now());
+    prepared(`INSERT INTO history(id,category,sourceId,campaignId,userId,createdAt,status,data,storageMode)VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(category,sourceId)DO UPDATE SET campaignId=excluded.campaignId,userId=excluded.userId,createdAt=excluded.createdAt,status=excluded.status,data=excluded.data`).run(`${category}:${sourceId}`,category,sourceId,value.campaignId??null,value.userId??value.actorId??null,time,value.status??null,json(data),data.storageMode);
     if(++writesSinceRetention>=100){writesSinceRetention=0;retentionRaw();}
   }
   function retentionRaw(config={}) {
@@ -135,39 +197,43 @@ async function createStore(dir,options={}) {
     const megabytes=config.maxMegabytes??setting.maxMegabytes;
     const days=clamp(config.days??setting.days??getSetting('historyRetentionDays',30),30,3650),maxRows=clamp(config.maxRows??config.maxEntries??setting.maxRows??setting.maxEntries??getSetting('historyMaxRows',10000),10000,1000000),maxBytes=clamp(config.maxBytes??setting.maxBytes??(megabytes===undefined?undefined:Math.floor(Number(megabytes)*1048576))??getSetting('historyMaxBytes',10485760),10485760,1073741824);
     for(const table of ['history','diagnostics','notifications']){
-      if(days)prepared(`DELETE FROM ${table} WHERE createdAt<?`).run(Date.now()-days*86400000);
-      if(maxRows)prepared(`DELETE FROM ${table} WHERE id IN(SELECT id FROM ${table} ORDER BY createdAt DESC,rowid DESC LIMIT -1 OFFSET ?)`).run(maxRows);
-      if(maxBytes)prepared(`DELETE FROM ${table} WHERE id IN(SELECT id FROM(SELECT id,SUM(length(CAST(data AS BLOB))) OVER(ORDER BY createdAt DESC,rowid DESC)AS size FROM ${table})WHERE size>?)`).run(maxBytes);
+      if(days)prepared(`DELETE FROM ${table} WHERE createdAt<? AND storageMode=?`).run(Date.now()-days*86400000,storageMode());
+      if(maxRows)prepared(`DELETE FROM ${table} WHERE id IN(SELECT id FROM ${table} WHERE storageMode=? ORDER BY createdAt DESC,rowid DESC LIMIT -1 OFFSET ?)`).run(storageMode(),maxRows);
+      if(maxBytes)prepared(`DELETE FROM ${table} WHERE id IN(SELECT id FROM(SELECT id,SUM(length(CAST(data AS BLOB))) OVER(ORDER BY createdAt DESC,rowid DESC)AS size FROM ${table} WHERE storageMode=?)WHERE size>?)`).run(storageMode(),maxBytes);
     }
   }
-  function roundRaw(r) {
+  function roundRaw(input) {
+    const r=tagged('rounds',input);
     if(!r?.id)throw new Error('Identificador obrigatório.');
-    prepared(`INSERT INTO rounds(id,data,campaignId,startedAt,finishedAt,status,dayKey)VALUES(?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET data=excluded.data,campaignId=excluded.campaignId,startedAt=excluded.startedAt,finishedAt=excluded.finishedAt,status=excluded.status,dayKey=excluded.dayKey`).run(r.id,json(r),r.campaignId??null,r.startedAt??0,r.finishedAt??null,r.status??null,localDay(r.startedAt||0));
+    prepared(`INSERT INTO rounds(id,data,campaignId,startedAt,finishedAt,status,dayKey,storageMode)VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET data=excluded.data,campaignId=excluded.campaignId,startedAt=excluded.startedAt,finishedAt=excluded.finishedAt,status=excluded.status,dayKey=excluded.dayKey`).run(r.id,json(r),r.campaignId??null,r.startedAt??0,r.finishedAt??null,r.status??null,localDay(r.startedAt||0),storageMode());
     projection('campaigns',`round:${r.id}`,{...r,kind:'round'});return r;
   }
-  function jobRaw(j) {
+  function jobRaw(input) {
+    const j=tagged('jobs',input);
     if(!j?.id)throw new Error('Identificador obrigatório.');
     const old=one('jobs',j.id);if(old?.status==='confirmed'&&j.status!=='confirmed')throw new Error('Um envio confirmado não pode voltar à fila.');
     if(old&&['roundId','campaignId','groupId','itemId'].some(key=>old[key]!==j[key]))throw new Error('A identidade operacional do envio não pode ser alterada.');
     if(old?.status==='uncertain'&&['queued','sending','accepted'].includes(j.status))throw new Error('Um envio incerto precisa de revisão e não pode voltar à fila.');
-    prepared(`INSERT INTO jobs(id,roundId,campaignId,groupId,itemId,status,data,createdAt,firstAttemptAt,resultAt,attempts,messageId,dayKey)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET status=excluded.status,data=excluded.data,createdAt=excluded.createdAt,firstAttemptAt=excluded.firstAttemptAt,resultAt=excluded.resultAt,attempts=excluded.attempts,messageId=excluded.messageId,dayKey=excluded.dayKey`).run(j.id,j.roundId,j.campaignId,j.groupId,j.itemId,j.status,json(j),j.createdAt??0,j.firstAttemptAt??null,j.resultAt??null,j.attempts||0,j.messageId??null,localDay(j.firstAttemptAt??j.createdAt??0));
+    prepared(`INSERT INTO jobs(id,roundId,campaignId,groupId,itemId,status,data,createdAt,firstAttemptAt,resultAt,attempts,messageId,dayKey,storageMode)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET status=excluded.status,data=excluded.data,createdAt=excluded.createdAt,firstAttemptAt=excluded.firstAttemptAt,resultAt=excluded.resultAt,attempts=excluded.attempts,messageId=excluded.messageId,dayKey=excluded.dayKey`).run(j.id,j.roundId,j.campaignId,j.groupId,j.itemId,j.status,json(j),j.createdAt??0,j.firstAttemptAt??null,j.resultAt??null,j.attempts||0,j.messageId??null,localDay(j.firstAttemptAt??j.createdAt??0),storageMode());
     if(j.attempts>0||['confirmed','uncertain','sending'].includes(j.status)){
       const r=prepared('SELECT startedAt FROM rounds WHERE id=?').get(j.roundId);
-      if(r){const added=prepared('INSERT OR IGNORE INTO group_rounds(campaignId,groupId,roundId,startedAt)VALUES(?,?,?,?)').run(j.campaignId,j.groupId,j.roundId,r.startedAt);if(added.changes)prepared('INSERT INTO group_progress(campaignId,groupId,lastAt,roundCount)VALUES(?,?,?,1) ON CONFLICT(campaignId,groupId)DO UPDATE SET lastAt=MAX(lastAt,excluded.lastAt),roundCount=roundCount+1').run(j.campaignId,j.groupId,r.startedAt);}
+      if(r){const added=prepared('INSERT OR IGNORE INTO group_rounds(campaignId,groupId,roundId,startedAt,storageMode)VALUES(?,?,?,?,?)').run(j.campaignId,j.groupId,j.roundId,r.startedAt,storageMode());if(added.changes)prepared('INSERT INTO group_progress(campaignId,groupId,lastAt,roundCount,storageMode)VALUES(?,?,?,1,?) ON CONFLICT(campaignId,groupId)DO UPDATE SET lastAt=MAX(lastAt,excluded.lastAt),roundCount=roundCount+1').run(j.campaignId,j.groupId,r.startedAt,storageMode());}
     }
     projection('sends',j.id,j);return j;
   }
   const entityTable=table=>{if(!ENTITY_TABLES.has(table))throw new Error('Coleção inválida.');return table;};
-  function entityRaw(table,value,immutable=false) {
+  function entityRaw(table,input,immutable=false) {
+    const value=tagged(table,input);
     entityTable(table);if(!value?.id)throw new Error('Identificador obrigatório.');
     const time=Number(value.createdAt??value.at??Date.now()),suffix=immutable?'':' ON CONFLICT(id)DO UPDATE SET data=excluded.data,createdAt=excluded.createdAt,campaignId=excluded.campaignId,userId=excluded.userId,status=excluded.status,kind=excluded.kind';
-    prepared(`INSERT INTO ${table}(id,data,createdAt,campaignId,userId,status,kind)VALUES(?,?,?,?,?,?,?)${suffix}`).run(value.id,json(value),time,value.campaignId??null,value.userId??value.actorId??null,value.status??null,value.kind??value.action??value.event??null);
+    prepared(`INSERT INTO ${table}(id,data,createdAt,campaignId,userId,status,kind${isolated(table)?',storageMode':''})VALUES(?,?,?,?,?,?,?${isolated(table)?',?':''})${suffix}`).run(value.id,json(value),time,value.campaignId??null,value.userId??value.actorId??null,value.status??null,value.kind??value.action??value.event??null,...modeParams(table));
     if(table==='diagnostics')projection('errors',value.id,value);
     if(table==='notifications')projection('notifications',value.id,value);
     return value;
   }
-  function queryFilter(filter={},allowed={}) {
+  function queryFilter(filter={},allowed={},table='history') {
     const where=[],params=[];
+    if(isolated(table)){where.push('storageMode=?');params.push(storageMode());}
     for(const[key,column]of Object.entries(allowed))if(filter[key]!==undefined&&filter[key]!==null){const values=Array.isArray(filter[key])?filter[key]:[filter[key]],global=filter.includeGlobal&&column==='campaignId';if(!values.length){where.push(global?'campaignId IS NULL':'0');continue;}where.push(`${global?'(':''}${column} IN(${values.map(()=>'?').join(',')})${global?' OR campaignId IS NULL)':''}`);params.push(...values);}
     if(filter.from!==undefined&&filter.from!==''){where.push('createdAt>=?');params.push(filterTimestamp(filter.from));}
     if(filter.to!==undefined&&filter.to!==''){where.push('createdAt<=?');params.push(filterTimestamp(filter.to,true));}
@@ -181,35 +247,37 @@ async function createStore(dir,options={}) {
     const items=parseRows(prepared(`SELECT data FROM history${f.sql} ORDER BY createdAt DESC,rowid DESC LIMIT ? OFFSET ?`).all(...f.params,limit,offset));
     return {items,total,limit,offset};
   }
-  const entityFilter=filter=>queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',userId:'userId',actorId:'userId',status:'status',kind:'kind',ids:'id',code:"json_extract(data,'$.code')",stage:"json_extract(data,'$.stage')"});
+  const entityFilter=(filter,table)=>queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',userId:'userId',actorId:'userId',status:'status',kind:'kind',ids:'id',code:"json_extract(data,'$.code')",stage:"json_extract(data,'$.stage')",traceId:"json_extract(data,'$.traceId')"},table);
   const store={
     dir,filename,schemaVersion:SCHEMA_VERSION,get persistenceFailed(){return persistenceFailed;},transaction,
-    getSetting,setSetting:(id,value)=>put('settings',{id,value}),
-    listCampaigns(filter={}){const where=[],params=[];if(filter.ownerId){where.push("json_extract(data,'$.ownerId')=?");params.push(filter.ownerId);}if(filter.ids){if(!filter.ids.length)return [];where.push(`id IN(${filter.ids.map(()=>'?').join(',')})`);params.push(...filter.ids);}return parseRows(prepared(`SELECT data FROM campaigns${where.length?' WHERE '+where.join(' AND '):''} ORDER BY rowid`).all(...params));},
+    getSetting,getStorageMode:storageMode,setSetting:(id,value)=>{const key=settingKey(id);return put('settings',{id:key,value});},
+    listCampaigns(filter={}){const where=['storageMode=?'],params=[storageMode()];if(filter.ownerId){where.push("json_extract(data,'$.ownerId')=?");params.push(filter.ownerId);}if(filter.ids){if(!filter.ids.length)return [];where.push(`id IN(${filter.ids.map(()=>'?').join(',')})`);params.push(...filter.ids);}return parseRows(prepared(`SELECT data FROM campaigns${where.length?' WHERE '+where.join(' AND '):''} ORDER BY rowid`).all(...params));},
     getCampaign:id=>one('campaigns',id),
     saveCampaign(c){return transaction(()=>{const old=one('campaigns',c.id),changed=!old||configurationFingerprint(old)!==configurationFingerprint(c);const result={...c,revision:(old?.revision||0)+1,configRevision:(old?.configRevision||old?.revision||0)+(changed?1:0)};putRaw('campaigns',result);if(changed||old?.state!==c.state)projection('campaigns',randomUUID(),{id:randomUUID(),campaignId:c.id,userId:c.lastActorId??c.ownerId??null,at:Date.now(),kind:!old?'created':changed?'edited':c.state,status:c.state,name:c.name});return result;});},
-    deleteCampaign(id){return transaction(()=>{const c=one('campaigns',id);prepared('DELETE FROM campaigns WHERE id=?').run(id);if(c)projection('campaigns',randomUUID(),{id:randomUUID(),campaignId:id,at:Date.now(),kind:'deleted',name:c.name});});},
-    listGroups:()=>all('groups_data'),getGroup:id=>one('groups_data',id),
-    upsertGroups(groups){return transaction(()=>{for(const g of groups){const old=one('groups_data',g.id);putRaw('groups_data',{...old,...g,authorized:old?.authorized??!!g.authorized});}});},
+    deleteCampaign(id){return transaction(()=>{const c=one('campaigns',id);prepared('DELETE FROM campaigns WHERE id=? AND storageMode=?').run(id,storageMode());if(c)projection('campaigns',randomUUID(),{id:randomUUID(),campaignId:id,at:Date.now(),kind:'deleted',name:c.name});});},
+    listGroups:()=>all('groups_data').filter(g=>g.available!==false),getGroup:id=>{const g=one('groups_data',id);return g?.available!==false?g:undefined;},
+    upsertGroups(groups){return transaction(()=>{for(const g of groups){if(g.simulation!==undefined&&Boolean(g.simulation)!==(storageMode()==='simulated'))throw new Error('O grupo pertence a outro modo de integração.');const old=one('groups_data',g.id);putRaw('groups_data',{...old,...g,available:true,simulation:storageMode()==='simulated',authorized:old?.authorized??!!g.authorized});}});},
+    clearGroups(){return transaction(()=>{for(const g of all('groups_data'))putRaw('groups_data',{...g,available:false});});},
+    replaceGroups(groups){return transaction(()=>{const ids=new Set(groups.map(g=>g.id));store.upsertGroups(groups);for(const g of all('groups_data'))if(!ids.has(g.id))putRaw('groups_data',{...g,available:false});return store.listGroups();});},
     authorizeGroup(id,authorized){const g=one('groups_data',id);if(!g)throw new Error('Grupo não encontrado.');return put('groups_data',{...g,authorized:!!authorized});},
     listMedia:()=>all('media'),getMedia:id=>one('media',id),saveMedia:m=>put('media',m),
     listTemplates:()=>all('templates'),saveTemplate:t=>put('templates',t),deleteTemplate:id=>remove('templates',id),
     insertRound:r=>transaction(()=>roundRaw(r)),
     updateRound(id,patch){const r=one('rounds',id);if(!r)throw new Error('Rodada não encontrada.');return transaction(()=>roundRaw({...r,...patch}));},
-    listRounds(id){return parseRows(prepared(`SELECT data FROM rounds${id?' WHERE campaignId=?':''} ORDER BY rowid`).all(...(id?[id]:[])));},
+    listRounds(id){return parseRows(prepared(`SELECT data FROM rounds WHERE storageMode=?${id?' AND campaignId=?':''} ORDER BY rowid`).all(storageMode(),...(id?[id]:[])));},
     insertJob:j=>transaction(()=>jobRaw(j)),
     updateJob(id,patch){const j=one('jobs',id);if(!j)throw new Error('Envio não encontrado.');return transaction(()=>jobRaw({...j,...patch}));},
     getJob:id=>one('jobs',id),
     listJobs(filter={}){const f=queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',roundId:'roundId',status:'status',messageId:'messageId',groupId:'groupId'}),limited=filter.limit!==undefined;return parseRows(prepared(`SELECT data FROM jobs${f.sql}${limited?' ORDER BY rowid DESC LIMIT ? OFFSET ?':' ORDER BY rowid'}`).all(...f.params,...(limited?[clamp(filter.limit,50,1000000),clamp(filter.offset,0,10000000)]:[])));},
     queryJobs(filter={}){const f=queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',roundId:'roundId',status:'status',messageId:'messageId',groupId:'groupId'}),limit=clamp(filter.limit,50,500),offset=clamp(filter.offset,0,10000000);return {items:store.listJobs({...filter,limit,offset}),total:Number(prepared(`SELECT COUNT(*)AS n FROM jobs${f.sql}`).get(...f.params).n),limit,offset};},
     listOperationalReviews(filter={}){return store.queryJobs({...filter,status:'uncertain'});},
-    getCampaignCounts(campaignId,at){const day=localDay(at);return {rounds:Number(prepared('SELECT COUNT(*)AS n FROM rounds WHERE campaignId=? AND dayKey=?').get(campaignId,day).n),sends:Number(prepared('SELECT COUNT(*)AS n FROM jobs WHERE campaignId=? AND dayKey=? AND attempts>0').get(campaignId,day).n)};},
-    getGroupHistory(campaignId){return new Map(prepared('SELECT groupId,lastAt,roundCount FROM group_progress WHERE campaignId=?').all(campaignId).map(r=>[r.groupId,{lastAt:r.lastAt,roundCount:Number(r.roundCount)}]));},
+    getCampaignCounts(campaignId,at){const day=localDay(at);return {rounds:Number(prepared('SELECT COUNT(*)AS n FROM rounds WHERE campaignId=? AND dayKey=? AND storageMode=?').get(campaignId,day,storageMode()).n),sends:Number(prepared('SELECT COUNT(*)AS n FROM jobs WHERE campaignId=? AND dayKey=? AND storageMode=? AND attempts>0').get(campaignId,day,storageMode()).n)};},
+    getGroupHistory(campaignId){return new Map(prepared('SELECT groupId,lastAt,roundCount FROM group_progress WHERE campaignId=? AND storageMode=?').all(campaignId,storageMode()).map(r=>[r.groupId,{lastAt:r.lastAt,roundCount:Number(r.roundCount)}]));},
     getMetrics({campaignIds}={}){const campaigns=store.listCampaigns(campaignIds?{ids:campaignIds}:{}),f=queryFilter({campaignId:campaignIds},{campaignId:'campaignId'}),counts={};for(const row of prepared(`SELECT status,COUNT(*)AS n FROM jobs${f.sql} GROUP BY status`).all(...f.params))counts[row.status]=Number(row.n);const next=campaigns.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt);return {campaigns:campaigns.length,activeCampaigns:campaigns.filter(c=>c.state==='active').length,selectedGroups:new Set(campaigns.flatMap(c=>c.groupIds||[])).size,confirmed:counts.confirmed||0,pending:(counts.queued||0)+(counts.sending||0)+(counts.accepted||0),uncertain:counts.uncertain||0,failed:counts.failed||0,nextRunAt:next.length?Math.min(...next):null};},
-    recoverInterrupted(){return transaction(()=>{const affected=new Set();for(const j of store.listJobs({status:['sending','accepted','queued']})){jobRaw({...j,status:j.status==='queued'?'cancelled':'uncertain',resultAt:Date.now(),error:j.status==='queued'?'Fila anterior cancelada na inicialização; sem recuperação de rodadas atrasadas.':'Aplicativo encerrado durante o envio; revise sem reenviar automaticamente.'});affected.add(j.campaignId);}for(const row of prepared('SELECT data FROM rounds WHERE finishedAt IS NULL').all()){const r=JSON.parse(row.data);roundRaw({...r,finishedAt:Date.now(),status:'interrupted'});}for(const c of store.listCampaigns())if(c.state==='active')putRaw('campaigns',{...c,state:'paused',nextRunAt:null,revision:c.revision+1,pauseReason:affected.has(c.id)?'Fila interrompida; verifique o histórico.':'Reabertura do aplicativo: retome após conferir a conexão.'});return [...affected];});},
+    recoverInterrupted(){return transaction(()=>{const affected=new Set();for(const j of store.listJobs({status:['sending','accepted','queued']})){jobRaw({...j,status:j.status==='queued'?'cancelled':'uncertain',resultAt:Date.now(),error:j.status==='queued'?'Fila anterior cancelada na inicialização; sem recuperação de rodadas atrasadas.':'Aplicativo encerrado durante o envio; revise sem reenviar automaticamente.'});affected.add(j.campaignId);}for(const row of prepared('SELECT data FROM rounds WHERE finishedAt IS NULL AND storageMode=?').all(storageMode())){const r=JSON.parse(row.data);roundRaw({...r,finishedAt:Date.now(),status:'interrupted'});}for(const c of store.listCampaigns())if(c.state==='active')putRaw('campaigns',{...c,state:'paused',nextRunAt:null,revision:c.revision+1,pauseReason:affected.has(c.id)?'Fila interrompida; verifique o histórico.':'Reabertura do aplicativo: retome após conferir a conexão.'});return [...affected];});},
     getEntity:(table,id)=>one(entityTable(table),id),
-    listEntities(table,filter={}){entityTable(table);const f=entityFilter(filter),page=filter.limit!==undefined;return parseRows(prepared(`SELECT data FROM ${table}${f.sql} ORDER BY createdAt DESC,rowid DESC${page?' LIMIT ? OFFSET ?':''}`).all(...f.params,...(page?[clamp(filter.limit,50,1000000),clamp(filter.offset,0,10000000)]:[])));},
-    queryEntities(table,filter={}){entityTable(table);const f=entityFilter(filter),limit=clamp(filter.limit,50,500),offset=clamp(filter.offset,0,10000000);return {items:store.listEntities(table,{...filter,limit,offset}),total:Number(prepared(`SELECT COUNT(*)AS n FROM ${table}${f.sql}`).get(...f.params).n),limit,offset};},
+    listEntities(table,filter={}){entityTable(table);const f=entityFilter(filter,table),page=filter.limit!==undefined;return parseRows(prepared(`SELECT data FROM ${table}${f.sql} ORDER BY createdAt DESC,rowid DESC${page?' LIMIT ? OFFSET ?':''}`).all(...f.params,...(page?[clamp(filter.limit,50,1000000),clamp(filter.offset,0,10000000)]:[])));},
+    queryEntities(table,filter={}){entityTable(table);const f=entityFilter(filter,table),limit=clamp(filter.limit,50,500),offset=clamp(filter.offset,0,10000000);return {items:store.listEntities(table,{...filter,limit,offset}),total:Number(prepared(`SELECT COUNT(*)AS n FROM ${table}${f.sql}`).get(...f.params).n),limit,offset};},
     saveEntity(table,value){return transaction(()=>entityRaw(table,value,table==='audit'||table==='diagnostics'));},
     deleteEntity(table,id){entityTable(table);if(table==='audit')throw new Error('Auditoria imutável.');return remove(table,id);},
     addAudit(record){const value={...redacted(record),id:record.id||randomUUID(),at:record.at??Date.now()};return transaction(()=>entityRaw('audit',value,true));},
@@ -217,16 +285,37 @@ async function createStore(dir,options={}) {
     saveNotification(record){const value={...redacted(record),id:record.id||randomUUID(),at:record.at??Date.now()};return transaction(()=>entityRaw('notifications',value));},
     listHistory:filter=>historyPage(filter),
     exportHistory(filter={}){return {...historyPage({...filter,limit:filter.limit??100000,offset:filter.offset??0},100000),exportedAt:new Date().toISOString()};},
-    cleanupPreview(input){const cats=categories(Array.isArray(input)?input:input?.categories),counts=Object.fromEntries(cats.map(c=>[c,Number(prepared('SELECT COUNT(*)AS n FROM history WHERE category=?').get(c).n)]));return {categories:cats,counts,total:Object.values(counts).reduce((a,b)=>a+b,0)};},
-    clearHistory({categories:input,actor}={}){return transaction(()=>{const preview=store.cleanupPreview(input);for(const category of preview.categories){prepared('DELETE FROM history WHERE category=?').run(category);if(category==='errors')db.exec('DELETE FROM diagnostics');if(category==='notifications')db.exec('DELETE FROM notifications');}const audit=store.addAudit({actorId:typeof actor==='string'?actor:actor?.id??actor?.userId??null,actorName:actor?.name??null,action:'history.clear',at:Date.now(),detail:{categories:preview.categories,counts:preview.counts},preserved:'operational jobs, rounds, alerts, users, campaigns, media and audit'});return {...preview,auditId:audit.id};});},
+    cleanupPreview(input){const cats=categories(Array.isArray(input)?input:input?.categories),counts=Object.fromEntries(cats.map(c=>[c,Number(prepared('SELECT COUNT(*)AS n FROM history WHERE category=? AND storageMode=?').get(c,storageMode()).n)]));return {categories:cats,counts,total:Object.values(counts).reduce((a,b)=>a+b,0)};},
+    clearHistory({categories:input,actor}={}){return transaction(()=>{const preview=store.cleanupPreview(input);for(const category of preview.categories){prepared('DELETE FROM history WHERE category=? AND storageMode=?').run(category,storageMode());if(category==='errors')prepared('DELETE FROM diagnostics WHERE storageMode=?').run(storageMode());if(category==='notifications')prepared('DELETE FROM notifications WHERE storageMode=?').run(storageMode());}const audit=store.addAudit({actorId:typeof actor==='string'?actor:actor?.id??actor?.userId??null,actorName:actor?.name??null,action:'history.clear',at:Date.now(),detail:{categories:preview.categories,counts:preview.counts},preserved:'operational jobs, rounds, alerts, users, campaigns, media and audit'});return {...preview,auditId:audit.id};});},
     applyHistoryRetention:config=>transaction(()=>retentionRaw(config)),applyRetention:config=>transaction(()=>retentionRaw(config)),
-    exportData(){return {format:'mega-disparos',version:1,createdAt:new Date().toISOString(),campaigns:all('campaigns'),groups:all('groups_data'),templates:all('templates'),contacts:all('contacts'),alertRecipients:all('alert_recipients'),settings:all('settings').filter(s=>!PRIVATE_SETTING.test(s.id)),media:all('media')};},
-    importData(data){data=require('./backup-validation.cjs').validateBackupData(data);return transaction(()=>{const localSettings=all('settings').filter(s=>PRIVATE_SETTING.test(s.id)&&s.id!=='integrationMode');for(const table of ['campaigns','groups_data','templates','media','settings','contacts','alert_recipients'])db.exec(`DELETE FROM ${table}`);for(const c of data.campaigns)putRaw('campaigns',{...c,state:'draft',nextRunAt:null,revision:(c.revision||0)+1,configRevision:(c.configRevision||c.revision||0)+1});for(const g of data.groups)putRaw('groups_data',g);for(const t of data.templates||[])putRaw('templates',t);for(const m of data.media||[])putRaw('media',m);for(const c of data.contacts||[])entityRaw('contacts',c);for(const r of data.alertRecipients||[])entityRaw('alert_recipients',r);for(const s of data.settings||[])if(!PRIVATE_SETTING.test(s.id))putRaw('settings',s);for(const s of localSettings)putRaw('settings',s);putRaw('settings',{id:'integrationMode',value:'simulated'});putRaw('settings',{id:'initialized',value:true});});},
+    exportData(){return {format:'mega-disparos',version:1,storageMode:storageMode(),createdAt:new Date().toISOString(),campaigns:all('campaigns'),groups:all('groups_data'),templates:all('templates'),contacts:all('contacts'),alertRecipients:all('alert_recipients'),settings:all('settings').filter(s=>!PRIVATE_SETTING.test(s.id)),media:all('media')};},
+    importData(data){
+      data=require('./backup-validation.cjs').validateBackupData(data);
+      const targetMode=['simulated','whatsapp'].includes(data.storageMode)?data.storageMode:data.groups.length&&data.groups.every(g=>g.simulation)?'simulated':'whatsapp';
+      if(data.groups.some(g=>Boolean(g.simulation)!==(targetMode==='simulated')))throw new Error('Backup inválido: grupos de simulação e reais não podem ser misturados.');
+      return transaction(()=>{
+        putRaw('settings',{id:'integrationMode',value:targetMode});
+        for(const table of ['campaigns','groups_data','templates','media','contacts','alert_recipients'])prepared(`DELETE FROM ${table} WHERE storageMode=?`).run(targetMode);
+        for(const s of all('settings'))if(!PRIVATE_SETTING.test(s.id))prepared('DELETE FROM settings WHERE id=?').run(s.id);
+        for(const c of data.campaigns)putRaw('campaigns',{...c,state:'draft',nextRunAt:null,revision:(c.revision||0)+1,configRevision:(c.configRevision||c.revision||0)+1});
+        for(const g of data.groups)putRaw('groups_data',g);for(const t of data.templates||[])putRaw('templates',t);for(const m of data.media||[])putRaw('media',m);
+        for(const c of data.contacts||[])entityRaw('contacts',c);for(const r of data.alertRecipients||[])entityRaw('alert_recipients',r);
+        for(const s of data.settings||[])if(!PRIVATE_SETTING.test(s.id))putRaw('settings',s);
+        putRaw('settings',{id:'initialized',value:true});
+      });
+    },
+    registerOutboundMessageId(id,{kind='automation',at=Date.now()}={}){if(typeof id!=='string'||!id||id.length>256)throw new Error('Identificador de mensagem inválido.');return transaction(()=>prepared('INSERT OR IGNORE INTO automation_outbound(id,at,storageMode,kind) VALUES(?,?,?,?)').run(id,Number(at),storageMode(),String(kind).slice(0,50)));},
+    isOutboundMessageId(id){
+      if(typeof id!=='string'||!id)return false;
+      if(prepared('SELECT id FROM automation_outbound WHERE id=?').get(id)||prepared('SELECT id FROM jobs WHERE messageId=? LIMIT 1').get(id)||prepared("SELECT id FROM jobs WHERE json_extract(data,'$.clientMessageId')=? LIMIT 1").get(id)||prepared("SELECT id FROM alerts WHERE json_extract(data,'$.messageId')=? LIMIT 1").get(id)||prepared("SELECT id FROM alerts WHERE json_extract(data,'$.clientMessageId')=? LIMIT 1").get(id))return true;
+      for(const table of ['buscas_deliveries','buscas_deliveries_simulation'])if(prepared("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table)&&prepared(`SELECT id FROM ${table} WHERE messageId=? LIMIT 1`).get(id))return true;
+      return false;
+    },
     close(){if(!closed){try{if(!persistenceFailed)db.exec('PRAGMA wal_checkpoint(TRUNCATE)');}finally{db.close();closed=true;statements.clear();}}}
   };
   Object.assign(store,{listUsers:filter=>store.listEntities('users',filter),saveAlert:value=>store.saveEntity('alerts',value),getAlert:id=>store.getEntity('alerts',id),listAlerts:filter=>store.listEntities('alerts',filter),updateAlert:(id,patch)=>{const old=store.getAlert(id);if(!old)throw new Error('Alerta não encontrado.');return store.saveAlert({...old,...patch});},saveAlertRecipient:value=>store.saveEntity('alert_recipients',value),getAlertRecipient:id=>store.getEntity('alert_recipients',id),listAlertRecipients:filter=>store.listEntities('alert_recipients',filter),deleteAlertRecipient:id=>store.deleteEntity('alert_recipients',id),
-    listPendingAlerts({at=Date.now(),channel,limit=50}={}){return parseRows(prepared(`SELECT data FROM alerts WHERE status='pending' AND COALESCE(json_extract(data,'$.nextAttemptAt'),0)<=?${channel?" AND json_extract(data,'$.channel')=?":''} ORDER BY createdAt ASC,rowid ASC LIMIT ?`).all(at,...(channel?[channel]:[]),clamp(limit,50,500)));},
-    findAlertsByMessageId(messageId){return parseRows(prepared("SELECT data FROM alerts WHERE json_extract(data,'$.messageId')=? AND status='uncertain' LIMIT 10").all(messageId));}
+    listPendingAlerts({at=Date.now(),channel,limit=50}={}){return parseRows(prepared(`SELECT data FROM alerts WHERE storageMode=? AND status='pending' AND COALESCE(json_extract(data,'$.nextAttemptAt'),0)<=?${channel?" AND json_extract(data,'$.channel')=?":''} ORDER BY createdAt ASC,rowid ASC LIMIT ?`).all(storageMode(),at,...(channel?[channel]:[]),clamp(limit,50,500)));},
+    findAlertsByMessageId(messageId){return parseRows(prepared("SELECT data FROM alerts WHERE json_extract(data,'$.messageId')=? AND storageMode=? AND status IN('sending','uncertain','confirmed','delivered','failed') LIMIT 10").all(messageId,storageMode()));}
   });
   // This one-time migration marker preserves deliberately cleared histories.
   if(!getSetting('historyProjectionInitialized',false))transaction(()=>{for(const row of prepared('SELECT data FROM jobs ORDER BY rowid DESC LIMIT 10000').all()){const j=JSON.parse(row.data);projection('sends',j.id,j);}for(const row of prepared('SELECT data FROM rounds ORDER BY rowid DESC LIMIT 10000').all()){const r=JSON.parse(row.data);projection('campaigns',`round:${r.id}`,{...r,kind:'round'});}putRaw('settings',{id:'historyProjectionInitialized',value:true});retentionRaw();});
@@ -237,8 +326,8 @@ function seed(store) {
   if(store.getSetting('initialized',false))return;
   store.transaction(()=>{
     for(const[key,value]of Object.entries({integrationMode:'simulated',admins:[],theme:'dark',maxSelectedGroups:15,launchAtLogin:false,closeBehavior:'ask',minimizeToTray:true,unofficialAcknowledged:false,historyRetentionDays:30,historyMaxRows:10000,historyMaxBytes:10485760}))store.setSetting(key,value);
-    const groups=Array.from({length:15},(_,i)=>({id:`sim-${String(i+1).padStart(2,'0')}@simulation`,name:`Grupo de exemplo ${String(i+1).padStart(2,'0')}`,authorized:true,simulation:true}));store.upsertGroups(groups);
-    store.saveCampaign({id:randomUUID(),name:'Exemplo • 15 grupos a cada 10 minutos',state:'draft',mode:'repeat',intervalMinutes:10,spacingSeconds:5,schedule:{days:[0,1,2,3,4,5,6],startTime:'08:00',endTime:'18:00',startDate:'',endDate:''},dailyRoundLimit:0,dailySendLimit:0,groupIds:groups.map(g=>g.id),items:[{id:randomUUID(),type:'text',text:'Olá, pessoal! 👋\n\n*Mensagem de exemplo do Mega Disparos*\nEsta campanha está desativada e utiliza apenas grupos simulados.\nhttps://www.whatsapp.com/'}],groupOverrides:{},nextRunAt:null,roundIndex:0});store.setSetting('initialized',true);
+    const groups=Array.from({length:15},(_,i)=>({id:`sim-${String(i+1).padStart(2,'0')}@simulation`,name:`Grupo de exemplo ${String(i+1).padStart(2,'0')}`,authorized:true,simulation:true,provenance:'builtin-simulation-example-v1'}));store.upsertGroups(groups);
+    store.saveCampaign({id:randomUUID(),name:'Exemplo • 15 grupos a cada 10 minutos',provenance:'builtin-simulation-example-v1',state:'draft',mode:'repeat',intervalMinutes:10,spacingSeconds:5,schedule:{days:[0,1,2,3,4,5,6],startTime:'08:00',endTime:'18:00',startDate:'',endDate:''},dailyRoundLimit:0,dailySendLimit:0,groupIds:groups.map(g=>g.id),items:[{id:randomUUID(),type:'text',text:'Olá, pessoal! 👋\n\n*Mensagem de exemplo do Kenned Code Disparos*\nEsta campanha está desativada e utiliza apenas grupos simulados.\nhttps://www.whatsapp.com/'}],groupOverrides:{},nextRunAt:null,roundIndex:0});store.setSetting('initialized',true);
   });
 }
 module.exports={createStore,atomicWrite,seed,HISTORY_CATEGORIES};

@@ -5,7 +5,7 @@ const { EventEmitter } = require('node:events');
 const { AlertService, alertText } = require('../src/core/alerts.cjs');
 const copy = value => value === undefined ? undefined : structuredClone(value);
 
-function fixture({ connected = true, privateSend, webhook, settings = {}, users = [], timerDeps = {} } = {}) {
+function fixture({ connected = true, mode = 'simulated', privateSend, webhook, settings = {}, users = [], timerDeps = {} } = {}) {
   const clock = { value: Date.parse('2026-10-01T12:00:00Z') };
   const tables = new Map();
   const campaigns = new Map([['c1', { id: 'c1', name: 'Ofertas', state: 'active', configRevision: 1, ownerId: 'u1', responsibleUserIds: ['u2'], alertRecipientIds: ['r1'], retryPolicy: { maxAttempts: 2, delaySeconds: 5 } }]]);
@@ -13,6 +13,7 @@ function fixture({ connected = true, privateSend, webhook, settings = {}, users 
   const store = {
     persistenceFailed: false,
     getSetting: (key, fallback) => prefs.has(key) ? copy(prefs.get(key)) : fallback,
+    setSetting: (key, value) => { prefs.set(key, copy(value)); return copy(value); },
     getCampaign: id => copy(campaigns.get(id)), listCampaigns: () => [...campaigns.values()].map(copy),
     saveCampaign: c => { campaigns.set(c.id, copy(c)); return copy(c); },
     listJobs: () => [],
@@ -24,7 +25,7 @@ function fixture({ connected = true, privateSend, webhook, settings = {}, users 
   store.saveEntity('alert_recipients', { id: 'r1', name: 'Dono', phone: '5511999999999', enabled: true });
   for (const u of users) store.saveEntity('users', u);
   const adapter = new EventEmitter();
-  adapter.status = { state: connected ? 'connected' : 'disconnected', mode: 'simulated' };
+  adapter.status = { state: connected ? 'connected' : 'disconnected', mode };
   adapter.minimumSpacingSeconds = 3;
   const calls = [];
   adapter.sendPrivate = async (phone, text, options) => {
@@ -143,7 +144,7 @@ test('automatic resume is opt-in and only resumes previously active unchanged co
 
 test('independent HTTPS channel is marked channel acceptance and works while WhatsApp is disconnected', async () => {
   const seen = [];
-  const f = fixture({ connected: false, settings: { independentAlertChannel: { enabled: true, url: 'https://alerts.example.test/events', secretId: 'webhook-token' } }, webhook: async request => { seen.push(request); return { status: 'confirmed' }; } });
+  const f = fixture({ connected: false, mode: 'whatsapp', settings: { independentAlertChannel: { enabled: true, url: 'https://alerts.example.test/events', secretId: 'webhook-token' } }, webhook: async request => { seen.push(request); return { status: 'confirmed' }; } });
   f.service.recordIncident(f.incident); await f.service.flush();
   assert.equal(seen.length, 1); assert.equal(f.calls.length, 0);
   const alerts = f.store.listEntities('alerts'); assert.equal(alerts.find(x => x.channel === 'webhook').confirmationScope, 'channel-accepted');
@@ -250,4 +251,190 @@ test('pending alerts use bounded indexed batches and concurrent flush calls shar
   release(); await first; assert.equal(f.calls.length, 50); assert.equal(f.scheduler.holds, 0);
   await f.service.flush(); assert.equal(f.calls.length, 65); assert(requested.every(r => r.limit === 50));
   assert.equal(new Set(f.calls.map(c => c.options.clientMessageId)).size, 65); await f.service.shutdown();
+});
+
+test('disconnect immediately persists one local occurrence and private pending notices for owners and configured recipients', async () => {
+  const f = fixture({ mode: 'whatsapp', users: [{ id: 'owner', roleId: 'role-owner', active: true, phone: '5521988888888' }] });
+  f.service.start();
+  f.adapter.status = { state: 'disconnected', mode: 'whatsapp', reasonCode: 'internet', at: f.clock.value, errorCode: 'NETWORK_OFFLINE' };
+  f.adapter.emit('status', f.adapter.status); f.adapter.emit('status', f.adapter.status);
+  await new Promise(resolve => setImmediate(resolve)); await f.service.flush();
+  assert.equal(f.local.length, 1);
+  let alerts = f.store.listEntities('alerts'); assert.equal(alerts.length, 2); assert.equal(f.calls.length, 0);
+  assert(alerts.every(alert => alert.status === 'pending' && alert.originalAt === f.clock.value && alert.traceId === f.local[0].traceId));
+  assert(alerts[0].text.includes('Ocorrência original:')); assert(alerts[0].text.includes('Kenned Code Disparos'));
+  const failureTime = f.clock.value; f.clock.value += 3600000;
+  f.adapter.status = { state: 'connected', mode: 'whatsapp' }; f.adapter.emit('status', f.adapter.status); await f.service.flush();
+  alerts = f.store.listEntities('alerts'); assert.equal(f.calls.length, 2);
+  assert(alerts.every(alert => alert.status === 'confirmed' && alert.originalAt === failureTime && alert.resultAt >= failureTime + 3600000));
+  await f.service.shutdown();
+});
+
+test('global critical incidents use explicit system recipient selection and a separately recorded occurrence', async () => {
+  const f = fixture({ connected: false, settings: { systemAlertRecipientIds: ['r2'] }, users: [{ id: 'owner', roleId: 'role-owner', active: true, phone: '5521988888888' }] });
+  f.store.saveEntity('alert_recipients', { id: 'r2', enabled: true, phone: '5531988888888' });
+  f.store.saveEntity('alert_recipients', { id: 'off', enabled: false, phone: '5541988888888' });
+  const occurrence = { id: 'system-fatal', code: 'PROCESSING_FAILURE', at: f.clock.value, reason: 'Falha crítica no processamento.', event: 'critical' };
+  const first = f.service.recordSystemIncident(occurrence); const second = f.service.recordSystemIncident(occurrence);
+  await f.service.flush();
+  assert.equal(first.traceId, occurrence.id); assert.equal(second.occurrenceId, first.occurrenceId);
+  assert.equal(f.local.length, 1); assert.equal(f.store.listEntities('notifications').length, 1);
+  const alerts = f.store.listEntities('alerts'); assert.deepEqual(alerts.map(a => a.number).sort(), ['5521988888888', '5531988888888']);
+  const occurrenceLogs = f.store.listEntities('diagnostics').filter(d => d.stage === 'alerta.occurrence'); assert.equal(occurrenceLogs.length, 1);
+  assert(alerts.every(a => a.traceId === occurrence.id && a.status === 'pending')); await f.service.shutdown();
+});
+
+test('per-recipient test and full alert test share the production occurrence notification and queue pipeline', async () => {
+  const f = fixture({ connected: false });
+  const one = await f.service.testRecipient('5511999999999', 'owner', { recipientId: 'r1' });
+  assert.equal(one.status, 'pending'); assert.equal(f.local.length, 1); assert.equal(f.local[0].traceId, one.traceId);
+  assert(one.text.includes('Kenned Code Disparos')); assert(!one.text.includes('Mega Disparos'));
+  const all = await f.service.testAlert({ userId: 'owner', event: 'critical' });
+  assert.equal(all.alerts.length, 1); assert.equal(all.alerts[0].status, 'pending'); assert.equal(f.local.length, 2);
+  assert.equal(f.store.getCampaign('c1').state, 'active'); assert.equal(f.calls.length, 0);
+  assert.equal(f.store.listEntities('audit').filter(a => a.action === 'alert.test').length, 2); await f.service.shutdown();
+});
+
+test('the own account recipient is resolved by the integration and confirmation is recorded only after transport acknowledgement', async () => {
+  let resolved = 0, release;
+  const f = fixture({ mode: 'whatsapp', privateSend: async ({ options }) => { await new Promise(resolve => { release = resolve; }); return { status: 'confirmed', messageId: options.clientMessageId }; } });
+  f.adapter.resolveRecipient = async phone => { resolved++; assert.equal(phone, '5511999999999'); return { jid: '5511999999999@s.whatsapp.net', phone, isSelf: true, mode: 'whatsapp', simulation: false }; };
+  const pending = f.service.testRecipient('5511999999999', 'owner');
+  await new Promise(resolve => setImmediate(resolve));
+  let alert = f.store.listEntities('alerts')[0]; assert.equal(alert.status, 'sending'); assert.equal(alert.isSelf, true); assert.equal(alert.targetId, '5511999999999@s.whatsapp.net'); assert.equal(alert.confirmationScope, undefined);
+  release(); alert = await pending; assert.equal(alert.status, 'confirmed'); assert.equal(alert.confirmationScope, 'whatsapp-server'); assert.equal(resolved, 1);
+  const stages = f.store.listEntities('diagnostics').filter(d => d.traceId === alert.traceId).map(d => d.stage);
+  assert.deepEqual(stages, ['alerta.occurrence', 'alerta.queue', 'alerta.recipient', 'alerta.result']); await f.service.shutdown();
+});
+
+test('recipient resolution failures never submit and show an actionable reason without exposing provider secrets', async () => {
+  const f = fixture({ mode: 'whatsapp' });
+  f.adapter.resolveRecipient = async () => { throw Object.assign(new Error('token=provider-private-secret'), { code: 'RECIPIENT_NOT_REGISTERED', definitive: true }); };
+  const alert = await f.service.testRecipient('5511999999999', 'owner');
+  assert.equal(alert.status, 'failed'); assert.equal(alert.errorCode, 'RECIPIENT_NOT_REGISTERED'); assert.equal(alert.retryEligible, true); assert.match(alert.error, /país, DDD e número/); assert.equal(f.calls.length, 0);
+  await f.service.flush(); assert.equal(f.calls.length, 0); assert.equal(f.store.getEntity('alerts', alert.id).attempts, 1);
+  assert(!JSON.stringify(f.store.listEntities('diagnostics')).includes('provider-private-secret')); await f.service.shutdown();
+});
+
+test('known failed alerts support an explicit audited retry while uncertain and confirmed alerts reject it', async () => {
+  let fail = true;
+  const f = fixture({ privateSend: ({ options }) => { if (fail) throw Object.assign(new Error('Known rejection'), { definitive: true, code: 'RECIPIENT_NOT_REGISTERED' }); return { status: 'confirmed', messageId: options.clientMessageId }; } });
+  const alert = await f.service.testRecipient('5511999999999', 'owner'); assert.equal(alert.status, 'failed'); assert.equal(alert.retryEligible, true);
+  fail = false; const retried = await f.service.retryAlert(alert.id, { userId: 'owner' });
+  assert.equal(retried.status, 'confirmed'); assert.equal(f.calls.length, 2); assert.equal(f.calls[0].options.clientMessageId, f.calls[1].options.clientMessageId);
+  assert.equal(f.store.listEntities('audit').filter(a => a.action === 'alert.retry').length, 1);
+  await assert.rejects(f.service.retryAlert(alert.id, { userId: 'owner' }), /incertos/);
+  f.store.saveEntity('alerts', { id: 'uncertain-retry', status: 'uncertain', retryEligible: false });
+  await assert.rejects(f.service.retryAlert('uncertain-retry', { userId: 'owner' }), /incertos/); await f.service.shutdown();
+});
+
+test('late delivered receipt reconciles uncertain or reviewed work without duplication and never degrades on a later server ACK', async () => {
+  const f = fixture({ privateSend: ({ options }) => ({ status: 'uncertain', messageId: options.clientMessageId }) });
+  f.service.start(); const alert = await f.service.testRecipient('5511999999999', 'owner');
+  await f.service.resolveUncertain(alert.id, { confirmed: false, userId: 'owner' });
+  f.adapter.emit('receipt', { status: 'confirmed', messageId: alert.messageId, confirmationScope: 'whatsapp-delivered', deliveredAt: f.clock.value + 30000 });
+  let stored = f.store.getEntity('alerts', alert.id); assert.equal(stored.status, 'delivered'); assert.equal(stored.deliveredAt, f.clock.value + 30000); assert.equal(stored.retryEligible, false);
+  f.adapter.emit('receipt', { status: 'confirmed', messageId: alert.messageId, confirmationScope: 'whatsapp-server' });
+  stored = f.store.getEntity('alerts', alert.id); assert.equal(stored.status, 'delivered'); assert.equal(stored.confirmationScope, 'whatsapp-delivered');
+  await assert.rejects(f.service.retryAlert(alert.id, { userId: 'owner' }), /incertos/); await f.service.flush(); assert.equal(f.calls.length, 1); await f.service.shutdown();
+});
+
+test('a receipt delivered during transport submission cannot be overwritten by a late uncertain transport result', async () => {
+  const f = fixture({ privateSend: ({ options, adapter }) => { adapter.emit('receipt', { messageId: options.clientMessageId, status: 'confirmed', confirmationScope: 'whatsapp-read', readAt: f.clock.value }); return { status: 'uncertain', messageId: options.clientMessageId }; } });
+  f.service.start(); const alert = await f.service.testRecipient('5511999999999', 'owner');
+  assert.equal(alert.status, 'delivered'); assert.equal(alert.confirmationScope, 'whatsapp-read'); assert.equal(alert.readAt, f.clock.value); assert.equal(alert.error, null); assert.equal(f.calls.length, 1); await f.service.shutdown();
+});
+
+test('simulation never invokes an independent real webhook and simulated private work cannot leak after adapter mode switch', async () => {
+  let webhookCalls = 0;
+  const f = fixture({ connected: false, mode: 'simulated', settings: { independentAlertChannel: { enabled: true, url: 'https://alerts.example.test/events' } }, webhook: async () => { webhookCalls++; return { status: 'confirmed' }; } });
+  f.service.recordIncident(f.incident); await f.service.flush(); assert.equal(webhookCalls, 0);
+  const webhook = f.store.listEntities('alerts').find(a => a.channel === 'webhook'); assert.equal(webhook.status, 'failed'); assert.equal(webhook.errorCode, 'SIMULATION_EXTERNAL_SEND_BLOCKED');
+  const real = new EventEmitter(); real.status = { state: 'connected', mode: 'whatsapp' }; real.minimumSpacingSeconds = 3; real.sendPrivate = async () => { throw new Error('Simulation must not reach this real adapter'); };
+  f.service.setAdapter(real); await f.service.flush(); assert.equal(f.calls.length, 0);
+  assert.equal(f.store.listEntities('alerts').find(a => a.channel === 'whatsapp').status, 'pending'); await f.service.shutdown();
+});
+
+test('removing or disabling a private recipient while offline prevents any queued delivery after reconnection', async () => {
+  const f = fixture({ connected: false });
+  f.service.recordIncident(f.incident); await f.service.flush();
+  f.store.saveEntity('alert_recipients', { id: 'r1', phone: '5511999999999', enabled: false });
+  f.adapter.status = { state: 'connected', mode: 'simulated' }; await f.service.flush();
+  const alert = f.store.listEntities('alerts')[0]; assert.equal(alert.status, 'failed'); assert.equal(alert.errorCode, 'ALERT_RECIPIENT_DISABLED'); assert.equal(f.calls.length, 0); await f.service.shutdown();
+});
+
+test('critical scheduler failures notify once per unresolved occurrence and create a new occurrence after recovery', async () => {
+  const f = fixture({ connected: false }); f.service.start();
+  f.scheduler.emit('change', { error: 'token=should-not-leak', code: 'PROCESSING_FAILURE' }); f.scheduler.emit('change', { error: 'Repeated failure', code: 'PROCESSING_FAILURE' });
+  await f.service.flush(); assert.equal(f.local.length, 1); assert.equal(f.store.listEntities('alerts').length, 1);
+  f.scheduler.emit('change'); f.scheduler.emit('change', { error: 'New failure', code: 'PROCESSING_FAILURE' });
+  await f.service.flush(); assert.equal(f.local.length, 2); assert.equal(f.store.listEntities('alerts').length, 2);
+  assert(!JSON.stringify(f.store.listEntities('diagnostics')).includes('should-not-leak')); await f.service.shutdown();
+});
+
+test('a persisted offline disconnect is reused on restart instead of generating duplicate pending alerts', async () => {
+  const f = fixture({ mode: 'whatsapp' }); f.service.start();
+  f.adapter.status = { state: 'disconnected', mode: 'whatsapp', reasonCode: 'internet', at: f.clock.value };
+  f.adapter.emit('status', f.adapter.status); await new Promise(resolve => setImmediate(resolve)); await f.service.flush(); await f.service.shutdown();
+  const original = f.store.listEntities('alerts')[0]; const restart = new AlertService({ store: f.store, scheduler: f.scheduler, adapter: f.adapter, now: () => f.clock.value, sleep: async ms => { f.clock.value += ms; } });
+  restart.start(); f.adapter.emit('status', f.adapter.status); await new Promise(resolve => setImmediate(resolve)); await restart.flush();
+  assert.equal(f.store.listEntities('alerts').length, 1); assert.equal(f.store.listEntities('notifications').length, 1);
+  f.adapter.status = { state: 'connected', mode: 'whatsapp' }; f.adapter.emit('status', f.adapter.status); await restart.flush();
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].options.clientMessageId, original.messageId); await restart.shutdown();
+});
+
+test('a recipient disabled while WhatsApp resolves its private identifier is revalidated before submission', async () => {
+  let releaseLookup;
+  const f = fixture({ mode: 'whatsapp' });
+  f.adapter.resolveRecipient = async phone => { await new Promise(resolve => { releaseLookup = resolve; }); return { jid: `${phone}@s.whatsapp.net`, mode: 'whatsapp' }; };
+  const testing = f.service.testRecipient('5511999999999', 'owner', { recipientId: 'r1' });
+  await new Promise(resolve => setImmediate(resolve));
+  f.store.saveEntity('alert_recipients', { id: 'r1', enabled: false, phone: '5511999999999' }); releaseLookup();
+  const alert = await testing; assert.equal(alert.status, 'failed'); assert.equal(alert.errorCode, 'ALERT_RECIPIENT_DISABLED'); assert.equal(f.calls.length, 0); await f.service.shutdown();
+});
+
+test('an active user who lost ownership while the private alert was pending no longer receives the global failure', async () => {
+  const f = fixture({ connected: false, users: [{ id: 'owner', roleId: 'role-owner', active: true, phone: '5521988888888' }], settings: { systemAlertRecipientIds: [] } });
+  f.service.recordSystemIncident({ id: 'global-owner-only', event: 'critical', at: f.clock.value, code: 'SYSTEM_ERROR', reason: 'Falha do sistema.' }); await f.service.flush();
+  f.store.saveEntity('users', { id: 'owner', roleId: 'role-manager', active: true, phone: '5521988888888' });
+  f.adapter.status = { state: 'connected', mode: 'simulated' }; await f.service.flush();
+  const alert = f.store.listEntities('alerts')[0]; assert.equal(alert.status, 'failed'); assert.equal(alert.errorCode, 'ALERT_RECIPIENT_DISABLED'); assert.equal(f.calls.length, 0); await f.service.shutdown();
+});
+
+test('a confirmed delivery receipt wins over a later rejected transport promise and cannot become retryable work', async () => {
+  const f = fixture({ privateSend: ({ options, adapter }) => { adapter.emit('receipt', { messageId: options.clientMessageId, status: 'confirmed', confirmationScope: 'whatsapp-delivered', deliveredAt: f.clock.value }); throw Object.assign(new Error('Late request failure'), { safeToRetry: true, code: 'WA_PRE_SUBMISSION_TEMPORARY' }); } });
+  f.service.start(); const alert = await f.service.testRecipient('5511999999999', 'owner');
+  assert.equal(alert.status, 'delivered'); assert.equal(alert.confirmationScope, 'whatsapp-delivered'); assert.equal(alert.retryEligible, false); assert.equal(alert.error, null);
+  f.clock.value += 3600000; await f.service.flush(); assert.equal(f.calls.length, 1); await assert.rejects(f.service.retryAlert(alert.id, { userId: 'owner' }), /incertos/); await f.service.shutdown();
+});
+
+test('the real integration unsupported-recipient code gives the user an update instruction and cannot retry infinitely', async () => {
+  const f = fixture({ mode: 'whatsapp' });
+  f.adapter.resolveRecipient = async () => { throw Object.assign(new Error('Provider credentials must not be logged'), { code: 'WA_RECIPIENT_UNSUPPORTED', definitive: true }); };
+  const alert = await f.service.testRecipient('5511999999999', 'owner');
+  assert.equal(alert.status, 'failed'); assert.equal(alert.attempts, 1); assert.match(alert.error, /Atualize o aplicativo/); assert.equal(f.calls.length, 0);
+  await f.service.flush(); assert.equal(f.store.getEntity('alerts', alert.id).attempts, 1); await f.service.shutdown();
+});
+
+test('the real integration known presubmission temporary failure remains retryable despite definitive outcome classification', async () => {
+  let lookups = 0;
+  const f = fixture({ mode: 'whatsapp' });
+  f.adapter.resolveRecipient = async phone => { lookups++; if (lookups === 1) throw Object.assign(new Error('Known lookup timeout'), { code: 'WA_RECIPIENT_TIMEOUT', definitive: true, safeToRetry: true }); return { jid: `${phone}@s.whatsapp.net`, mode: 'whatsapp' }; };
+  let alert = await f.service.testRecipient('5511999999999', 'owner'); assert.equal(alert.status, 'pending'); assert.equal(f.calls.length, 0); assert.equal(lookups, 1);
+  f.clock.value += 15000; await f.service.flush(); alert = f.store.getEntity('alerts', alert.id);
+  assert.equal(alert.status, 'confirmed'); assert.equal(f.calls.length, 1); assert.equal(lookups, 2); assert.equal(alert.attempts, 2); await f.service.shutdown();
+});
+
+test('real read proof stays stronger than later delivery proof or server acceptance', async () => {
+  const f = fixture(); f.service.start(); const alert = await f.service.testRecipient('5511999999999', 'owner');
+  f.adapter.emit('receipt', { messageId: alert.messageId, status: 'confirmed', confirmationScope: 'whatsapp-read', readAt: f.clock.value + 10000 });
+  f.adapter.emit('receipt', { messageId: alert.messageId, status: 'confirmed', confirmationScope: 'whatsapp-delivered', deliveredAt: f.clock.value + 5000 });
+  f.adapter.emit('receipt', { messageId: alert.messageId, status: 'confirmed', confirmationScope: 'whatsapp-server' });
+  const stored = f.store.getEntity('alerts', alert.id); assert.equal(stored.status, 'delivered'); assert.equal(stored.confirmationScope, 'whatsapp-read'); assert.equal(stored.readAt, f.clock.value + 10000); assert.equal(f.calls.length, 1); await f.service.shutdown();
+});
+
+test('a simulation-only receipt never claims a real WhatsApp server confirmation scope', async () => {
+  const f = fixture({ mode: 'simulated', privateSend: ({ options, adapter }) => { adapter.emit('receipt', { messageId: options.clientMessageId, status: 'confirmed', confirmationScope: 'simulation-only', mode: 'simulated', simulation: true }); return { status: 'confirmed', messageId: options.clientMessageId, simulation: true }; } });
+  f.service.start(); const alert = await f.service.testRecipient('5511999999999', 'owner');
+  assert.equal(alert.status, 'confirmed'); assert.equal(alert.confirmationScope, 'simulation-only'); assert.equal(alert.simulation, true); assert.equal(f.calls.length, 1); await f.service.shutdown();
 });

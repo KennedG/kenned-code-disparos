@@ -13,7 +13,7 @@ const offer=(extra={})=>({model:'iPhone 18 Pro Max',modelKey:'iphone-18-pro-max'
 test('schema v4 migrates narrowly preserving campaign progress and producing an original pre-migration copy',async t=>{
   const {store:s,open}=await fixture(t);seed(s);s.insertJob({id:'j1',roundId:'r1',campaignId:'c1',groupId:'g1',itemId:'i1',status:'confirmed',attempts:1,createdAt:at,messageId:'NEVER-REPEAT'});s.clearHistory({actor:'owner'});s.close();
   const db=new DatabaseSync(s.filename);db.exec('PRAGMA user_version=4');db.close();const before=fs.readFileSync(s.filename);
-  const upgraded=await open();assert.equal(upgraded.schemaVersion,5);assert.equal(upgraded.getJob('j1').messageId,'NEVER-REPEAT');assert.equal(upgraded.listHistory().total,0);assert.equal(upgraded.listCampaigns().length,1);assert.equal(upgraded.getSearchMonitorStats().offers,0);
+  const upgraded=await open();assert.equal(upgraded.schemaVersion,6);assert.equal(upgraded.getJob('j1').messageId,'NEVER-REPEAT');assert.equal(upgraded.listHistory().total,0);assert.equal(upgraded.listCampaigns().length,1);assert.equal(upgraded.getSearchMonitorStats().offers,0);
   const files=fs.readdirSync(path.join(upgraded.dir,'backups'));assert.equal(files.length,1);assert.deepEqual(fs.readFileSync(path.join(upgraded.dir,'backups',files[0])),before);
 });
 
@@ -104,4 +104,22 @@ test('portable backup excludes captured data and grants; ordinary campaign resto
 
 test('retention removes captured source/offers and visible old search history without losing operational delivery or dedupe',async t=>{
   const {store:s}=await fixture(t);s.upsertSearchMessage(message('old',{originalAt:at-40*86400000}),[offer()]);s.upsertSearchMessage(message('fresh'),[offer({supplierKey:'fresh'})]);s.claimSearchRun({id:'run',chatId:'private',messageId:'cmd',userId:'owner',createdAt:at-100*86400000,status:'done'});s.saveSearchDelivery({id:'pending',runId:'run',status:'pending',createdAt:at});const result=s.applySearchRetention({days:30,at,historyDays:90});assert.equal(result.removed,1);assert.equal(s.querySearchOffers().total,1);assert.equal(s.listSearchHistory().total,0);assert.equal(s.getSearchRun('run').messageId,'cmd');assert.equal(s.getSearchDelivery('pending').status,'pending');
+});
+
+test('real and simulation search storage have independent messages, grants, runs, deliveries, counters and cleanup even with identical IDs',async t=>{
+  const {store:s,open}=await fixture(t);
+  s.setSetting('integrationMode','simulated');s.setSetting('buscasSettings',{enabled:true,prefix:'!sim'});s.upsertSearchMessage(message(),[offer({id:'same-offer',priceCents:100})]);s.saveSearchAuthorization({id:'same-grant',userId:'owner',enabled:true,permissions:['search']});s.claimSearchRun({id:'same-run',chatId:'same-chat',messageId:'same-command',actorId:'owner',createdAt:at,status:'done'});s.saveSearchDelivery({id:'same-delivery',runId:'same-run',createdAt:at,status:'pending',target:'5511999990001@s.whatsapp.net'});s.enqueueSearchInbox({id:'same-inbox',createdAt:at,status:'queued'});s.recordSearchGap({id:'same-gap',startedAt:at});
+  s.setSetting('integrationMode','whatsapp');assert.equal(s.querySearchOffers().total,0);assert.equal(s.getSearchMessage('g1@g.us','m1'),undefined);assert.equal(s.getSearchAuthorization('same-grant'),undefined);assert.equal(s.listSearchRuns().total,0);assert.equal(s.listSearchDeliveries().total,0);assert.equal(s.listSearchInbox().total,0);assert.equal(s.listSearchGaps().total,0);assert.equal(s.getSearchMonitorStats().messages,0);assert.equal(s.getSetting('buscasSettings',null),null);
+  s.setSetting('buscasSettings',{enabled:true,prefix:'!real'});s.upsertSearchMessage(message(),[offer({id:'same-offer',priceCents:700000})]);assert.equal(s.claimSearchRun({id:'same-run',chatId:'same-chat',messageId:'same-command',actorId:'owner',createdAt:at,status:'done'}).claimed,true);s.saveSearchDelivery({id:'same-delivery',runId:'same-run',createdAt:at,status:'confirmed',target:'5511999990001@s.whatsapp.net'});s.deleteSearchBase({actor:'owner'});assert.equal(s.querySearchOffers().total,0);
+  assert.throws(()=>s.saveSearchDelivery({id:'forged',runId:'same-run',createdAt:at,status:'pending',storageMode:'simulated'}),/outro modo/);
+  s.setSetting('integrationMode','simulated');assert.equal(s.getSetting('buscasSettings').prefix,'!sim');assert.equal(s.querySearchOffers().items[0].priceCents,100);assert.equal(s.getSearchDelivery('same-delivery').status,'pending');assert.equal(s.getSearchAuthorization('same-grant').userId,'owner');assert.equal(s.listSearchInbox().total,1);assert.equal(s.claimSearchRun({id:'new-id',chatId:'same-chat',messageId:'same-command',actorId:'owner',createdAt:at}).claimed,false);
+  s.close();const restarted=await open();assert.equal(restarted.querySearchOffers().items[0].priceCents,100);restarted.setSetting('integrationMode','whatsapp');assert.equal(restarted.getSetting('buscasSettings').prefix,'!real');assert.equal(restarted.getSearchDelivery('same-delivery').status,'confirmed');
+});
+
+test('legacy simulation migration uses explicit protocol or metadata evidence, preserving legitimately named real data',async t=>{
+  const {store:s,open}=await fixture(t);s.close();
+  const db=new DatabaseSync(s.filename);db.exec('DELETE FROM buscas_isolation_meta');
+  const insert=db.prepare('INSERT INTO buscas_messages(chatId,messageId,originalAt,capturedAt,revisionAt,deletedAt,senderId,forwarded,data) VALUES(?,?,?,?,?,NULL,NULL,0,?)');
+  for(const [chatId,simulation]of [['sim-01@simulation',false],['real@g.us',false],['other-real@g.us',true]]){const value=message(chatId,{chatId,text:'Fornecedor real chamado Grupo simulado',simulation});insert.run(chatId,chatId,at,at,at,JSON.stringify(value));}db.close();
+  const upgraded=await open();upgraded.setSetting('integrationMode','whatsapp');assert.deepEqual(upgraded.listSearchMessages().items.map(x=>x.chatId),['real@g.us']);upgraded.setSetting('integrationMode','simulated');assert.equal(upgraded.listSearchMessages().total,2);
 });

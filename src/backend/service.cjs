@@ -18,7 +18,7 @@ const {AlertService}=require('../core/alerts.cjs');
 const {SearchService}=require('../core/search-service.cjs');
 const {writeRecordsJSON}=require('../core/export-records.cjs');
 
-const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook'];
+const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook','systemAlertRecipientIds'];
 const DEFAULTS={reconnect:{enabled:false,maxAttempts:3,delaySeconds:15,autoResume:false},notifications:{nativeEnabled:true},sound:{enabled:true,volume:65,sound:'soft',customAudioId:null,events:['disconnect','critical'],repeat:false,intervalSeconds:30,maxRepeats:3,quiet:{enabled:false,start:'22:00',end:'08:00'}},retention:{days:90,maxEntries:20000,maxMegabytes:64},webhook:{enabled:false,url:''}};
 const HISTORY_CATEGORIES=['campaigns','sends','errors','notifications'];
 const cleanPhone=value=>String(value||'').replace(/[\s()+.-]/g,'');
@@ -33,7 +33,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   const media=new MediaManager(store),events=new EventEmitter();
   let channelUrl='';try{const value=await host('secretGet',{key:'webhookUrl'});if(typeof value==='string')channelUrl=value;}catch{}
   const auth=new AuthService({store,clock:now});
-  let adapter,scheduler,commands,alerts,searches,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null;
+  let adapter,scheduler,commands,alerts,searches,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,groupSync=null,groupSyncSource=null,groupLoadError=null;
   const cleanupTokens=new Map();
   const nativeTasks=new Set();
   const audioDir=path.join(dir,'audio');fs.mkdirSync(audioDir,{recursive:true});
@@ -78,13 +78,13 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   };
   const visibleMedia=()=>can('media.view')?store.listMedia().map(withoutPath):[];
   function snapshot(){
-    const status=auth.status(),base={auth:status,version,maintenance,settings:{theme:store.getSetting('theme','dark')},campaigns:[],groups:[],media:[],templates:[],contacts:[],alertRecipients:[],campaignUsers:[],history:[],metrics:{confirmed:0,failed:0,uncertain:0,activeCampaigns:0,selectedGroups:0,nextRunAt:null}};
+    const status=auth.status(),base={auth:status,version,maintenance,storageMode:store.getStorageMode(),settings:{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()},campaigns:[],groups:[],media:[],templates:[],contacts:[],alertRecipients:[],campaignUsers:[],history:[],metrics:{confirmed:0,failed:0,uncertain:0,activeCampaigns:0,selectedGroups:0,nextRunAt:null}};
     if(!status.authenticated)return {...base,connection:null};
     const cs=campaigns(),ids=cs.map(c=>c.id),storageError=store.persistenceFailed||scheduler.persistenceFailed?'Armazenamento indisponível: envios bloqueados. Corrija o espaço ou as permissões e reabra o aplicativo.':null;
     const metrics=store.getMetrics?store.getMetrics({campaignIds:scopeIds()}):{confirmed:0,failed:0,uncertain:0};
     let recent=[];if(can('history.view'))recent=historyPage({limit:50,offset:0}).items||[];
-    const publicSettings=can('settings.view')?settings():{theme:store.getSetting('theme','dark')};
-    return {...base,auth:status,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items:[]};
+    const publicSettings=can('settings.view')?settings():{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()};
+    return {...base,auth:status,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,groupLoadError:can('groups.view')?groupLoadError:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items:[]};
   }
   function broadcast(immediate=false){
     if(closed)return;
@@ -101,7 +101,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   function bindAdapter(){
     const source=adapter;
-    source.on('status',status=>{broadcast();if(status.state==='connected')source.listGroups().then(groups=>{if(source===adapter){store.upsertGroups(groups);broadcast();}}).catch(()=>{});});
+    source.on('status',status=>{broadcast();if(status.state==='connected')syncGroups(source).catch(()=>{});});
     source.on('incoming',ctx=>{
       const emergency=ctx.type==='text'&&/^!mega\s+(?:parar\s+tudo|pausar\s+\S+)\s*$/i.test(String(ctx.text||''));
       if(source!==adapter||(maintenance&&!emergency))return;
@@ -109,6 +109,25 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
       (emergency?Promise.resolve().then(handle):enqueue(handle)).then(()=>broadcast()).catch(()=>{});
     });
     source.on('receipt',()=>broadcast());
+  }
+  async function syncGroups(source=adapter){
+    if(groupSync&&groupSyncSource===source)return groupSync;
+    const mode=store.getStorageMode(),traceId=randomUUID();groupSyncSource=source;
+    const operation=(async()=>{
+      try{
+        const groups=await source.listGroups();
+        if(source!==adapter||mode!==store.getStorageMode())return [];
+        const values=store.replaceGroups(groups);searches?.refreshGroups?.();groupLoadError=null;broadcast();return values;
+      }catch(error){
+        if(source===adapter&&mode===store.getStorageMode()){
+          store.clearGroups();searches?.refreshGroups?.();groupLoadError={code:error.code||'GROUP_SYNC_FAILED',description:'Não foi possível carregar os grupos. Confira a conexão e tente sincronizar novamente.',traceId,at:now()};
+          store.addDiagnostic({id:randomUUID(),at:now(),traceId,userId:user()?.id||null,stage:'groups.sync',code:groupLoadError.code,description:groupLoadError.description,action:'Lista atual ocultada; autorizações preservadas.',guidance:'Reconecte o WhatsApp e selecione Sincronizar grupos.'});broadcast();
+        }
+        throw error;
+      }
+    })();
+    groupSync=operation;
+    try{return await operation;}finally{if(groupSync===operation){groupSync=null;groupSyncSource=null;}}
   }
   function listRecipients(){return store.listAlertRecipients?store.listAlertRecipients():entityList('alert_recipients');}
   const getRecipient=id=>listRecipients().find(r=>r.id===id);
@@ -118,9 +137,10 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');return await task();}finally{searches?.resumeCapture();maintenance=false;broadcast();}}
   async function switchMode(mode){
-    await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();adapter.removeAllListeners();
+    await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await alerts.waitForIdle?.();if(groupSync)await groupSync.catch(()=>{});adapter.removeAllListeners();
     store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);bindAdapter();
-    if(mode==='simulated'){await adapter.connect();store.upsertGroups(await adapter.listGroups());}
+    cleanupTokens.clear();groupLoadError=null;
+    if(mode==='simulated'){await adapter.connect();await syncGroups(adapter);}
   }
   const configRevision=c=>c.configRevision??c.revision;
   function checkRevision(c,p){const expected=p.configRevision??p.revision;if(expected===undefined||Number(expected)!==(p.configRevision!==undefined?configRevision(c):c.revision)||(p.summaryState!==undefined&&p.summaryState!==c.state))throw new Error('A configuração ou o estado mudou. Abra uma nova prévia antes de confirmar.');}
@@ -133,7 +153,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   async function exportRecords(table,p){
     assert(table==='history'?'history.export':'diagnostics.export');
-    const response=await host('showSaveDialog',{title:'Exportar registros',defaultPath:`Mega-Disparos-${table}-${new Date(now()).toISOString().slice(0,10)}.json`,filters:[{name:'Registros JSON',extensions:['json']}]});
+    const response=await host('showSaveDialog',{title:'Exportar registros',defaultPath:`Kenned-Code-Disparos-${table}-${new Date(now()).toISOString().slice(0,10)}.json`,filters:[{name:'Registros JSON',extensions:['json']}]});
     if(response.canceled)return {cancelled:true};
     const actor=user()?.id,count=await writeRecordsJSON(response.filePath,{header:{format:'mega-disparos-logs',version:1,exportedAt:new Date(now()).toISOString()},check:()=>{if(user()?.id!==actor)throw new Error('A sessão de acesso mudou.');assert(table==='history'?'history.export':'diagnostics.export');},page:(offset,limit)=>table==='history'?historyPage({...p,offset,limit}):diagnosisPage({...p,offset,limit})});
     audit(`${table}.export`,{count});return {path:response.filePath,count};
@@ -173,7 +193,10 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
       const chatId=p.chatId||(p.isGroup?p.groupId:`${senderNumber}@s.whatsapp.net`),isGroup=!!p.isGroup;
       if(isGroup&&!knownGroups.has(chatId))throw new Error('O comando aceita apenas grupos simulados.');
       if(!isGroup&&chatId!==`${senderNumber}@s.whatsapp.net`)throw new Error('A conversa privada de teste deve pertencer ao usuário conectado.');
-      adapter.injectOfferMessage({messageId:`SIM-COMMAND-${randomUUID()}`,senderId:`${senderNumber}@s.whatsapp.net`,senderNumber,verified:true,identityVerified:true,isGroup,fromMe:false,forwarded:!!p.forwarded,chatId,text:String(p.text??p.command),type:'text',timestamp:now(),simulation:true});
+      const fromMe=p.fromMe===true;
+      if(fromMe){if(!auth.status().user?.isOwner)throw new Error('O comando manual da conta conectada é reservado ao dono.');adapter.setOwnAccount?.(senderNumber);}
+      const own=fromMe?adapter.getOwnAccount?.():null;
+      adapter.injectOfferMessage({messageId:`SIM-COMMAND-${randomUUID()}`,senderId:`${senderNumber}@s.whatsapp.net`,senderNumber,verified:true,identityVerified:true,isGroup,fromMe,trustedSelf:fromMe,ownAccountNumber:own?.phone||null,accountId:own?.id||null,ownAccountId:own?.id||null,selfChat:fromMe&&chatId===own?.id,forwarded:!!p.forwarded,chatId,text:String(p.text??p.command),type:'text',timestamp:now(),simulation:true});
       await searches.waitForIdle();
     }
     audit('search.simulation',{messages:fixtures.length});
@@ -192,7 +215,10 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     searchOffers:async p=>searches.listOffers(p,assertSearchActor()),
     searchMessages:async p=>searches.listMessages(p,assertSearchActor()),
     searchHistory:async p=>searches.listHistory(p,assertSearchActor()),
-    runSearch:async p=>searches.executeSearch({query:p.query,filters:p.filters},assertSearchActor(),{deliver:p.deliver===true}),
+    searchRecipientStatus:async()=>searches.getRecipientStatus(assertSearchActor()),
+    testSearchRecipient:async p=>searches.testRecipient(p,assertSearchActor()),
+    retrySearchDelivery:async p=>searches.retryDelivery(p,assertSearchActor()),
+    runSearch:async p=>searches.executeSearch({query:p.query,filters:p.filters},assertSearchActor(),{deliver:p.deliver===true,asyncDelivery:store.getStorageMode()==='whatsapp'}),
     searchAuthorizations:async()=>searches.listAuthorizations(assertSearchActor()),
     saveSearchAuthorization:async p=>searches.saveAuthorization(p.authorization||p,assertSearchActor()),
     deleteSearchAuthorization:async p=>searches.deleteAuthorization(p.id,assertSearchActor()),
@@ -202,9 +228,9 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     clearSearchBase:async p=>searches.clearData({...p,scope:'base'},assertSearchActor()),
     importSearchHistory:async()=>searches.importHistory(assertSearchActor()),
     testSearchSimulation:async p=>testSearchSimulation(p),
-    connect:async()=>{assert('connection.manage');await adapter.connect({reconnect:true});if(adapter.status.state==='connected')store.upsertGroups(await adapter.listGroups());audit('connection.connect');return adapter.status;},
+    connect:async()=>{assert('connection.manage');await adapter.connect({reconnect:true});if(adapter.status.state==='connected')await syncGroups(adapter);audit('connection.connect');return adapter.status;},
     disconnect:async()=>{assert('connection.manage');for(const c of store.listCampaigns())if(c.state==='active')await scheduler.pause(c.id);await adapter.disconnect({logout:true});audit('connection.disconnect');return adapter.status;},
-    refreshGroups:async()=>{assert('groups.view');store.upsertGroups(await adapter.listGroups());return store.listGroups();},
+    refreshGroups:async()=>{assert('groups.view');return syncGroups(adapter);},
     authorizeGroup:async p=>{assert('groups.edit');if(!p.authorized)for(const c of store.listCampaigns())if(c.state==='active'&&c.groupIds.includes(p.id))await scheduler.pause(c.id);audit('groups.authorize',{groupId:p.id,authorized:!!p.authorized});return store.authorizeGroup(p.id,p.authorized);},
     saveCampaign:async p=>{
       const old=p.campaign?.id?store.getCampaign(p.campaign.id):null;assert(old?'campaign.edit':'campaign.create',old);
@@ -234,6 +260,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     deleteTemplate:async p=>{assert('media.delete');store.deleteTemplate(p.id);audit('media.deleteTemplate',{templateId:p.id});return true;},
     saveSettings:async p=>{
       assert('settings.edit');const changesMode=p.settings?.integrationMode&&p.settings.integrationMode!==store.getSetting('integrationMode');if(changesMode)assertModeChange();
+      if(p.settings?.systemAlertRecipientIds!==undefined)assert('notifications.manage');
       const next=validateSettings(p.settings||{},store),previousWebhook=store.getSetting('webhook',DEFAULTS.webhook);
       const changesChannel=p.settings?.webhookToken!==undefined||next.webhook&&(next.webhook.enabled!==previousWebhook.enabled||next.webhook.url!==(channelUrl||previousWebhook.url));
       if(changesChannel)assertGlobal('settings.edit',['notifications.manage']);
@@ -242,13 +269,13 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
       if(changesMode)assertModeChange();for(const [key,value] of Object.entries(next))store.setSetting(key,value);if(next.webhook)store.setSetting('independentAlertChannel',{...next.webhook,secretId:'webhookToken'});
       if(runtimePlatform==='win32'&&next.launchAtLogin!==undefined)await host('setLoginItemSettings',{openAtLogin:next.launchAtLogin});if(changesMode)await withMaintenance(()=>switchMode(p.settings.integrationMode));audit('settings.edit');return settings();
     },
-    backup:async()=>{assertBackup();const r=await host('showSaveDialog',{title:'Backup de campanhas e mídias',defaultPath:`Mega-Disparos-${new Date(now()).toISOString().slice(0,10)}.mega.json`,filters:[{name:'Backup Mega Disparos',extensions:['json']}]});if(r.canceled)return {cancelled:true};assertBackup();await media.createBackup(r.filePath);audit('settings.backup');return {path:r.filePath};},
-    restore:async()=>{assertRestore();const r=await host('showOpenDialog',{title:'Restaurar backup',properties:['openFile'],filters:[{name:'Backup Mega Disparos',extensions:['json']}]});if(r.canceled)return {cancelled:true};const answer=await host('showMessageBox',{type:'question',message:'Restaurar campanhas, mídias e configurações?',detail:'Os dados atuais terão backup automático. Os usuários e as permissões atuais serão preservados. As campanhas restauradas ficarão desativadas.',buttons:['Cancelar','Restaurar'],cancelId:0,defaultId:0});if(answer.response!==1)return {cancelled:true};assertRestore();return withMaintenance(async()=>{await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await media.createBackup(path.join(dir,'backups',`antes-restauracao-${now()}.mega.json`));const result=await media.restoreBackup(r.filePaths[0]);for(const c of store.listCampaigns())if(!store.getEntity('users',c.ownerId))store.saveCampaign({...c,ownerId:user().id,responsibleUserIds:(c.responsibleUserIds||[]).filter(id=>store.getEntity('users',id)),alertRecipientIds:(c.alertRecipientIds||[]).filter(id=>getRecipient(id))});await switchMode('simulated');if(runtimePlatform==='win32')await host('setLoginItemSettings',{openAtLogin:!!store.getSetting('launchAtLogin',false)});audit('settings.restore');return result;});},
+    backup:async()=>{assertBackup();const r=await host('showSaveDialog',{title:'Backup de campanhas e mídias',defaultPath:`Kenned-Code-Disparos-${new Date(now()).toISOString().slice(0,10)}.mega.json`,filters:[{name:'Backup Kenned Code Disparos',extensions:['json']}]});if(r.canceled)return {cancelled:true};assertBackup();await media.createBackup(r.filePath);audit('settings.backup');return {path:r.filePath};},
+    restore:async()=>{assertRestore();const r=await host('showOpenDialog',{title:'Restaurar backup',properties:['openFile'],filters:[{name:'Backup Kenned Code Disparos',extensions:['json']}]});if(r.canceled)return {cancelled:true};const answer=await host('showMessageBox',{type:'question',message:'Restaurar campanhas, mídias e configurações?',detail:'Os dados atuais terão backup automático. Os usuários e as permissões atuais serão preservados. As campanhas restauradas ficarão desativadas.',buttons:['Cancelar','Restaurar'],cancelId:0,defaultId:0});if(answer.response!==1)return {cancelled:true};assertRestore();return withMaintenance(async()=>{await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await media.createBackup(path.join(dir,'backups',`antes-restauracao-${now()}.mega.json`));const result=await media.restoreBackup(r.filePaths[0]);for(const c of store.listCampaigns())if(!store.getEntity('users',c.ownerId))store.saveCampaign({...c,ownerId:user().id,responsibleUserIds:(c.responsibleUserIds||[]).filter(id=>store.getEntity('users',id)),alertRecipientIds:(c.alertRecipientIds||[]).filter(id=>getRecipient(id))});await switchMode(store.getStorageMode());if(runtimePlatform==='win32')await host('setLoginItemSettings',{openAtLogin:!!store.getSetting('launchAtLogin',false)});audit('settings.restore');return result;});},
     openDataFolder:async()=>{assert('settings.view');return host('openDataFolder',{path:dir});},
     historyPage:async p=>historyPage(p),diagnosticsPage:async p=>diagnosisPage(p),
     auditPage:async p=>{assert('audit.view');return pageEntities('audit',{...p,limit:Math.min(200,Number(p.limit)||50)});},
     exportHistory:async p=>exportRecords('history',p),exportDiagnostics:async p=>exportRecords('diagnostics',p),
-    exportReports:async()=>{assert('reports.export');const r=await host('showSaveDialog',{title:'Exportar relatório',defaultPath:`Mega-Disparos-relatorio-${new Date(now()).toISOString().slice(0,10)}.json`,filters:[{name:'Relatório JSON',extensions:['json']}]});if(r.canceled)return {cancelled:true};assert('reports.export');const cs=store.listCampaigns().filter(c=>can('reports.export',c)),data={format:'mega-disparos-report',exportedAt:new Date(now()).toISOString(),metrics:store.getMetrics({campaignIds:scopeIds()}),campaigns:cs.map(c=>({id:c.id,name:c.name,state:c.state,nextRunAt:c.nextRunAt,intervalMinutes:c.intervalMinutes,groups:c.groupIds.length}))};atomicWrite(r.filePath,Buffer.from(JSON.stringify(data,null,2)));audit('reports.export',{count:cs.length});return {path:r.filePath,count:cs.length};},
+    exportReports:async()=>{assert('reports.export');const r=await host('showSaveDialog',{title:'Exportar relatório',defaultPath:`Kenned-Code-Disparos-relatorio-${new Date(now()).toISOString().slice(0,10)}.json`,filters:[{name:'Relatório JSON',extensions:['json']}]});if(r.canceled)return {cancelled:true};assert('reports.export');const cs=store.listCampaigns().filter(c=>can('reports.export',c)),data={format:'mega-disparos-report',exportedAt:new Date(now()).toISOString(),metrics:store.getMetrics({campaignIds:scopeIds()}),campaigns:cs.map(c=>({id:c.id,name:c.name,state:c.state,nextRunAt:c.nextRunAt,intervalMinutes:c.intervalMinutes,groups:c.groupIds.length}))};atomicWrite(r.filePath,Buffer.from(JSON.stringify(data,null,2)));audit('reports.export',{count:cs.length});return {path:r.filePath,count:cs.length};},
     pendingReviewsPage:async p=>pendingReviewsPage(p),
     cleanupPreview:async p=>{assert('history.clear');for(const [key,value] of cleanupTokens)if(now()-value.at>5*60*1000)cleanupTokens.delete(key);while(cleanupTokens.size>=32)cleanupTokens.delete(cleanupTokens.keys().next().value);const categories=validateCategories(p.categories);const counts=store.cleanupPreview(categories),token=randomBytes(18).toString('hex');cleanupTokens.set(token,{userId:user().id,categories,at:now(),fingerprint:JSON.stringify(counts)});return {token,categories,counts:counts.counts,total:counts.total,protected:true,description:'Serão removidos somente os registros visíveis selecionados. Campanhas, mídias, usuários, configurações, auditoria e o controle operacional de envios serão preservados.'};},
     clearHistory:async p=>{assert('history.clear');if(p.confirmation!=='APAGAR')throw new Error('Digite APAGAR para confirmar.');const token=cleanupTokens.get(p.token),categories=validateCategories(p.categories);if(!token||token.userId!==user().id||now()-token.at>5*60*1000||JSON.stringify(categories)!==JSON.stringify(token.categories))throw new Error('A confirmação expirou. Confira uma nova prévia.');if(token.fingerprint!==JSON.stringify(store.cleanupPreview(categories)))throw new Error('Os registros mudaram. Confira uma nova prévia antes de apagar.');cleanupTokens.delete(p.token);const result=store.clearHistory({categories,actor:{id:user().id,name:user().name},at:now()});broadcast();return result;},
@@ -259,7 +286,9 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     listAlertRecipients:async()=>{assert('notifications.view');return listRecipients();},
     saveAlertRecipient:async p=>{assert('notifications.manage');const v=p.recipient||p,old=v.id?getRecipient(v.id):null,phone=cleanPhone(v.phone);if(!asText(v.name,121).trim()||asText(v.name,121).length>120||!validPhone(phone))throw new Error('Informe nome e telefone com país + DDD + número.');if(v.userId&&!store.getEntity('users',v.userId))throw new Error('Usuário não encontrado.');const result=store.saveEntity('alert_recipients',{id:old?.id||randomUUID(),name:asText(v.name,120).trim(),phone,userId:v.userId||null,enabled:v.enabled!==false});audit('alerts.recipientSave',{recipientId:result.id});return result;},
     deleteAlertRecipient:async p=>{assert('notifications.manage');if(store.listCampaigns().some(c=>(c.alertRecipientIds||[]).includes(p.id)))throw new Error('Remova o destinatário das campanhas antes de excluí-lo.');store.deleteEntity('alert_recipients',p.id);audit('alerts.recipientDelete',{recipientId:p.id});return true;},
-    testAlertRecipient:async p=>{assert('notifications.manage');const r=getRecipient(p.id);if(!r||!r.enabled)throw new Error('Destinatário não encontrado ou desativado.');audit('alerts.test',{recipientId:r.id});return alerts.testRecipient(r.phone,user().id);},
+    testAlertRecipient:async p=>{assert('notifications.manage');const r=getRecipient(p.id);if(!r||!r.enabled)throw new Error('Destinatário não encontrado ou desativado.');audit('alerts.test',{recipientId:r.id});return alerts.testRecipient(r.phone,user().id,{recipientId:r.id});},
+    testAlert:async p=>{assert('notifications.manage');if(p.event!==undefined&&!['critical','disconnect'].includes(p.event))throw new Error('Evento de alerta inválido.');audit('alerts.testOccurrence',{event:p.event||'critical'});return alerts.testAlert({userId:user().id,event:p.event||'critical'});},
+    retryAlert:async p=>{assert('notifications.manage');const a=store.getAlert(p.id);if(!a)throw new Error('Alerta não encontrado.');if(a.campaignId)getCampaign(a.campaignId,'campaign.view');audit('alerts.retry',{alertId:a.id});return alerts.retryAlert(a.id,{userId:user().id});},
     alertsPage:async p=>{assert('notifications.view');return pageEntities('alerts',{...p,campaignIds:scopeIds(),includeGlobal:true,limit:Math.min(200,Number(p.limit)||50)});},
     reviewAlert:async p=>{assert('notifications.manage');const a=store.getEntity('alerts',p.id);if(!a)throw new Error('Alerta não encontrado.');if(a.campaignId&&scopeIds()&&!scopeIds().includes(a.campaignId))throw new Error('Sem permissão para este alerta.');if(typeof p.confirmed!=='boolean'&&!['confirm','discard'].includes(p.decision))throw new Error('Informe uma decisão válida para o alerta.');audit('alerts.review',{alertId:p.id,confirmed:p.confirmed===true||p.decision==='confirm'});return alerts.resolveUncertain(p.id,{confirmed:p.confirmed===true||p.decision==='confirm',userId:user().id});},
     silenceAlert:async p=>{assert('notifications.view');const notification=store.getEntity('notifications',p.id)||store.listEntities('notifications').find(n=>n.occurrenceId===p.id);if(!notification)throw new Error('Alerta não encontrado.');if(notification.campaignId&&scopeIds()&&!scopeIds().includes(notification.campaignId))throw new Error('Sem permissão para este alerta.');alerts.muteOccurrence(p.id);await host('silenceAlert',{id:p.id,occurrenceId:p.occurrenceId||notification.occurrenceId});return true;},
@@ -269,7 +298,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     windowMinimize:async()=>host('windowMinimize',{}),windowQuit:async()=>host('windowQuit',{})
   };
   const publicUnprotected=new Set(['snapshot','authStatus','setupOwner','login','recoverPassword','windowMinimize','windowQuit']);
-  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory']);
+  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory','searchRecipientStatus']);
   events.call=async(action,payload={})=>{
     if(closed)throw new Error('Aplicativo encerrado.');if(!Object.hasOwn(actions,action))throw new Error('Ação não autorizada.');
     if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');
@@ -295,7 +324,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   searches.on('change',()=>broadcast());searches.start();
   alerts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});alerts.on('change',()=>broadcast());scheduler.on('change',()=>broadcast());bindAdapter();alerts.start();scheduler.start();
   retentionTimer=setInterval(()=>{try{store.applyRetention?.(store.getSetting('retention',DEFAULTS.retention));}catch{if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();}},60000);retentionTimer.unref?.();
-  if(store.getSetting('integrationMode')==='simulated'){await adapter.connect();store.upsertGroups(await adapter.listGroups());}
+  if(store.getSetting('integrationMode')==='simulated'){await adapter.connect();await syncGroups(adapter);}
   return events;
 }
 
@@ -318,6 +347,11 @@ function validateSettings(v,store){
   if(v.sound!==undefined){next.sound=validateSound(v.sound);if(next.sound.sound==='custom'&&!(store.getSetting('audioAssets',[])||[]).some(a=>a.id===next.sound.customAudioId))throw new Error('Importe o arquivo de áudio antes de selecioná-lo.');}
   if(v.reconnect!==undefined){const r=v.reconnect;next.reconnect={enabled:!!r.enabled,maxAttempts:Math.floor(bounded(r.maxAttempts??3,0,10,'Tentativas de reconexão')),delaySeconds:bounded(r.delaySeconds??15,3,3600,'Intervalo de reconexão'),autoResume:!!r.autoResume};}
   if(v.notifications!==undefined)next.notifications={nativeEnabled:v.notifications.nativeEnabled!==false};
+  if(v.systemAlertRecipientIds!==undefined){
+    if(!Array.isArray(v.systemAlertRecipientIds)||v.systemAlertRecipientIds.length>100||v.systemAlertRecipientIds.some(id=>typeof id!=='string'||!id||id.length>512))throw new Error('Destinatários dos alertas do sistema inválidos.');
+    next.systemAlertRecipientIds=[...new Set(v.systemAlertRecipientIds)];
+    if(next.systemAlertRecipientIds.some(id=>!store.getAlertRecipient(id)?.enabled))throw new Error('Selecione destinatários de alertas ativos do modo atual.');
+  }
   if(v.retention!==undefined){const r=v.retention;next.retention={days:Math.floor(bounded(r.days??90,1,3650,'Retenção em dias')),maxEntries:Math.floor(bounded(r.maxEntries??20000,100,1000000,'Limite de registros')),maxMegabytes:bounded(r.maxMegabytes??64,1,1024,'Tamanho máximo dos registros')};}
   if(v.webhook!==undefined){const w=v.webhook;let url='';if(w.url){const parsed=new URL(w.url);if(parsed.protocol!=='https:'||parsed.username||parsed.password||parsed.hash)throw new Error('O canal independente exige endereço HTTPS sem credenciais na URL.');url=parsed.href;}if(w.enabled&&!url)throw new Error('Configure o endereço HTTPS do canal independente.');next.webhook={enabled:!!w.enabled,url};}
   return next;

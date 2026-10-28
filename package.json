@@ -1,9 +1,9 @@
 {
-  "name": "mega-disparos",
-  "version": "2.1.0",
-  "description": "Agendador local de campanhas autorizadas para grupos do WhatsApp",
+  "name": "kenned-code-disparos",
+  "version": "2.2.0",
+  "description": "Kenned Code Disparos: campanhas autorizadas e buscas de ofertas pelo WhatsApp",
   "main": "src/main.cjs",
-  "author": "Mega Disparos",
+  "author": "Kenned Code Disparos",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
@@ -25,7 +25,7 @@
   },
   "build": {
     "appId": "br.com.megadisparos.desktop",
-    "productName": "Mega Disparos",
+    "productName": "Kenned Code Disparos",
     "compression": "maximum",
     "publish": [],
     "asar": true,
@@ -49,7 +49,7 @@
       ],
       "icon": "assets/icon.ico",
       "signExecutable": false,
-      "artifactName": "Mega-Disparos-Setup-${version}-${arch}.${ext}"
+      "artifactName": "Kenned-Code-Disparos-Setup-${version}-${arch}.${ext}"
     },
     "nsis": {
       "script": "scripts/installer.nsi",
@@ -59,7 +59,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Mega Disparos",
+      "shortcutName": "Kenned Code Disparos",
       "deleteAppDataOnUninstall": false,
       "installerLanguages": [
         "pt_BR"

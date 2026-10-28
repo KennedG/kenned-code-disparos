@@ -125,6 +125,8 @@ class Scheduler extends EventEmitter {
       this._pauseActive('Integração alterada; retome após conferir a conexão.');
     }
     this.adapter = adapter;
+    this.receipts.clear();
+    this.lastSubmissionAt=null;
     this.statusListener = status => {
       if (status.state !== 'connected') this._pauseActive(`Conexão indisponível: ${status.state}.`);
       this.emit('change');
@@ -197,6 +199,7 @@ class Scheduler extends EventEmitter {
 
   _validateCampaign(campaign) {
     if (!campaign) throw new Error('Campanha não encontrada.');
+    if(campaign.storageMode&&campaign.storageMode!==this.adapter.status.mode)throw new Error('A campanha pertence a outro modo de integração.');
     if (!campaign.name?.trim()) throw new Error('Informe um nome para a campanha.');
     if (!['repeat', 'rotate'].includes(campaign.mode)) throw new Error('Escolha repetir ou alternar os conteúdos.');
     const retries = campaign.retryPolicy || { maxAttempts: 3, delaySeconds: 3 };

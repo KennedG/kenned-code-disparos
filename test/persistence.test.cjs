@@ -312,7 +312,7 @@ test('backup roundtrip restores campaign content and files as drafts without cre
   assert.equal(campaign.items[1].caption, 'Legenda com emoji 📄');
   assert.equal(campaign.groupOverrides['group-1@g.us'].items[0].mediaId, media.id);
   assert.equal(restored.listTemplates()[0].items[0].mediaId, media.id);
-  assert.equal(restored.getSetting('integrationMode'), 'simulated');
+  assert.equal(restored.getSetting('integrationMode'), 'whatsapp');
   assert.deepEqual(restored.getSetting('admins'), ['5511999999999']);
   assert.equal(restored.getSetting('theme'), 'light');
   assert.equal(restored.getSetting('session'), undefined);

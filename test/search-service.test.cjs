@@ -142,6 +142,103 @@ test('recipient destinations require explicit origin enabling and valid register
   assert.equal(validateSearchSettings({ aliases: { prata: 'silver' } }).aliases.prata, 'silver');
 });
 
+test('manual commands from the authenticated own account work in self chat and are deduplicated; automation and non-owner self identity are rejected', async t => {
+  const f = await fixture(t); f.adapter.setOwnAccount(f.owner.phone);
+  const own = f.command('!busca iPhone 18 Pro Max Silver', { chatId: `${f.owner.phone}@s.whatsapp.net`, isGroup: false, fromMe: true, trustedSelf: true, ownAccountNumber: f.owner.phone, ownAccountId: f.adapter.status.ownAccountId, machineGenerated: false, simulation: true, accountId: f.adapter.status.ownAccountId });
+  assert.equal(await f.searches.handleIncoming(own), true); assert.match(f.adapter.sent.at(-1).text, /Não foram encontradas ofertas compatíveis/);
+  const sent = f.adapter.sent.length; assert.equal(await f.searches.handleIncoming(own), false); assert.equal(f.adapter.sent.length, sent);
+  for (const changed of [{ trustedSelf: false }, { ownAccountNumber: '5511999990003' }, { machineGenerated: true }, { automaticMessage: true }, { forwarded: true }, { history: true }]) assert.equal(await f.searches.handleIncoming({ ...own, ...changed, messageId: randomUUID() }), false);
+  f.searches.saveSettings({ privateCommandsEnabled: false, commandPrivateNumbers: [], selfCommandsEnabled: false }, f.owner.id);
+  assert.equal(await f.searches.handleIncoming({ ...own, messageId: randomUUID() }), false);
+  f.searches.saveSettings({ selfCommandsEnabled: true }, f.owner.id);
+  assert.equal(await f.searches.handleIncoming({ ...own, messageId: randomUUID() }), true);
+  const records = f.store.listEntities('diagnostics'); const trace = records.filter(r => r.traceId && r.stage === 'buscas.results'); assert.equal(trace.length, 2); assert.equal(trace[0].detail.resultCount, 0);
+  assert.ok(records.some(r => r.stage === 'buscas.authorization' && r.detail.approved === true)); assert.ok(records.some(r => r.stage === 'buscas.rejected' && r.detail.reason === 'duplicate_message'));
+});
+
+test('own-account permission requires the active owner mapped to the authenticated phone and respects enabled command groups', async t => {
+  const f = await fixture(t), admin = await f.auth.createUser({ name: 'Admin', username: 'admin-self', phone: '5511999990002', password: PASSWORD, roleId: 'role-admin', requirePasswordChange: false, permissionOverrides: { 'search.view': true, 'search.run': true } });
+  f.searches.saveAuthorization({ userId: admin.id, permissions: ['search'] }, f.owner.id); f.adapter.setOwnAccount(admin.phone);
+  const base = f.command('!busca iPhone 18 Pro Max Silver', { senderNumber: admin.phone, fromMe: true, trustedSelf: true, ownAccountNumber: admin.phone });
+  assert.equal(await f.searches.handleIncoming(base), false);
+  f.adapter.setOwnAccount(f.owner.phone);
+  assert.equal(await f.searches.handleIncoming(f.command(base.text, { fromMe: true, trustedSelf: true, ownAccountNumber: f.owner.phone, chatId: f.secondGroup })), false);
+});
+
+test('configured private recipients are used exactly, resolution precedes submission and test-send exposes pending then ACK status', async t => {
+  const f = await fixture(t); f.store.saveAlertRecipient({ id: 'responsible', name: 'Responsável', phone: '5511888877777', enabled: true });
+  f.searches.saveSettings({ recipientMode: 'responsibles', responsibleRecipientIds: ['responsible'] }, f.owner.id);
+  const resolved = []; f.adapter.resolveRecipient = async number => { resolved.push(number); return { jid: `${number}@s.whatsapp.net`, phone: number }; };
+  await f.searches.handleIncoming(f.command('!busca iPhone 18 Pro Max Silver'));
+  assert.deepEqual(resolved, ['5511888877777']); assert.equal(f.adapter.sent[0].privateNumber, '5511888877777'); assert.notEqual(f.adapter.sent[0].targetId, f.group);
+  f.searches.saveSettings({ enabled: false }, f.owner.id);
+  const delivery = await f.searches.testRecipient({ recipientId: `user:${f.owner.id}` }, f.owner.id); assert.ok(['pending', 'sending'].includes(delivery.status));
+  await f.searches.waitForIdle(); const state = f.searches.getRecipientStatus(f.owner.id); assert.equal(state.recipients.find(r => r.id === `user:${f.owner.id}`).status, 'confirmed');
+  const stored = f.store.getSearchDelivery(delivery.id); f.adapter.emit('receipt', { messageId: stored.messageId, status: 'confirmed', confirmationScope: 'delivered', deliveredAt: f.now(), simulation: true });
+  assert.equal(f.store.getSearchDelivery(delivery.id).deliveredAt, f.now()); assert.equal(f.store.getSearchDelivery(delivery.id).confirmationScope, 'delivered');
+});
+
+test('invalid explicitly selected owner never substitutes another recipient and a failure notice identifies the reason', async t => {
+  const f = await fixture(t); f.searches.saveSettings({ ownerRecipientUserId: f.owner.id }, f.owner.id);
+  const owner = f.store.getEntity('users', f.owner.id); f.store.saveEntity('users', { ...owner, phone: '' });
+  await assert.rejects(f.searches.executeSearch({ query: 'iPhone 18 Pro Max Silver' }, f.owner.id, { deliver: true }), { code: 'SEARCH_OWNER_RECIPIENT_INVALID' }); assert.equal(f.adapter.sent.length, 0);
+  f.store.saveEntity('users', { ...owner, phone: owner.phone });
+  f.searches.saveSettings({ defaultFilters: { model: 'produto desconhecido' } }, f.owner.id);
+  assert.equal(await f.searches.handleIncoming(f.command('!busca iPhone 18 Pro Max Silver')), true);
+  assert.match(f.adapter.sent.at(-1).text, /Kenned Code Disparos/); assert.match(f.adapter.sent.at(-1).text, /filtros ou a configuração/);
+  assert.ok(f.store.listSearchHistory().items.some(r => r.status === 'failed' && r.error));
+});
+
+test('safe recipient-resolution failures can be retried manually, uncertainty and confirmed delivery cannot', async t => {
+  const f = await fixture(t); let failResolve = true;
+  f.adapter.resolveRecipient = async number => { if (failResolve) throw Object.assign(new Error('raw sensitive detail must never enter diagnostics'), { code: 'RECIPIENT_NOT_REGISTERED', definitive: true }); return { jid: `${number}@s.whatsapp.net` }; };
+  const first = await f.searches.testRecipient({ recipientId: `user:${f.owner.id}` }, f.owner.id); await f.searches.waitForIdle(); const failed = f.store.getSearchDelivery(first.id);
+  assert.equal(failed.status, 'failed'); assert.equal(f.adapter.sent.length, 0); assert.equal(failed.safeToRetry, true); assert.match(failed.error, /não foi encontrado no WhatsApp/);
+  failResolve = false; await f.searches.retryDelivery({ id: first.id }, f.owner.id); assert.equal(f.store.getSearchDelivery(first.id).status, 'confirmed');
+  await assert.rejects(f.searches.retryDelivery({ id: first.id }, f.owner.id), { code: 'SEARCH_RETRY_UNSAFE' });
+  f.adapter.setNextOutcome('uncertain'); const uncertain = await f.searches.testRecipient({ recipientId: `user:${f.owner.id}` }, f.owner.id); await f.searches.waitForIdle(); await assert.rejects(f.searches.retryDelivery({ id: uncertain.id }, f.owner.id), { code: 'SEARCH_RETRY_UNSAFE' });
+  assert.equal(JSON.stringify(f.store.listEntities('diagnostics')).includes('raw sensitive detail'), false);
+});
+
+test('a destination removed during asynchronous WhatsApp resolution is revalidated and receives no result', async t => {
+  const f = await fixture(t); f.store.saveAlertRecipient({ id: 'to-revoke', name: 'Destino', phone: '5511888877777', enabled: true });
+  f.searches.saveSettings({ recipientMode: 'responsibles', responsibleRecipientIds: ['to-revoke'] }, f.owner.id);
+  let entered, resume; const lookupEntered = new Promise(resolve => { entered = resolve; }), lookupBlocked = new Promise(resolve => { resume = resolve; });
+  f.adapter.resolveRecipient = async number => { entered(); await lookupBlocked; return { jid: `${number}@s.whatsapp.net` }; };
+  const command = f.searches.handleIncoming(f.command('!busca iPhone 18 Pro Max Silver')); await lookupEntered;
+  f.searches.saveSettings({ recipientMode: 'owner', ownerRecipientUserId: f.owner.id }, f.owner.id); resume(); await command; await f.searches.waitForIdle();
+  assert.equal(f.adapter.sent.length, 1); assert.equal(f.adapter.sent[0].privateNumber, f.owner.phone); assert.match(f.adapter.sent[0].text, /autorização mudou/); assert.equal(f.store.listSearchDeliveries().items[0].status, 'failed'); assert.equal(f.store.listSearchDeliveries().items[0].code, 'SEARCH_TARGET_DISABLED');
+});
+
+test('recipient status reads latest delivery after more than 500 older records, and group synchronization refreshes search selectors', async t => {
+  const f = await fixture(t);
+  f.store.transaction(() => { for (let i = 0; i < 505; i++) f.store.saveSearchDelivery({ id: `old-${i}`, runId: `old-run-${i}`, actorId: f.owner.id, createdAt: f.now() - 10000 + i, status: 'confirmed', target: `${f.owner.phone}@s.whatsapp.net` }); });
+  const test = await f.searches.testRecipient({ recipientId: `user:${f.owner.id}` }, f.owner.id); await f.searches.waitForIdle();
+  const latest = f.searches.getRecipientStatus(f.owner.id).recipients.find(r => r.id === `user:${f.owner.id}`); assert.equal(latest.deliveryId, test.id); assert.equal(latest.status, 'confirmed');
+  f.store.upsertGroups([{ id: 'sim-20@simulation', name: 'Novo grupo', simulation: true }]); assert.ok(f.searches.getState(f.owner.id).groups.some(g => g.id === 'sim-20@simulation'));
+});
+
+test('a private result failure produces one private error notice without replacing result status or looping on failed notices', async t => {
+  const f = await fixture(t); f.store.saveAlertRecipient({ id: 'bad-contact', name: 'Inválido', phone: '5511888877777', enabled: true });
+  f.searches.saveSettings({ recipientMode: 'responsibles', responsibleRecipientIds: ['bad-contact'] }, f.owner.id);
+  f.adapter.resolveRecipient = async number => { if (number === '5511888877777') throw Object.assign(new Error('secret upstream'), { code: 'WA_RECIPIENT_NOT_FOUND', definitive: true }); return { jid: `${number}@s.whatsapp.net` }; };
+  const command = f.command('!busca iPhone 18 Pro Max Silver'); await f.searches.handleIncoming(command); await f.searches.waitForIdle();
+  assert.equal(f.adapter.sent.length, 1); assert.equal(f.adapter.sent[0].privateNumber, f.owner.phone); assert.match(f.adapter.sent[0].text, /número configurado não foi encontrado/); assert.doesNotMatch(f.adapter.sent[0].text, /Encontradas|secret upstream/);
+  const history = f.searches.listHistory({}, f.owner.id).items[0]; assert.equal(history.deliveryStatus, 'failed'); assert.deepEqual(history.deliveryTargets, ['5511888877777@s.whatsapp.net']);
+  assert.equal(f.searches.getRecipientStatus(f.owner.id).recipients.find(r => r.id === 'bad-contact').status, 'failed');
+  await f.searches.flushDeliveries(); assert.equal(f.adapter.sent.length, 1);
+  f.adapter.resolveRecipient = async () => { throw Object.assign(new Error(), { code: 'WA_RECIPIENT_NOT_FOUND', definitive: true }); };
+  await f.searches.handleIncoming(f.command('!busca iPhone 18 Pro Max Silver')); await f.searches.waitForIdle(); const runs = f.store.listSearchRuns().items; const newest = runs.sort((a,b)=>b.requestedAt-a.requestedAt)[0]; assert.equal(f.store.listSearchDeliveries({ runId: newest.id }).total, 2); assert.equal(f.store.listSearchDeliveries({ runId: newest.id }).items.filter(d=>d.errorNotice).length, 1);
+});
+
+test('requester delivery uses the actual authorized requesting phone rather than a different primary profile number', async t => {
+  const f = await fixture(t), alternate = '5511999990008';
+  const user = f.store.getEntity('users', f.owner.id); f.store.saveEntity('users', { ...user, authorizedPhones: [alternate] });
+  f.searches.saveSettings({ recipientMode: 'requester' }, f.owner.id);
+  await f.searches.handleIncoming(f.command('!busca iPhone 18 Pro Max Silver', { senderNumber: alternate, senderId: `${alternate}@s.whatsapp.net` }));
+  assert.equal(f.adapter.sent.length, 1); assert.equal(f.adapter.sent[0].privateNumber, alternate);
+});
+
 test('blocked supplier does not reappear through a forwarded copy and independent original sellers remain eligible', async t => {
   const f = await fixture(t), text = 'iPhone 18 Pro Max 256GB Silver lacrado R$ 7.000,00';
   await f.capture(text); await f.capture(text, { forwarded: true, chatId: f.secondGroup });

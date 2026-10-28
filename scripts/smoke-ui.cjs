@@ -4,7 +4,7 @@ const {_electron,expect}=require('@playwright/test');
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-ui-'));
   const screenshotDir=process.env.MEGA_SCREENSHOT_DIR||'docs';fs.mkdirSync(screenshotDir,{recursive:true});
   const {createStore}=require('../src/core/store.cjs');const {MediaManager}=require('../src/core/media.cjs');
-  const preStore=await createStore(dir);await new MediaManager(preStore).importFile(path.resolve('assets/icon.png'));preStore.close();
+  const preStore=await createStore(dir);preStore.setSetting('integrationMode','simulated');await new MediaManager(preStore).importFile(path.resolve('assets/icon.png'));preStore.close();
   let app;const errors=[];
   try{
     app=await _electron.launch({executablePath:require('electron'),args:['--no-sandbox','--disable-gpu',process.env.MEGA_APP_PATH||'.'],env:{...process.env,MEGA_DATA_DIR:dir},timeout:20000});

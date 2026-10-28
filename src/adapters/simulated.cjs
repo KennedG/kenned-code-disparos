@@ -12,12 +12,14 @@ class SimulatedAdapter extends EventEmitter {
     this.nextOutcome = null;
     this.replies = [];
     this.sent = [];
+    this.automaticMessages = new Set();
+    this.ownNumber = String(store?.getSetting?.('simulationOwnNumber', '') || '');
     this.searchCapture = { enabled: false, importHistory: false, groupIds: null, commandGroupIds: null };
     this.status = { state: 'disconnected', mode: 'simulated', detail: 'Simulação local: nenhum envio pelo WhatsApp.' };
   }
 
   _status(state, detail, extras = {}) {
-    this.status = { state, ...(state === 'disconnected' ? { reasonCode: 'manual', at: new Date().toISOString(), manual: true, retryable: false } : {}), ...extras, mode: 'simulated', detail };
+    this.status = { state, ...(state === 'disconnected' ? { reasonCode: 'manual', at: new Date().toISOString(), manual: true, retryable: false } : {}), ...extras, mode: 'simulated', simulation: true, ownNumber: this.ownNumber, ownAccountId: this.ownNumber ? `${this.ownNumber}@s.whatsapp.net` : '', detail };
     this.emit('status', this.status);
   }
 
@@ -35,13 +37,42 @@ class SimulatedAdapter extends EventEmitter {
       id: `sim-${String(index + 1).padStart(2, '0')}@simulation`,
       name: `Grupo simulado ${String(index + 1).padStart(2, '0')}`,
       authorized: false,
-      simulation: true
+      simulation: true,
+      mode: 'simulated'
     }));
   }
 
   setNextOutcome(outcome) {
     if (!['confirmed', 'failed', 'uncertain'].includes(outcome)) throw new Error('Resultado de simulação inválido.');
     this.nextOutcome = outcome;
+  }
+
+  setOwnAccount(number) {
+    if (!/^[1-9]\d{9,14}$/.test(String(number || ''))) throw new Error('Telefone da conta de simulação inválido.');
+    this.ownNumber = String(number);
+    this._status(this.status.state, this.status.detail);
+    return this.getOwnAccount();
+  }
+
+  getOwnAccount() {
+    return { id: this.ownNumber ? `${this.ownNumber}@s.whatsapp.net` : '', phone: this.ownNumber, mode: 'simulated', simulation: true };
+  }
+
+  isTrustedSelfContext(context) {
+    return context?.simulation === true && context.fromMe === true && context.trustedSelf === true && Boolean(this.ownNumber) && context.senderNumber === this.ownNumber && context.accountId === `${this.ownNumber}@s.whatsapp.net`;
+  }
+
+  async resolveRecipient(number) {
+    const digits = String(number || '');
+    if (!/^[1-9]\d{9,14}$/.test(digits)) throw Object.assign(new Error('Telefone privado inválido. Use código do país e DDD.'), { code: 'WA_RECIPIENT_INVALID', safeToRetry: false });
+    if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { code: 'WA_RECIPIENT_OFFLINE', safeToRetry: true });
+    return { jid: `${digits}@s.whatsapp.net`, phone: digits, requestedPhone: digits, isSelf: digits === this.ownNumber, mode: 'simulated', simulation: true, resolutionSource: 'simulation-only' };
+  }
+
+  _markAutomatic(messageId, kind = 'simulated') {
+    this.store?.registerOutboundMessageId?.(messageId, { kind, at: Date.now(), storageMode: 'simulated' });
+    this.automaticMessages.add(messageId);
+    while (this.automaticMessages.size > 10000) this.automaticMessages.delete(this.automaticMessages.values().next().value);
   }
 
   async send(groupId, item, media) {
@@ -64,16 +95,17 @@ class SimulatedAdapter extends EventEmitter {
       throw Object.assign(new Error('Falha temporária simulada antes do envio.'), { safeToRetry: true });
     }
     const messageId = item.clientMessageId || `SIM-${randomUUID()}`;
+    this._markAutomatic(messageId);
     this.sent.push({ groupId, item: { ...item }, mediaId: media?.id, messageId, at: new Date().toISOString(), simulation: true });
     if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);
     if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
-    const result = { status: outcome === 'uncertain' ? 'uncertain' : 'confirmed', messageId };
-    if (result.status === 'confirmed') this.emit('receipt', { messageId, status: 'confirmed', simulation: true });
+    const result = { status: outcome === 'uncertain' ? 'uncertain' : 'confirmed', messageId, mode: 'simulated', simulation: true };
+    if (result.status === 'confirmed') this.emit('receipt', { messageId, status: 'confirmed', confirmationScope: 'simulation-only', mode: 'simulated', simulation: true });
     return result;
   }
 
   async sendPrivate(number, text, { clientMessageId } = {}) {
-    if (!/^\d{10,15}$/.test(String(number || ''))) throw Object.assign(new Error('Telefone privado inválido. Use código do país e DDD.'), { safeToRetry: false });
+    if (!/^[1-9]\d{9,14}$/.test(String(number || ''))) throw Object.assign(new Error('Telefone privado inválido. Use código do país e DDD.'), { safeToRetry: false });
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw Object.assign(new Error('Alerta privado inválido.'), { safeToRetry: false });
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     const outcome = this.nextOutcome || 'confirmed';
@@ -81,12 +113,16 @@ class SimulatedAdapter extends EventEmitter {
     if (outcome === 'failed') throw Object.assign(new Error('Falha temporária simulada antes do alerta.'), { safeToRetry: true });
     const messageId = clientMessageId || `SIM-PRIVATE-${randomUUID()}`;
     const existing = this.sent.find(entry => entry.messageId === messageId);
-    if (existing) return { status: existing.status || 'uncertain', messageId, simulation: true };
+    if (existing) {
+      if (existing.privateNumber !== String(number)) throw Object.assign(new Error('Identificador do alerta já pertence a outro destino.'), { safeToRetry: false });
+      return { status: existing.status || 'uncertain', messageId, simulation: true };
+    }
+    this._markAutomatic(messageId);
     this.sent.push({ privateNumber: String(number), text, messageId, at: new Date().toISOString(), simulation: true, status: outcome });
     if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);
     if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
     const status = outcome === 'uncertain' ? 'uncertain' : 'confirmed';
-    if (status === 'confirmed') this.emit('receipt', { messageId, status, simulation: true });
+    if (status === 'confirmed') this.emit('receipt', { messageId, status, confirmationScope: 'simulation-only', mode: 'simulated', simulation: true });
     return { status, messageId, simulation: true };
   }
 
@@ -122,10 +158,11 @@ class SimulatedAdapter extends EventEmitter {
     const outcome = this.nextOutcome || 'confirmed';
     this.nextOutcome = null;
     if (outcome === 'failed') throw Object.assign(new Error('Falha temporária simulada antes da resposta da busca.'), { safeToRetry: true });
+    this._markAutomatic(messageId);
     this.sent.push({ targetId, chatId: targetId, privateNumber: /^\d+@s\.whatsapp\.net$/.test(targetId) ? targetId.split('@')[0] : undefined, text, messageId, status: outcome, search: true, simulation: true, at: new Date().toISOString() });
     if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);
     if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
-    if (outcome === 'confirmed') this.emit('receipt', { messageId, status: 'confirmed', simulation: true });
+    if (outcome === 'confirmed') this.emit('receipt', { messageId, status: 'confirmed', confirmationScope: 'simulation-only', mode: 'simulated', simulation: true });
     return { status: outcome, messageId, simulation: true };
   }
 
@@ -140,10 +177,12 @@ class SimulatedAdapter extends EventEmitter {
 
   async reply(chatId, text) {
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
-    this.replies.push({ chatId, text: String(text), at: new Date().toISOString(), simulation: true });
+    const messageId = `SIM-REPLY-${randomUUID()}`;
+    this._markAutomatic(messageId, 'simulated-control-reply');
+    this.replies.push({ chatId, text: String(text), messageId, at: new Date().toISOString(), simulation: true });
     if (this.replies.length > 1000) this.replies.splice(0, this.replies.length - 1000);
     this.emit('reply', this.replies[this.replies.length - 1]);
-    return { status: 'confirmed', messageId: `SIM-REPLY-${randomUUID()}` };
+    return { status: 'confirmed', messageId, mode: 'simulated', simulation: true };
   }
 
   async downloadIncoming(context) {
@@ -154,8 +193,8 @@ class SimulatedAdapter extends EventEmitter {
 
   /** Test-only ingress; authorization still runs through the command controller. */
   injectIncoming(context = {}) {
-    const senderNumber = String(context.senderNumber || '').replace(/\D/g, '');
-    const event = {
+    const senderNumber = context.fromMe === true ? this.ownNumber : String(context.senderNumber || '').replace(/\D/g, '');
+    const event = this._offerContext({
       messageId: context.messageId || `SIM-IN-${randomUUID()}`,
       senderNumber,
       verified: context.verified ?? true,
@@ -168,16 +207,19 @@ class SimulatedAdapter extends EventEmitter {
       timestamp: context.timestamp || Date.now(),
       ...context,
       simulation: true
-    };
-    this.emit('incoming', event);
-    if (this._searchChatAllowed(event.chatId) && !event.history) this.emit('offerMessage', this._offerContext(event));
+    }, context.history === true || context.historical === true);
+    if (!event.history) this.emit('incoming', event);
+    if (this._searchChatAllowed(event.chatId) && !event.history) this.emit('offerMessage', event);
     return event;
   }
 
   _offerContext(context = {}, history = false) {
-    const number = String(context.senderNumber || '').replace(/\D/g, '');
+    const fromMe = context.fromMe === true;
+    const number = fromMe ? this.ownNumber : String(context.senderNumber || '').replace(/\D/g, '');
     const senderId = context.senderId || (number ? `${number}@s.whatsapp.net` : '');
-    return { ...context, messageId: context.messageId || `SIM-OFFER-${randomUUID()}`, chatId: context.chatId || 'sim-01@simulation', isGroup: context.isGroup ?? (context.chatId || 'sim-01@simulation').endsWith('@simulation'), senderId, senderIds: context.senderIds || [senderId].filter(Boolean), identityVerified: context.identityVerified ?? context.verified ?? Boolean(senderId), senderNumber: number, verified: context.verified ?? Boolean(number), pushName: context.pushName || context.displayName || '', displayName: context.displayName || context.pushName || '', savedName: context.savedName || '', text: context.text || '', type: context.type || 'text', timestamp: context.timestamp ?? Date.now(), capturedAt: context.capturedAt ?? Date.now(), forwarded: context.forwarded === true, fromMe: context.fromMe === true, history, revisionAt: context.revisionAt ?? null, simulation: true };
+    const messageId = context.messageId || `SIM-OFFER-${randomUUID()}`;
+    const automaticMessage = fromMe && (this.automaticMessages.has(messageId) || this.store?.isOutboundMessageId?.(messageId) === true);
+    return { ...context, messageId, chatId: context.chatId || 'sim-01@simulation', isGroup: context.isGroup ?? (context.chatId || 'sim-01@simulation').endsWith('@simulation'), senderId: fromMe ? `${number}@s.whatsapp.net` : senderId, senderIds: context.senderIds || [senderId].filter(Boolean), identityVerified: context.identityVerified ?? context.verified ?? Boolean(senderId), senderNumber: number, verified: context.verified ?? Boolean(number), pushName: context.pushName || context.displayName || '', displayName: context.displayName || context.pushName || '', savedName: context.savedName || '', text: context.text || '', type: context.type || 'text', timestamp: context.timestamp ?? Date.now(), capturedAt: context.capturedAt ?? Date.now(), forwarded: context.forwarded === true, fromMe, trustedSelf: fromMe && Boolean(number), selfChat: Boolean(this.ownNumber) && context.chatId === `${this.ownNumber}@s.whatsapp.net`, automaticMessage, machineGenerated: automaticMessage, accountNumber: this.ownNumber, ownAccountNumber: this.ownNumber, accountId: this.ownNumber ? `${this.ownNumber}@s.whatsapp.net` : '', ownAccountId: this.ownNumber ? `${this.ownNumber}@s.whatsapp.net` : '', history, revisionAt: context.revisionAt ?? null, mode: 'simulated', simulation: true };
   }
 
   injectOfferMessage(context = {}) {

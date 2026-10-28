@@ -10,13 +10,17 @@ const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {
 async function eventually(predicate){for(let i=0;i<200;i++){if(predicate())return;await new Promise(r=>setTimeout(r,5));}throw new Error('Condição de teste não atingida.');}
 const plain=value=>JSON.parse(JSON.stringify(value));
 
-async function desktopHarness({locked=true,argv=[],settings={}}={}){
+async function desktopHarness({locked=true,argv=[],settings={},dataOverride=true,legacyFiles={}}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-desktop-test-'));
   const state={dir,handlers:new Map(),listeners:new Map(),protocols:new Map(),windows:[],notifications:[],calls:[],systemCalls:[],dialogs:[],nativeSupported:true,online:true,workers:0,finalQuit:0,shutdownCalls:0,prefs:{closeBehavior:'ask',minimizeToTray:true,sound:{enabled:false},notifications:{nativeEnabled:true},...settings}};
+  const appData=path.join(dir,'AppData'),legacyProfile=path.join(appData,'Mega Disparos');
+  for(const [relative,value]of Object.entries(legacyFiles)){const target=path.join(legacyProfile,relative);fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,value);}
+  const paths=new Map([['appData',appData],['userData',path.join(appData,'Kenned Code Disparos')]]);
+  state.paths=paths;state.legacyProfile=legacyProfile;
   const app=new EventEmitter();
   Object.assign(app,{
     setName:value=>{state.appName=value;},setAppUserModelId:value=>{state.aumid=value;},commandLine:{appendSwitch:(...args)=>{state.switch=args;}},
-    setPath(){},getPath:()=>dir,getVersion:()=> 'test',requestSingleInstanceLock:()=>locked,whenReady:()=>Promise.resolve(),
+    setPath:(name,value)=>{paths.set(name,value);},getPath:name=>paths.get(name)||dir,getVersion:()=> 'test',requestSingleInstanceLock:()=>{state.lockProfile=paths.get('userData');return locked;},whenReady:()=>Promise.resolve(),
     quit(){const event={preventDefault(){this.prevented=true;}};app.emit('before-quit',event);if(!event.prevented)state.finalQuit++;},
     setLoginItemSettings:value=>{state.loginSettings=plain(value);}
   });
@@ -40,11 +44,11 @@ async function desktopHarness({locked=true,argv=[],settings={}}={}){
     constructor(options){super();this.options=options;state.notifications.push(this);}static isSupported(){return state.nativeSupported;}show(){this.requested=true;}
   }
   const powerMonitor=new EventEmitter();
-  const electron={app,BrowserWindow:Window,ipcMain:{handle:(name,fn)=>state.handlers.set(name,fn),on:(name,fn)=>state.listeners.set(name,fn)},dialog:{showMessageBox:async(_,payload)=>{state.dialogs.push(payload);return {response:state.dialogResponse??2};},showOpenDialog:async()=>({canceled:true}),showSaveDialog:async()=>({canceled:true}),showErrorBox:(_,message)=>{state.startupError=message;}},Tray:class extends EventEmitter{constructor(){super();state.tray=this;}setToolTip(){}setContextMenu(menu){this.menu=menu;}destroy(){this.destroyed=true;}},Menu:{buildFromTemplate:value=>value,setApplicationMenu(){}},nativeImage:{createFromPath:()=>({})},shell:{openPath:async()=>''},powerMonitor,safeStorage:{isEncryptionAvailable:()=>true,encryptString:value=>Buffer.from(value),decryptString:buffer=>buffer.toString()},protocol:{registerSchemesAsPrivileged(value){state.schemes=value;},handle:(name,fn)=>state.protocols.set(name,fn)},net:{isOnline:()=>state.online,fetch:async url=>({url})},Notification:TestNotification};
+  const electron={app,BrowserWindow:Window,ipcMain:{handle:(name,fn)=>state.handlers.set(name,fn),on:(name,fn)=>state.listeners.set(name,fn)},dialog:{showMessageBox:async(_,payload)=>{state.dialogs.push(payload);return {response:state.dialogResponse??2};},showOpenDialog:async()=>({canceled:true}),showSaveDialog:async()=>({canceled:true}),showErrorBox:(_,message)=>{state.startupError=message;}},Tray:class extends EventEmitter{constructor(){super();state.tray=this;}setToolTip(value){state.trayTooltip=value;}setContextMenu(menu){this.menu=menu;}destroy(){this.destroyed=true;}},Menu:{buildFromTemplate:value=>value,setApplicationMenu(){}},nativeImage:{createFromPath:()=>({})},shell:{openPath:async()=>''},powerMonitor,safeStorage:{isEncryptionAvailable:()=>true,encryptString:value=>Buffer.from(value),decryptString:buffer=>buffer.toString()},protocol:{registerSchemesAsPrivileged(value){state.schemes=value;},handle:(name,fn)=>state.protocols.set(name,fn)},net:{isOnline:()=>state.online,fetch:async url=>({url})},Notification:TestNotification};
   const filename=path.resolve(__dirname,'../src/main.cjs'),baseRequire=createRequire(filename);
-  const localRequire=name=>name==='electron'?electron:name==='node:worker_threads'?{Worker:class{constructor(){state.workers++;}}}:name==='./core/worker-client.cjs'?{WorkerClient:Client}:name==='./core/sound.cjs'?{SoundController}:baseRequire(name);
+  const localRequire=name=>name==='electron'?electron:name==='node:worker_threads'?{Worker:class{constructor(filename,options){state.workers++;state.workerData=plain(options.workerData);}}}:name==='./core/worker-client.cjs'?{WorkerClient:Client}:name==='./core/sound.cjs'?{SoundController}:baseRequire(name);
   const intervals=[];
-  vm.runInNewContext(fs.readFileSync(filename,'utf8'),{require:localRequire,__dirname:path.dirname(filename),process:{env:{MEGA_DATA_DIR:dir},platform:'win32',argv,execPath:'C:\\Mega Disparos.exe'},setTimeout,clearTimeout,setInterval:fn=>{const timer={fn,unref(){}};intervals.push(timer);return timer;},clearInterval:timer=>{if(timer)timer.cleared=true;},Response,URL,Promise,Buffer,Date},{filename});
+  vm.runInNewContext(fs.readFileSync(filename,'utf8'),{require:localRequire,__dirname:path.dirname(filename),process:{env:dataOverride?{MEGA_DATA_DIR:dir}:{},platform:'win32',argv,execPath:'C:\\Kenned Code Disparos.exe'},setTimeout,clearTimeout,setInterval:fn=>{const timer={fn,unref(){}};intervals.push(timer);return timer;},clearInterval:timer=>{if(timer)timer.cleared=true;},Response,URL,Promise,Buffer,Date},{filename});
   if(locked)await eventually(()=>state.windows.length===2||state.startupError);
   assert(!state.startupError,state.startupError);
   const win=state.windows.find(w=>w.options.show!==false),audioWindow=state.windows.find(w=>w.options.show===false);
@@ -92,9 +96,31 @@ async function testLifecycleAndNetwork(){
     h.win.emit('minimize');assert.equal(h.win.hidden,true);
     h.win.show();h.state.dialogResponse=0;const event={preventDefault(){this.prevented=true;}};h.win.emit('close',event);await eventually(()=>h.win.hidden);assert(event.prevented);assert.equal(h.state.finalQuit,0);
     assert(/computador precisa estar ligado/i.test(h.state.dialogs.at(-1).detail));
-    await h.state.host('setLoginItemSettings',{openAtLogin:true});assert.deepEqual(h.state.loginSettings,{openAtLogin:true,path:'C:\\Mega Disparos.exe',args:['--autostart']});
+    await h.state.host('setLoginItemSettings',{openAtLogin:true});assert.deepEqual(h.state.loginSettings,{name:'Kenned Code Disparos',openAtLogin:true,path:'C:\\Kenned Code Disparos.exe',args:['--autostart']});
     h.state.shutdownGate=deferred();h.app.quit();h.app.quit();assert.equal(h.state.shutdownCalls,1);assert.equal(h.state.finalQuit,0);assert.equal(timer.cleared,true);assert.equal(h.state.soundStopped,true);
     h.state.shutdownGate.resolve();await eventually(()=>h.state.finalQuit>0);assert.equal(h.state.tray.destroyed,true);assert.equal(h.audioWindow.destroyed,true);
+  }finally{await h.close();}
+}
+
+async function testBrandingAndLegacyProfile(){
+  const h=await desktopHarness({dataOverride:false,legacyFiles:{'credentials/channels.dpapi':JSON.stringify({independent:'preserved-test-value'}),'mega.sqlite':'database-sentinel'}});
+  try{
+    assert.equal(h.state.appName,'Kenned Code Disparos');assert.equal(h.win.options.title,'Kenned Code Disparos');
+    assert.equal(h.state.trayTooltip,'Kenned Code Disparos • campanhas locais');
+    assert.equal(h.state.lockProfile,h.state.legacyProfile,'The original profile is selected before the single-instance lock.');
+    assert.equal(h.state.workerData.dir,h.state.legacyProfile);assert.equal(h.state.aumid,'br.com.megadisparos.desktop');
+    assert.equal(await h.state.host('secretGet',{key:'independent'}),'preserved-test-value');
+    assert.equal(fs.readFileSync(path.join(h.state.legacyProfile,'mega.sqlite'),'utf8'),'database-sentinel');
+    assert.equal(fs.existsSync(path.join(h.state.dir,'AppData','Kenned Code Disparos')),false,'The rename does not create an empty second profile.');
+    h.state.tray.menu.find(item=>item.label==='Sobre Kenned Code Disparos').click();await eventually(()=>h.state.dialogs.some(item=>item.title==='Sobre Kenned Code Disparos'));
+    await h.state.host('localAlert',{id:'brand-test',event:'critical'});assert.equal(h.state.notifications[0].options.title,'Kenned Code Disparos');
+    const pkg=JSON.parse(fs.readFileSync(path.join(__dirname,'../package.json'),'utf8'));
+    assert.equal(pkg.build.productName,'Kenned Code Disparos');assert.equal(pkg.build.appId,'br.com.megadisparos.desktop');assert.equal(pkg.build.nsis.shortcutName,'Kenned Code Disparos');
+    const installer=fs.readFileSync(path.join(__dirname,'installer.nsi'),'utf8');
+    assert(installer.includes('InstallDirRegKey HKCU "Software\\Mega Disparos" "InstallDir"'));
+    assert(installer.includes('StrCmp $0 "Mega Disparos" validDirectory'));
+    assert(installer.includes('StrCmp $1 "F|Mega Disparos.exe" 0 legacyOwnedLoop'));
+    assert(installer.includes('"DisplayName" "Kenned Code Disparos"'));
   }finally{await h.close();}
 }
 
@@ -126,7 +152,7 @@ async function testActualAudioRenderer(){
 function testOwnershipManifest(){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-owned-test-'));
   try{
-    fs.mkdirSync(path.join(dir,'resources','nested'),{recursive:true});fs.writeFileSync(path.join(dir,'Mega Disparos.exe'),'app');fs.writeFileSync(path.join(dir,'resources','nested','app.asar'),'payload');
+    fs.mkdirSync(path.join(dir,'resources','nested'),{recursive:true});fs.writeFileSync(path.join(dir,'Kenned Code Disparos.exe'),'app');fs.writeFileSync(path.join(dir,'resources','nested','app.asar'),'payload');
     const result=writeOwnershipManifest(dir);assert.equal(result.files,2);
     const manifest=fs.readFileSync(path.join(dir,'.mega-owned-files.txt'),'utf16le').trim().split(/\r?\n/);
     assert(manifest.includes('F|resources\\nested\\app.asar'));assert(manifest.indexOf('D|resources\\nested')<manifest.indexOf('D|resources'));
@@ -137,4 +163,4 @@ function testOwnershipManifest(){
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 }
 
-(async()=>{testOwnershipManifest();await testSingleInstanceAndIpcBoundary();await testNativeNotificationAcknowledgement();await testLifecycleAndNetwork();await testActualAudioRenderer();console.log('Desktop: 5 fluxos passaram (instância/IPC/bandeja, retorno das notificações, suspensão/rede/encerramento, manifesto e renderizador real de áudio com ganho/volume). Facade nativa; exibição e áudio físicos no Windows não verificados.');})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{testOwnershipManifest();await testSingleInstanceAndIpcBoundary();await testNativeNotificationAcknowledgement();await testLifecycleAndNetwork();await testBrandingAndLegacyProfile();await testActualAudioRenderer();console.log('Desktop: 6 fluxos passaram (instância/IPC/bandeja, retorno das notificações, suspensão/rede/encerramento, manifesto, nova identidade com perfil legado preservado e renderizador real de áudio com ganho/volume). Facade nativa; exibição e áudio físicos no Windows não verificados.');})().catch(error=>{console.error(error);process.exitCode=1;});

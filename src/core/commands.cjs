@@ -333,7 +333,7 @@ class CommandController {
   }
 
   _help() {
-    return 'Mega Disparos — comandos da conversa autorizada\n' +
+    return 'Kenned Code Disparos — comandos da conversa autorizada\n' +
       '!mega ajuda\n!mega status\n!mega campanhas\n!mega grupos\n!mega menu\n!mega criar NOME\n!mega editar ID\n' +
       '!mega pausar ID\n!mega retomar ID\n!mega ativar ID\n!mega parar tudo\n!mega intervalo ID MINUTOS\n' +
       '!mega adicionar-grupo ID_CAMPANHA ID_GRUPO\n!mega remover-grupo ID_CAMPANHA ID_GRUPO\n!mega previa ID\n' +
@@ -368,7 +368,7 @@ class CommandController {
   _home(session) {
     const campaign = session.campaignId ? this.store.getCampaign(session.campaignId) : null;
     if (campaign) this._assert('campaign.view', campaign);
-    return `Menu Mega Disparos${campaign ? ` — ${campaign.name}` : ''}\n` +
+    return `Menu Kenned Code Disparos${campaign ? ` — ${campaign.name}` : ''}\n` +
       '1 Criar campanha\n2 Editar/selecionar campanha\n3 Selecionar/remover grupos e configurar grupo\n' +
       '4 Horários, intervalos e limites\n5 Adicionar texto ou mídia\n6 Ordenar/remover conteúdos\n7 Resultados e falhas\n8 Prévia e ativação\n0 Encerrar menu\nResponda com o número. Para retornar de uma etapa: !mega menu.';
   }

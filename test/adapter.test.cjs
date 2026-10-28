@@ -45,6 +45,7 @@ async function fixture(t, { ackTimeoutMs = 30, submissionTimeoutMs = 90000, cont
       socket = {
         ev: new EventEmitter(), ws: new EventEmitter(), user: { id: '5511999999999@s.whatsapp.net' },
         end: () => {}, logout: async () => {},
+        onWhatsApp: async number => [{ jid: `${number}@s.whatsapp.net`, exists: true }],
         groupFetchAllParticipating: async () => ({ 'a@g.us': { id: 'a@g.us', subject: 'Grupo autorizado' } }),
         sendMessage: (...args) => sendBehavior(...args)
       };
@@ -72,7 +73,7 @@ test('simulação identifica grupos fictícios e oferece falha antes do envio e 
   await assert.rejects(adapter.send(groups[0].id, { type: 'text', text: 'Teste' }), error => error.safeToRetry === true);
   assert.equal(adapter.sent.length, 0);
   adapter.setNextOutcome('uncertain');
-  assert.deepEqual(await adapter.send(groups[0].id, { type: 'text', text: 'Teste', clientMessageId: 'persisted' }), { status: 'uncertain', messageId: 'persisted' });
+  assert.deepEqual(await adapter.send(groups[0].id, { type: 'text', text: 'Teste', clientMessageId: 'persisted' }), { status: 'uncertain', messageId: 'persisted', mode: 'simulated', simulation: true });
   await assert.rejects(adapter.send('real@g.us', { type: 'text', text: 'Teste' }));
 });
 
@@ -358,6 +359,8 @@ test('queda de internet fecha transporte, mantém sessão e marca envio pendente
   f.socket.end = () => { ended++; };
   f.setSendBehavior(() => new Promise(() => {}));
   const pending = f.adapter.sendPrivate('5511888888888', 'Alerta', { clientMessageId: 'offline-alert' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.adapter.pendingAcks.has('offline-alert'), true, 'a queda ocorre depois da submissão, não durante a consulta do número');
   f.adapter.setNetworkOnline(false);
   assert.equal((await pending).status, 'uncertain');
   assert.equal(ended, 1);

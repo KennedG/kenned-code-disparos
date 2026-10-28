@@ -5,7 +5,7 @@ const { createHash, randomUUID } = require('node:crypto');
 // The captured supplier data and operational command/delivery ledgers intentionally
 // remain outside campaign history, portable backup and campaign restore.
 function createSearchSchema(db) {
-  db.exec(`
+  const schema = `
     CREATE TABLE IF NOT EXISTS buscas_messages(
       chatId TEXT NOT NULL,messageId TEXT NOT NULL,originalAt INTEGER NOT NULL,
       capturedAt INTEGER NOT NULL,revisionAt INTEGER NOT NULL,deletedAt INTEGER,
@@ -50,12 +50,38 @@ function createSearchSchema(db) {
     CREATE TABLE IF NOT EXISTS buscas_inbox(
       id TEXT PRIMARY KEY,status TEXT NOT NULL,createdAt INTEGER NOT NULL,data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS buscas_inbox_status_time ON buscas_inbox(status,createdAt);
-  `);
+  `;
+  db.exec(schema);
+  db.exec(schema.replace(/\bbuscas_(messages|offers|authorizations|runs|history|deliveries|gaps|inbox)(?![a-z_])/g, '$&_simulation').replace(/\bbuscas_(messages|offers|authorizations|runs|history|deliveries|gaps|inbox)_[a-z_]+(?= ON)/g, '$&_simulation'));
 }
 
-function attachSearchStore(store,{db,prepared,transaction}) {
+function attachSearchStore(store,{db,prepared: basePrepared,transaction}) {
+  createSearchSchema(db);
+  const tablePattern = /\bbuscas_(messages|offers|authorizations|runs|history|deliveries|gaps|inbox)\b/g;
+  const mode = () => store.getStorageMode?.() || (store.getSetting('integrationMode', 'simulated') === 'whatsapp' ? 'whatsapp' : 'simulated');
+  const prepared = sql => basePrepared(mode() === 'simulated' ? sql.replace(tablePattern, '$&_simulation') : sql);
+  // Only proven demo records are moved: explicit metadata or the protocol's
+  // simulation namespace. Display names are never used to classify data.
+  db.exec('CREATE TABLE IF NOT EXISTS buscas_isolation_meta(id TEXT PRIMARY KEY)');
+  if (!basePrepared("SELECT id FROM buscas_isolation_meta WHERE id='v1'").get()) transaction(() => {
+    const proven = `COALESCE(json_extract(data,'$.simulation'),0)=1 OR COALESCE(json_extract(data,'$.storageMode'),'')='simulated' OR COALESCE(json_extract(data,'$.chatId'),'') LIKE '%@simulation' OR COALESCE(json_extract(data,'$.context.simulation'),0)=1 OR COALESCE(json_extract(data,'$.context.chatId'),'') LIKE '%@simulation'`;
+    for (const table of ['messages','offers','inbox']) {
+      basePrepared(`INSERT OR IGNORE INTO buscas_${table}_simulation SELECT * FROM buscas_${table} WHERE ${proven}`).run();
+      basePrepared(`DELETE FROM buscas_${table} WHERE ${proven}`).run();
+    }
+    const runs = `${proven} OR id IN(SELECT id FROM buscas_runs WHERE EXISTS(SELECT 1 FROM json_each(json_extract(buscas_runs.data,'$.resultOfferIds')) refs JOIN buscas_offers_simulation offers ON refs.value=offers.id))`;
+    basePrepared(`INSERT OR IGNORE INTO buscas_runs_simulation SELECT * FROM buscas_runs WHERE ${runs}`).run();
+    for (const table of ['history','deliveries']) {
+      const condition = table === 'history' ? 'id IN(SELECT id FROM buscas_runs_simulation)' : 'runId IN(SELECT id FROM buscas_runs_simulation)';
+      basePrepared(`INSERT OR IGNORE INTO buscas_${table}_simulation SELECT * FROM buscas_${table} WHERE ${condition} OR ${proven}`).run();
+      basePrepared(`DELETE FROM buscas_${table} WHERE ${condition} OR ${proven}`).run();
+    }
+    basePrepared('DELETE FROM buscas_runs WHERE id IN(SELECT id FROM buscas_runs_simulation)').run();
+    basePrepared("INSERT INTO buscas_isolation_meta(id) VALUES('v1')").run();
+  });
   const foldText=value=>String(value??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
   db.function('buscas_fold_text',{deterministic:true},foldText);
+  const scoped=value=>{if(value?.storageMode && value.storageMode!==mode())throw new Error('O registro BUSCAS pertence a outro modo de integração.');return {...value,storageMode:mode(),simulation:mode()==='simulated'};};
   const encode=JSON.stringify;
   const decode=row=>row?JSON.parse(row.data):undefined;
   const identifier=(value,label='Identificador')=>{if(typeof value!=='string'||!value||value.length>500)throw new Error(`${label} inválido.`);return value;};
@@ -86,6 +112,7 @@ function attachSearchStore(store,{db,prepared,transaction}) {
   const messageOffers=(chatId,messageId)=>prepared('SELECT data FROM buscas_offers WHERE chatId=? AND messageId=? ORDER BY rowid').all(chatId,messageId).map(decode);
   function upsertMessage(input,offers=[]) {
     if(!input||!Array.isArray(offers)||offers.length>1000)throw new Error('Mensagem ou lista de ofertas BUSCAS inválida.');
+    input=scoped(input);
     const chatId=identifier(input.chatId??input.groupId,'Grupo'),messageId=identifier(input.messageId??input.id,'Mensagem');
     if(typeof input.text!=='string'||Buffer.byteLength(input.text,'utf8')>1048576)throw new Error('Texto da mensagem BUSCAS inválido ou muito grande.');
     return transaction(()=>{
@@ -103,7 +130,7 @@ function attachSearchStore(store,{db,prepared,transaction}) {
         if(priceCents!==null&&priceCents<0)throw new Error('Preço de oferta inválido.');
         const status=raw.unavailable?'unavailable':raw.status??'active';
         if(!['active','unavailable','deleted'].includes(status))throw new Error('Estado de oferta inválido.');
-        const offer={...raw,id:raw.id??hash(`${chatId}\0${messageId}\0${index}`),chatId,groupId:chatId,messageId,messageAt:originalAt,originalAt,revisionAt,supplierKey,confidence,status,priceCents,storageGB:optionalInt(raw.storageGB),batteryPercent:optionalInt(raw.batteryPercent),originalExcerpt:raw.originalExcerpt??input.text};
+        const offer={...scoped(raw),id:raw.id??hash(`${chatId}\0${messageId}\0${index}`),chatId,groupId:chatId,messageId,messageAt:originalAt,originalAt,revisionAt,supplierKey,confidence,status,priceCents,storageGB:optionalInt(raw.storageGB),batteryPercent:optionalInt(raw.batteryPercent),originalExcerpt:raw.originalExcerpt??input.text};
         prepared(`INSERT INTO buscas_offers(id,chatId,messageId,messageAt,supplierKey,modelKey,storageGB,colorKey,condition,batteryPercent,priceCents,priceKind,confidence,status,productKey,fingerprint,data)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(identifier(offer.id),chatId,messageId,originalAt,supplierKey,offer.modelKey??null,offer.storageGB,offer.colorKey??null,offer.condition??null,offer.batteryPercent,priceCents,offer.priceKind??'unknown',confidence,status,offer.productKey??null,offer.fingerprint??null,encode(offer));
         return offer;
       });
@@ -155,12 +182,13 @@ function attachSearchStore(store,{db,prepared,transaction}) {
     const order=filters.order==='recent'?'o.messageAt DESC,o.rowid DESC':filters.order==='price-desc'?'o.priceCents DESC,o.messageAt DESC,o.rowid DESC':'o.priceCents ASC,o.messageAt DESC,o.rowid DESC';
     return page('buscas_offers',filters,{ids:'o.id',chatId:'o.chatId',groupId:'o.chatId',groupIds:'o.chatId',supplierKey:'o.supplierKey',supplierKeys:'o.supplierKey',modelKey:'o.modelKey',storageGB:'o.storageGB',colorKey:'o.colorKey',condition:'o.condition',confidence:'o.confidence',status:'o.status',priceKind:'o.priceKind',productKey:'o.productKey',fingerprint:'o.fingerprint'},where,params,order);
   }
-  function saveAuthorization(value){return transaction(()=>{
+  function saveAuthorization(value){value=scoped(value);return transaction(()=>{
     const id=identifier(value?.id),old=decode(prepared('SELECT data FROM buscas_authorizations WHERE id=?').get(id));
     const data={...old,...value,id,createdAt:old?.createdAt??timestamp(value.createdAt)},principalId=value.principalId??value.accountId??value.senderId??value.userId??null;
     prepared(`INSERT INTO buscas_authorizations(id,principalId,active,createdAt,data)VALUES(?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET principalId=excluded.principalId,active=excluded.active,data=excluded.data`).run(id,principalId,value.active===false||value.enabled===false?0:1,data.createdAt,encode(data));return data;
   });}
   function saveRunRaw(value) {
+    value=scoped(value);
     const id=identifier(value?.id),old=decode(prepared('SELECT data FROM buscas_runs WHERE id=?').get(id));
     if(old&&['chatId','messageId','userId','actorId'].some(key=>old[key]!==value[key]))throw new Error('A identidade operacional da busca não pode ser alterada.');
     const data={...old,...value,id,createdAt:old?.createdAt??timestamp(value.createdAt??value.requestedAt),status:value.status??'pending'};
@@ -172,7 +200,7 @@ function attachSearchStore(store,{db,prepared,transaction}) {
     if(value?.id){const old=decode(prepared('SELECT data FROM buscas_runs WHERE id=?').get(value.id));if(old)return {claimed:false,run:old};}
     return {claimed:true,run:saveRunRaw({...value,id:value.id??randomUUID()})};
   });}
-  function saveDelivery(value){return transaction(()=>{
+  function saveDelivery(value){value=scoped(value);return transaction(()=>{
     const id=identifier(value?.id),old=decode(prepared('SELECT data FROM buscas_deliveries WHERE id=?').get(id)),data={...old,...value,id,createdAt:old?.createdAt??timestamp(value.createdAt)};
     if(!['pending','sending','confirmed','uncertain','failed','cancelled'].includes(data.status))throw new Error('Estado de entrega BUSCAS inválido.');
     if(old&&old.runId!==data.runId)throw new Error('A busca associada à entrega não pode ser alterada.');
@@ -196,7 +224,7 @@ function attachSearchStore(store,{db,prepared,transaction}) {
     listSearchHistory:filters=>page('buscas_history',filters,{userId:'userId',actorId:'userId',chatId:'chatId',status:'status'}),
     saveSearchDelivery:saveDelivery,getSearchDelivery:id=>decode(prepared('SELECT data FROM buscas_deliveries WHERE id=?').get(identifier(id))),
     updateSearchDelivery(id,patch){const old=api.getSearchDelivery(id);if(!old)throw new Error('Entrega BUSCAS não encontrada.');return saveDelivery({...old,...patch,id});},
-    listSearchDeliveries:filters=>page('buscas_deliveries',filters,{runId:'runId',status:'status',statuses:'status',messageId:'messageId'},filters?.dueAt===undefined?[]:['nextAttemptAt<=?'],filters?.dueAt===undefined?[]:[timestamp(filters.dueAt)],'createdAt ASC,rowid ASC'),
+    listSearchDeliveries:filters=>page('buscas_deliveries',filters,{runId:'runId',status:'status',statuses:'status',messageId:'messageId'},filters?.dueAt===undefined?[]:['nextAttemptAt<=?'],filters?.dueAt===undefined?[]:[timestamp(filters.dueAt)],filters?.order==='recent'?'createdAt DESC,rowid DESC':'createdAt ASC,rowid ASC'),
     getSearchDeliverySummaries(runIds){
       if(!Array.isArray(runIds)||runIds.length>1000)throw new Error('Lote de buscas excede o limite.');
       const ids=[...new Set(runIds.map(id=>identifier(id,'Busca')))];if(!ids.length)return [];
@@ -211,14 +239,14 @@ function attachSearchStore(store,{db,prepared,transaction}) {
         MIN(CAST(json_extract(data,'$.submittedAt') AS INTEGER)) firstSubmittedAt,
         MAX(CAST(json_extract(data,'$.submittedAt') AS INTEGER)) lastSubmittedAt,
         MAX(CAST(json_extract(data,'$.resultAt') AS INTEGER)) lastResultAt
-        FROM buscas_deliveries WHERE runId IN(${ids.map(()=>'?').join(',')}) GROUP BY runId`).all(...ids);
+        FROM buscas_deliveries WHERE COALESCE(json_extract(data,'$.errorNotice'),0)=0 AND runId IN(${ids.map(()=>'?').join(',')}) GROUP BY runId`).all(...ids);
       return rows.map(row=>({runId:row.runId,parts:Number(row.parts),counts:Object.fromEntries(['pending','sending','confirmed','uncertain','failed','cancelled'].map(status=>[status,Number(row[status])])),targets:JSON.parse(row.targets).filter(target=>typeof target==='string'),firstCreatedAt:row.firstCreatedAt,firstSubmittedAt:row.firstSubmittedAt,lastSubmittedAt:row.lastSubmittedAt,lastResultAt:row.lastResultAt}));
     },
-    recordSearchGap(value){return transaction(()=>{const id=identifier(value?.id??randomUUID()),old=decode(prepared('SELECT data FROM buscas_gaps WHERE id=?').get(id)),data={...old,...value,id,startedAt:old?.startedAt??timestamp(value.startedAt),endedAt:value.endedAt===null||value.endedAt===undefined?null:timestamp(value.endedAt)};prepared(`INSERT INTO buscas_gaps(id,startedAt,endedAt,chatId,data)VALUES(?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET endedAt=excluded.endedAt,data=excluded.data`).run(id,data.startedAt,data.endedAt,data.chatId??null,encode(data));return data;});},
+    recordSearchGap(value){value=scoped(value);return transaction(()=>{const id=identifier(value?.id??randomUUID()),old=decode(prepared('SELECT data FROM buscas_gaps WHERE id=?').get(id)),data={...old,...value,id,startedAt:old?.startedAt??timestamp(value.startedAt),endedAt:value.endedAt===null||value.endedAt===undefined?null:timestamp(value.endedAt)};prepared(`INSERT INTO buscas_gaps(id,startedAt,endedAt,chatId,data)VALUES(?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET endedAt=excluded.endedAt,data=excluded.data`).run(id,data.startedAt,data.endedAt,data.chatId??null,encode(data));return data;});},
     listSearchGaps:filters=>page('buscas_gaps',filters,{chatId:'chatId'},[],[],'startedAt DESC,rowid DESC'),
     setSearchMonitorStarted:at=>store.setSetting('buscasMonitorStartedAt',timestamp(at)),
     getSearchMonitorStats(){const m=prepared('SELECT COUNT(*) messages,MAX(capturedAt) lastCapturedAt,MAX(originalAt) lastOriginalAt,COALESCE(SUM(deletedAt IS NOT NULL),0) deleted FROM buscas_messages').get(),o=prepared("SELECT COUNT(*) offers,COALESCE(SUM(confidence='review' AND status='active'),0) review,COALESCE(SUM(confidence='confirmed' AND status='active'),0) confirmed FROM buscas_offers").get(),inbox=prepared('SELECT COUNT(*) n FROM buscas_inbox').get(),gap=prepared('SELECT COUNT(*) totalGaps,COALESCE(SUM(endedAt IS NULL),0) openGaps FROM buscas_gaps').get(),history=prepared('SELECT COUNT(*) n FROM buscas_history').get();const groups=prepared('SELECT chatId,COUNT(*) messages,MAX(capturedAt) lastCapturedAt,MAX(originalAt) lastOriginalAt FROM buscas_messages GROUP BY chatId ORDER BY lastCapturedAt DESC LIMIT 500').all();return {...m,...o,...gap,totalMessages:Number(m.messages),totalOffers:Number(o.offers),history:Number(history.n),startedAt:store.getSetting('buscasMonitorStartedAt',null),inbox:Number(inbox.n),groups,gaps:api.listSearchGaps({limit:20}).items};},
-    enqueueSearchInbox(value,{maximum=10000}={}){return transaction(()=>{const id=identifier(value?.id??hash(encode(value))),old=prepared('SELECT 1 FROM buscas_inbox WHERE id=?').get(id);if(old)return {enqueued:false,duplicate:true,id};const count=Number(prepared('SELECT COUNT(*) n FROM buscas_inbox').get().n);if(count>=limit(maximum,10000,100000))return {enqueued:false,full:true,id,count};const data={...value,id,status:value.status??'pending',createdAt:timestamp(value.createdAt)};prepared('INSERT INTO buscas_inbox(id,status,createdAt,data)VALUES(?,?,?,?)').run(id,data.status,data.createdAt,encode(data));return {enqueued:true,id,count:count+1};});},
+    enqueueSearchInbox(value,{maximum=10000}={}){value=scoped(value);return transaction(()=>{const id=identifier(value?.id??hash(encode(value))),old=prepared('SELECT 1 FROM buscas_inbox WHERE id=?').get(id);if(old)return {enqueued:false,duplicate:true,id};const count=Number(prepared('SELECT COUNT(*) n FROM buscas_inbox').get().n);if(count>=limit(maximum,10000,100000))return {enqueued:false,full:true,id,count};const data={...value,id,status:value.status??'pending',createdAt:timestamp(value.createdAt)};prepared('INSERT INTO buscas_inbox(id,status,createdAt,data)VALUES(?,?,?,?)').run(id,data.status,data.createdAt,encode(data));return {enqueued:true,id,count:count+1};});},
     getSearchInboxCount:()=>Number(prepared('SELECT COUNT(*) n FROM buscas_inbox').get().n),
     listSearchInbox:filters=>page('buscas_inbox',filters,{status:'status'},[],[],'createdAt ASC,rowid ASC'),
     updateSearchInbox(id,patch){return transaction(()=>{const old=decode(prepared('SELECT data FROM buscas_inbox WHERE id=?').get(identifier(id)));if(!old)throw new Error('Captura BUSCAS não encontrada.');const data={...old,...patch,id};prepared('UPDATE buscas_inbox SET status=?,data=? WHERE id=?').run(data.status,encode(data),id);return data;});},

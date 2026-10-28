@@ -6,14 +6,20 @@ const fs=require('node:fs'),path=require('node:path'),{randomUUID}=require('node
 const {WorkerClient}=require('./core/worker-client.cjs');
 const {SoundController}=require('./core/sound.cjs');
 
-app.setName('Mega Disparos');
+const APP_NAME='Kenned Code Disparos';
+// Keep the existing profile and the OS mutex during the identity update.
+// This preserves SQLite, managed media, DPAPI credentials and WhatsApp sessions.
+const LEGACY_PROFILE_NAME='Mega Disparos';
+app.setName(APP_NAME);
 app.setAppUserModelId('br.com.megadisparos.desktop');
 app.commandLine.appendSwitch('autoplay-policy','no-user-gesture-required');
 protocol.registerSchemesAsPrivileged([
   {scheme:'mega-media',privileges:{standard:true,secure:true,supportFetchAPI:true,stream:true}},
   {scheme:'mega-audio',privileges:{standard:true,secure:true,supportFetchAPI:true,stream:true}}
 ]);
-if(process.env.MEGA_DATA_DIR)app.setPath('userData',path.resolve(process.env.MEGA_DATA_DIR));
+const profileDir=process.env.MEGA_DATA_DIR?path.resolve(process.env.MEGA_DATA_DIR):path.join(app.getPath('appData'),LEGACY_PROFILE_NAME);
+fs.mkdirSync(profileDir,{recursive:true});
+app.setPath('userData',profileDir);
 const locked=app.requestSingleInstanceLock();
 if(!locked)app.quit();
 let win,tray,audioWindow,client,sounds,quitting=false,quitStarted=false,networkTimer,settings={},lastSnapshot=null,resolveAudio;
@@ -61,7 +67,7 @@ async function nativeAlert(payload){
   if(payload.nativeEnabled===false||settings.notifications?.nativeEnabled===false)return {...audio,nativeStatus:'disabled'};
   if(!Notification.isSupported())return {...audio,nativeStatus:'unsupported'};
   try{
-    const notification=new Notification({title:payload.title||'Mega Disparos',body:payload.body||payload.reason||'Verifique os detalhes no aplicativo.',icon:path.join(__dirname,'../assets/icon.png'),silent:true,timeoutType:'default'});
+    const notification=new Notification({title:payload.title||APP_NAME,body:payload.body||payload.reason||'Verifique os detalhes no aplicativo.',icon:path.join(__dirname,'../assets/icon.png'),silent:true,timeoutType:'default'});
     notification.on('click',showWindow);
     notification.on('show',()=>{void client?.systemCall('nativeNotificationResult',{id:payload.id,status:'shown'}).catch(()=>{});});
     notification.on('failed',()=>{void client?.systemCall('nativeNotificationResult',{id:payload.id,status:'failed',error:'O Windows não aceitou a notificação; confira as permissões de notificações.'}).catch(()=>{});});
@@ -83,7 +89,7 @@ async function nativeHost(action,payload={}){
     case 'showSaveDialog':return dialog.showSaveDialog(win,payload);
     case 'showMessageBox':return dialog.showMessageBox(win,payload);
     case 'openDataFolder':return shell.openPath(dataDir());
-    case 'setLoginItemSettings':if(process.platform==='win32')app.setLoginItemSettings({openAtLogin:!!payload.openAtLogin,path:process.execPath,args:['--autostart']});return true;
+    case 'setLoginItemSettings':if(process.platform==='win32')app.setLoginItemSettings({name:APP_NAME,openAtLogin:!!payload.openAtLogin,path:process.execPath,args:['--autostart']});return true;
     case 'localAlert':return nativeAlert(payload);
     case 'testSound':return sounds.test(payload.preferences||payload.soundPreferences||payload.sound||settings.sound,{audioUrl:registerAudio(payload.audioPath)});
     case 'silenceAlert':sounds.mute(payload.id);return true;
@@ -99,7 +105,7 @@ async function nativeHost(action,payload={}){
   }
 }
 function createWindow(){
-  win=new BrowserWindow({width:1380,height:920,minWidth:1060,minHeight:700,title:'Mega Disparos',backgroundColor:'#0b101b',icon:path.join(__dirname,'../assets/icon.png'),webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
+  win=new BrowserWindow({width:1380,height:920,minWidth:1060,minHeight:700,title:APP_NAME,backgroundColor:'#0b101b',icon:path.join(__dirname,'../assets/icon.png'),webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
   win.loadFile(uiPath);win.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   win.webContents.on('will-navigate',(event,url)=>{if(url.split('#')[0]!==pathToFileURL(uiPath).href)event.preventDefault();});
   win.on('minimize',()=>{if(settings.minimizeToTray!==false)win.hide();});
@@ -107,15 +113,15 @@ function createWindow(){
     if(quitting)return;event.preventDefault();
     if(settings.closeBehavior==='tray'){win.hide();return;}
     if(settings.closeBehavior==='quit'){app.quit();return;}
-    const result=await dialog.showMessageBox(win,{type:'question',title:'Fechar Mega Disparos',message:'Continuar na bandeja ou encerrar o aplicativo?',detail:'Campanhas e notificações dependem deste aplicativo em execução. O computador precisa estar ligado, conectado e sem suspensão.',buttons:['Minimizar para a bandeja','Encerrar aplicativo','Cancelar'],cancelId:2,defaultId:0});
+    const result=await dialog.showMessageBox(win,{type:'question',title:'Fechar '+APP_NAME,message:'Continuar na bandeja ou encerrar o aplicativo?',detail:'Campanhas e notificações dependem deste aplicativo em execução. O computador precisa estar ligado, conectado e sem suspensão.',buttons:['Minimizar para a bandeja','Encerrar aplicativo','Cancelar'],cancelId:2,defaultId:0});
     if(result.response===0)win.hide();else if(result.response===1)app.quit();
   });
   tray=new Tray(nativeImage.createFromPath(path.join(__dirname,'../assets/tray.png')));
-  tray.setToolTip('Mega Disparos • campanhas locais');
+  tray.setToolTip(APP_NAME+' • campanhas locais');
   tray.setContextMenu(Menu.buildFromTemplate([
-    {label:'Abrir Mega Disparos',click:showWindow},
+    {label:'Abrir '+APP_NAME,click:showWindow},
     {label:'PARAR TODOS OS ENVIOS',click:()=>{void client.call('stopAll').then(result=>{if(result?.error)throw new Error(result.error);}).catch(()=>{showWindow();void dialog.showMessageBox(win,{type:'warning',message:'Entre com um usuário autorizado para interromper as campanhas.'});});}},
-    {type:'separator'},{label:'Encerrar',click:()=>app.quit()}
+    {type:'separator'},{label:'Sobre '+APP_NAME,click:()=>{void dialog.showMessageBox(win,{type:'info',title:'Sobre '+APP_NAME,message:APP_NAME+' '+app.getVersion(),detail:'Aplicativo local para Windows. Campanhas e buscas autorizadas pelo WhatsApp.\nIntegração Baileys não oficial. Os dados da instalação anterior foram preservados.',buttons:['OK']});}},{label:'Encerrar',click:()=>app.quit()}
   ]));
   tray.on('double-click',showWindow);Menu.setApplicationMenu(null);
 }
@@ -137,7 +143,7 @@ if(locked){
       if(quitting||quitStarted)return;
       const message='O processamento de campanhas foi interrompido. Reabra o aplicativo e revise os resultados incertos.';
       publish({...lastSnapshot,backendError:message,storageError:message,connection:{state:'disconnected',detail:message}});
-      void nativeAlert({id:'backend-failure',event:'critical',title:'Mega Disparos: processamento interrompido',body:message,at:Date.now(),soundPreferences:settings.sound,nativeEnabled:settings.notifications?.nativeEnabled});
+      void nativeAlert({id:'backend-failure',event:'critical',title:APP_NAME+': processamento interrompido',body:message,at:Date.now(),soundPreferences:settings.sound,nativeEnabled:settings.notifications?.nativeEnabled});
     });
     settings=await client.ready;
     ipcMain.handle('mega:call',async(event,action,payload={})=>{
@@ -159,7 +165,7 @@ if(locked){
     let online=net.isOnline();void client.systemCall('networkState',{online,at:Date.now()}).catch(()=>{});
     networkTimer=setInterval(()=>{const value=net.isOnline();if(value!==online){online=value;void client.systemCall('networkState',{online,at:Date.now()}).catch(()=>{});}},15000);networkTimer.unref();
     if(process.argv.includes('--autostart'))win.hide();
-  }).catch(error=>{dialog.showErrorBox('Mega Disparos','Não foi possível abrir o aplicativo: '+error.message);quitting=true;app.quit();});
+  }).catch(error=>{dialog.showErrorBox(APP_NAME,'Não foi possível abrir o aplicativo: '+error.message);quitting=true;app.quit();});
   app.on('before-quit',event=>{
     if(quitting)return;event.preventDefault();if(quitStarted)return;
     quitStarted=true;clearInterval(networkTimer);sounds?.shutdown();

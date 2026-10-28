@@ -194,11 +194,16 @@ class WhatsAppAdapter extends EventEmitter {
     this.knownSearchGroups = new Set();
     this.captureHistoryChain = Promise.resolve();
     this.captureHistoryQueued = 0;
+    this.automaticMessages = new Set();
+    this.recipientCache = new Map();
+    this.recipientResolutions = new Map();
+    this.deliveryProofs = new Map();
   }
 
   _status(state, detail, extras = {}) {
     const failure = ['disconnected', 'restricted'].includes(state);
-    this.status = { state, mode: 'whatsapp', detail, ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
+    const own = this._ownAccount();
+    this.status = { state, mode: 'whatsapp', simulation: false, detail, ownNumber: own.phone || '', ownAccountId: own.id || '', ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
     this.emit('status', this.status);
   }
 
@@ -228,6 +233,8 @@ class WhatsAppAdapter extends EventEmitter {
     await this._ensureProtection();
     this._status('connecting', 'Preparando a conexão não oficial com o WhatsApp…');
     const generation = ++this.generation;
+    this.recipientCache.clear();
+    this.recipientResolutions.clear();
     this.connectStartedAt = Date.now();
     try {
       if (this.socket) this.socket.end(new Error('Reconexão solicitada.'));
@@ -251,7 +258,7 @@ class WhatsAppAdapter extends EventEmitter {
         enableRecentMessageCache: false,
         enableAutoSessionRecreation: false,
         maxMsgRetryCount: 0,
-        browser: this.library.Browsers?.windows?.('Mega Disparos') || ['Mega Disparos', 'Chrome', '1.0.0'],
+        browser: this.library.Browsers?.windows?.('Kenned Code Disparos') || ['Kenned Code Disparos', 'Chrome', '1.0.0'],
         connectTimeoutMs: 30000,
         defaultQueryTimeoutMs: 30000,
         keepAliveIntervalMs: 30000
@@ -283,7 +290,10 @@ class WhatsAppAdapter extends EventEmitter {
         if (generation !== this.generation) return;
         for (const event of updates || []) {
           this._captureUpdate(event);
-          if (Number(event.update?.status) >= 2 && (event.key?.fromMe || this.pendingAcks.has(event.key?.id))) this._ack(event.key.id);
+          if (Number(event.update?.status) >= 2 && (event.key?.fromMe || this.pendingAcks.has(event.key?.id))) {
+            const status = Number(event.update.status);
+            this._ack(event.key.id, { confirmationScope: status >= 4 ? 'whatsapp-read' : status >= 3 ? 'whatsapp-delivered' : 'whatsapp-server' });
+          }
           if (Number(event.update?.status) === 0 && event.key?.fromMe) {
             if ((event.update?.messageStubParameters || []).some(value => ['403', '429', '463'].includes(String(value)))) this._restrict(socket);
             this._uncertain(event.key.id);
@@ -314,7 +324,11 @@ class WhatsAppAdapter extends EventEmitter {
       socket.ev.on('message-receipt.update', updates => {
         if (generation !== this.generation) return;
         for (const event of updates || []) {
-          if (event.key?.fromMe && (event.receipt?.receiptTimestamp || event.receipt?.readTimestamp || event.receipt?.playedTimestamp)) this._ack(event.key.id);
+          if (event.key?.fromMe && (event.receipt?.receiptTimestamp || event.receipt?.readTimestamp || event.receipt?.playedTimestamp)) {
+            const deliveredAt = messageTimestamp(event.receipt.receiptTimestamp);
+            const readAt = messageTimestamp(event.receipt.readTimestamp || event.receipt.playedTimestamp);
+            this._ack(event.key.id, { confirmationScope: readAt ? 'whatsapp-read' : 'whatsapp-delivered', ...(deliveredAt ? { deliveredAt } : {}), ...(readAt ? { readAt } : {}) });
+          }
         }
       });
       // rc14 emits group delivery receipts but no high-level successful server ACK.
@@ -441,6 +455,7 @@ class WhatsAppAdapter extends EventEmitter {
       name: group.subject || group.id,
       authorized: false,
       simulation: false,
+      mode: 'whatsapp',
       ...(typeof group.linkedParent === 'string' ? { linkedParent: group.linkedParent } : {}),
       ...(typeof group.isCommunity === 'boolean' ? { isCommunity: group.isCommunity } : {}),
       ...(typeof group.isCommunityAnnounce === 'boolean' ? { isCommunityAnnounce: group.isCommunityAnnounce } : {})
@@ -482,6 +497,82 @@ class WhatsAppAdapter extends EventEmitter {
     }
   }
 
+  _ownAccount() {
+    // For an outbound message remoteJid is its destination, never its author.
+    // Only authenticated socket metadata and authenticated PN/LID mappings identify self.
+    const user = this.socket?.user;
+    const id = accountJid(user?.id);
+    if (!id) return { id: '', phone: '', ids: [] };
+    const lid = accountJid(user?.lid);
+    const contact = this.contacts.get(id) || this.contacts.get(lid) || {};
+    const numbers = [phoneFromJid(id), phoneFromJid(user?.phoneNumber), contact.phoneNumber].filter(Boolean);
+    const phone = new Set(numbers).size === 1 ? numbers[0] : '';
+    return { id, phone: phone || '', ids: [id, lid].filter(Boolean) };
+  }
+
+  getOwnAccount() {
+    const own = this._ownAccount();
+    return { id: own.id, phone: own.phone, mode: 'whatsapp', simulation: false };
+  }
+
+  _isAutomaticMessage(messageId) {
+    if (!messageId) return false;
+    if (this.automaticMessages.has(messageId) || this.pendingAcks.has(messageId) || this.submittedOutcomes.has(messageId)) return true;
+    try {
+      if (this.store?.isOutboundMessageId) return this.store.isOutboundMessageId(messageId) === true;
+      // Compatibility with older stores while their migration is being opened.
+      if (this.store?.listJobs?.({ messageId, limit: 1 })?.length) return true;
+      const deliveries = this.store?.listSearchDeliveries?.({ messageId, limit: 1 });
+      return Array.isArray(deliveries) ? deliveries.length > 0 : (deliveries?.items?.length || 0) > 0;
+    } catch {
+      // Do not turn an uncertain automation echo into an administrator command.
+      return true;
+    }
+  }
+
+  _markAutomatic(messageId, kind = 'whatsapp') {
+    let reservation;
+    try { reservation = this.store?.registerOutboundMessageId?.(messageId, { kind, at: Date.now(), storageMode: 'whatsapp' }); }
+    catch { throw definitiveError('Não foi possível registrar o controle contra duplicidade. Nenhuma mensagem foi enviada.', false, 'WA_AUTOMATION_PERSISTENCE_FAILED'); }
+    this.automaticMessages.add(messageId);
+    while (this.automaticMessages.size > 10000) this.automaticMessages.delete(this.automaticMessages.values().next().value);
+    return reservation?.changes !== 0;
+  }
+
+  isTrustedSelfContext(context) {
+    const own = this._ownAccount();
+    return context?.fromMe === true && context.trustedSelf === true && Boolean(own.phone) && context.senderNumber === own.phone && context.accountId === own.id;
+  }
+
+  _identityContext(key, isGroup) {
+    const own = this._ownAccount();
+    const fromMe = key.fromMe === true;
+    const senderId = fromMe ? own.id : accountJid(isGroup ? key.participant : key.remoteJid);
+    const senderAlt = fromMe ? own.ids.find(id => id !== senderId) || '' : accountJid(isGroup ? key.participantAlt : key.remoteJidAlt);
+    const contact = this.contacts.get(senderId) || this.contacts.get(senderAlt) || {};
+    const direct = phoneFromJid(senderId);
+    const alternate = phoneFromJid(senderAlt);
+    const mapped = contact.phoneNumber || null;
+    const numbers = [direct, alternate, mapped, ...(fromMe ? [own.phone] : [])].filter(Boolean);
+    const consistent = new Set(numbers).size <= 1;
+    const senderNumber = consistent ? (fromMe ? own.phone : direct || (senderId.endsWith('@lid') ? alternate || mapped : null)) || '' : '';
+    const automaticMessage = fromMe && this._isAutomaticMessage(String(key.id || ''));
+    const remoteId = accountJid(key.remoteJid);
+    const remoteAlt = accountJid(key.remoteJidAlt);
+    const remotePhones = [phoneFromJid(remoteId), phoneFromJid(remoteAlt)].filter(Boolean);
+    const selfChat = !isGroup && Boolean(own.phone) && remotePhones.every(number => number === own.phone) &&
+      (own.ids.includes(remoteId) || own.ids.includes(remoteAlt) || remotePhones.includes(own.phone));
+    return {
+      senderId, senderIds: [senderId, senderAlt].filter(Boolean), identityVerified: Boolean(senderId),
+      senderNumber, verified: Boolean(senderNumber) && consistent, contact,
+      trustedSelf: fromMe && Boolean(senderNumber) && senderNumber === own.phone,
+      selfChat,
+      automaticMessage, machineGenerated: automaticMessage,
+      accountNumber: own.phone, ownAccountNumber: own.phone,
+      accountId: own.id, ownAccountId: own.id, mode: 'whatsapp', simulation: false
+    };
+  }
+
   _captureContext(message, { history = false, edits = false } = {}) {
     const key = message?.key || {};
     const chatId = key.remoteJid;
@@ -491,19 +582,10 @@ class WhatsAppAdapter extends EventEmitter {
     const timestamp = messageTimestamp(message.messageTimestamp);
     if (!edits && (!timestamp || timestamp > Date.now() + 30000)) return null;
     const isGroup = chatId.endsWith('@g.us');
-    const senderId = accountJid(isGroup ? key.participant : chatId);
-    const senderAlt = accountJid(isGroup ? key.participantAlt : key.remoteJidAlt);
-    const contact = this.contacts.get(senderId) || this.contacts.get(senderAlt) || {};
-    const direct = phoneFromJid(senderId);
-    const alternate = phoneFromJid(senderAlt);
-    const mapped = contact.phoneNumber || null;
-    const numbers = [direct, alternate, mapped].filter(Boolean);
-    const consistent = new Set(numbers).size <= 1;
-    const senderNumber = consistent ? direct || (senderId.endsWith('@lid') ? alternate || mapped : null) || '' : '';
+    const { contact, ...identity } = this._identityContext(key, isGroup);
     const normalized = {
       messageId: String(key.id), chatId, isGroup, fromMe: key.fromMe === true,
-      senderId, senderIds: [senderId, senderAlt].filter(Boolean), identityVerified: Boolean(senderId),
-      senderNumber, verified: Boolean(senderNumber) && consistent,
+      ...identity,
       pushName: typeof message.pushName === 'string' ? message.pushName : contact.notify || '',
       displayName: typeof message.pushName === 'string' ? message.pushName : contact.notify || '',
       savedName: contact.name || '', ...content, capturedAt: Date.now(),
@@ -602,18 +684,23 @@ class WhatsAppAdapter extends EventEmitter {
     });
   }
 
-  _ack(messageId) {
-    if (!messageId) return;
+  _ack(messageId, proof = {}) {
+    if (!messageId || !this._isAutomaticMessage(messageId)) return;
     this.receipts.set(messageId, Date.now());
     this._rememberOutcome(messageId, 'confirmed');
+    if (proof.confirmationScope === 'whatsapp-delivered' || proof.confirmationScope === 'whatsapp-read') {
+      const previous = this.deliveryProofs.get(messageId) || {};
+      this.deliveryProofs.set(messageId, { ...previous, ...proof, ...(previous.confirmationScope === 'whatsapp-read' ? { confirmationScope: 'whatsapp-read' } : {}) });
+      while (this.deliveryProofs.size > 1000) this.deliveryProofs.delete(this.deliveryProofs.keys().next().value);
+    }
     while (this.receipts.size > 1000) this.receipts.delete(this.receipts.keys().next().value);
     const pending = this.pendingAcks.get(messageId);
     if (pending) {
       clearTimeout(pending.timer);
       this.pendingAcks.delete(messageId);
-      pending.resolve({ status: 'confirmed', messageId });
+      pending.resolve({ status: 'confirmed', messageId, ...(this.deliveryProofs.get(messageId) || {}) });
     }
-    this.emit('receipt', { messageId, status: 'confirmed' });
+    this.emit('receipt', { messageId, status: 'confirmed', mode: 'whatsapp', simulation: false, confirmationScope: 'whatsapp-server', ...proof });
   }
 
   _rememberOutcome(messageId, status, targetId) {
@@ -686,17 +773,76 @@ class WhatsAppAdapter extends EventEmitter {
 
   async sendPrivate(number, text, { clientMessageId } = {}) {
     const digits = String(number || '');
-    if (!/^\d{10,15}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.');
+    if (!/^[1-9]\d{9,14}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.');
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Informe um alerta de 1 a 16.000 caracteres.');
-    return this._submitVerified(`${digits}@s.whatsapp.net`, { text }, clientMessageId);
+    const recipient = await this.resolveRecipient(digits);
+    return this._submitVerified(recipient.jid, { text }, clientMessageId);
+  }
+
+  async resolveRecipient(number) {
+    const digits = String(number || '');
+    if (!/^[1-9]\d{9,14}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.', false, 'WA_RECIPIENT_INVALID');
+    if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado antes de resolver o destinatário.', true, 'WA_RECIPIENT_OFFLINE');
+    const socket = this.socket;
+    const generation = this.generation;
+    const own = this._ownAccount();
+    if (own.phone === digits) {
+      // Baileys sends to the authenticated account's own PN JID and synchronizes
+      // its companion devices. onWhatsApp is unnecessary for the already verified self.
+      const ownJid = own.ids.find(id => phoneFromJid(id) === digits) || `${digits}@s.whatsapp.net`;
+      return { jid: ownJid, phone: digits, requestedPhone: digits, isSelf: true, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-account' };
+    }
+    const cached = this.recipientCache.get(digits);
+    if (cached && cached.generation === generation && cached.expiresAt > Date.now()) return { ...cached.result };
+    if (this.recipientResolutions.has(digits)) return this.recipientResolutions.get(digits);
+    if (this.recipientResolutions.size >= 64) throw definitiveError('Há destinatários demais sendo resolvidos. Aguarde a fila atual.', true, 'WA_RECIPIENT_BUSY');
+    if (typeof socket.onWhatsApp !== 'function') throw definitiveError('Esta integração não disponibiliza a resolução de números. Atualize a instalação antes de enviar.', false, 'WA_RECIPIENT_UNSUPPORTED');
+    const operation = (async () => {
+      let timer;
+      try {
+        const results = await Promise.race([
+          Promise.resolve().then(() => socket.onWhatsApp(digits)),
+          new Promise((_resolve, reject) => { timer = setTimeout(() => reject(definitiveError('O WhatsApp não respondeu à validação do destinatário. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_TIMEOUT')), Math.min(this.controlTimeoutMs, 30000)); })
+        ]);
+        if (generation !== this.generation || this.socket !== socket || this.status.state !== 'connected') throw definitiveError('A conexão mudou durante a resolução do destinatário. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_CONNECTION_CHANGED');
+        if (!Array.isArray(results)) throw definitiveError('Não foi possível confirmar o destinatário no WhatsApp. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_LOOKUP_INCOMPLETE');
+        const available = results.filter(result => result?.exists === true);
+        if (!available.length) throw definitiveError('O número configurado não foi encontrado no WhatsApp. Confira o código do país, DDD e telefone.', false, 'WA_RECIPIENT_NOT_FOUND');
+        if (available.length !== 1) throw definitiveError('A integração retornou uma identificação ambígua para o destinatário. Nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_AMBIGUOUS');
+        const jid = accountJid(this.library?.jidNormalizedUser?.(available[0].jid) || available[0].jid);
+        if (!jid) throw definitiveError('O WhatsApp retornou um identificador de destinatário inválido. Nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_INVALID_JID');
+        const resolvedPhone = phoneFromJid(jid);
+        if (resolvedPhone && resolvedPhone !== digits) throw definitiveError('O WhatsApp retornou um telefone diferente do configurado. Revise o destinatário; nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_MISMATCH');
+        const result = { jid, phone: digits, requestedPhone: digits, isSelf: false, mode: 'whatsapp', simulation: false, resolutionSource: 'whatsapp-usync' };
+        this._rememberContacts([{ id: jid, phoneNumber: `${digits}@s.whatsapp.net` }]);
+        this.recipientCache.set(digits, { result, generation, expiresAt: Date.now() + 600000 });
+        while (this.recipientCache.size > 1000) this.recipientCache.delete(this.recipientCache.keys().next().value);
+        return { ...result };
+      } catch (error) {
+        if (/^WA_RECIPIENT_/.test(error?.code || '')) throw error;
+        const statusCode = Number(error?.output?.statusCode || error?.statusCode);
+        const temporary = ![400, 401, 403, 404, 429, 463].includes(statusCode);
+        if ([403, 429, 463].includes(statusCode)) this._restrict(socket);
+        throw definitiveError(temporary ? 'Falha temporária ao validar o destinatário no WhatsApp. Nenhuma mensagem foi enviada.' : 'O WhatsApp recusou a validação do destinatário. Verifique a conexão e eventuais restrições.', temporary, temporary ? 'WA_RECIPIENT_LOOKUP_TEMPORARY' : 'WA_RECIPIENT_LOOKUP_REJECTED');
+      } finally { clearTimeout(timer); }
+    })();
+    this.recipientResolutions.set(digits, operation);
+    try { return await operation; }
+    finally { if (this.recipientResolutions.get(digits) === operation) this.recipientResolutions.delete(digits); }
   }
 
   async sendSearchText(target, text, { clientMessageId } = {}) {
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Resultado da busca precisa ter de 1 a 16.000 caracteres.');
     if (typeof target !== 'string') throw definitiveError('Destinatário da busca inválido.');
     let targetId;
-    if (/^\d{10,15}$/.test(target)) targetId = `${target}@s.whatsapp.net`;
-    else if (accountJid(target) && (target.endsWith('@lid') || phoneFromJid(target))) targetId = accountJid(target);
+    if (/^[1-9]\d{9,14}$/.test(target)) targetId = (await this.resolveRecipient(target)).jid;
+    else if (phoneFromJid(target)) targetId = (await this.resolveRecipient(phoneFromJid(target))).jid;
+    else if (accountJid(target) && target.endsWith('@lid')) {
+      const normalized = accountJid(target);
+      const mapped = this.contacts.get(normalized)?.phoneNumber || phoneFromJid(await this.socket?.signalRepository?.lidMapping?.getPNForLID?.(normalized));
+      if (!mapped) throw definitiveError('O número real desse destinatário não foi disponibilizado pelo WhatsApp. Cadastre o telefone com código do país e DDD.', false, 'WA_RECIPIENT_NUMBER_UNAVAILABLE');
+      targetId = (await this.resolveRecipient(mapped)).jid;
+    }
     else if (target.endsWith('@g.us')) {
       const group = this.store?.getGroup(target);
       if ((!group || group.simulation) && !this.knownSearchGroups.has(target)) throw definitiveError('O destino da busca precisa ser um grupo real conhecido da conta.');
@@ -720,10 +866,15 @@ class WhatsAppAdapter extends EventEmitter {
     const outcome = this.submittedOutcomes.get(messageId);
     if (outcome) {
       if (outcome.targetId && outcome.targetId !== targetId) throw definitiveError('O identificador do envio já pertence a outro destino.');
-      return { status: outcome.status, messageId };
+      return { status: outcome.status, messageId, ...(outcome.status === 'confirmed' ? this.deliveryProofs.get(messageId) || {} : {}) };
     }
     if (this.receipts.has(messageId)) return { status: 'confirmed', messageId };
     const socket = this.socket;
+    if (!this._markAutomatic(messageId)) {
+      // Only the transport reservation proves this ID already reached submission.
+      // Queued jobs/alerts/search deliveries are automatic, but have not been sent.
+      return { status: 'uncertain', messageId };
+    }
     // Register before submitting so even an immediate server ACK cannot be lost.
     const resultPromise = new Promise(resolve => {
       const timer = setTimeout(() => {
@@ -761,7 +912,7 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   _incoming(event, generation) {
-    if (generation !== this.generation || event?.type !== 'notify') return;
+    if (generation !== this.generation || event?.type !== 'notify' || (typeof event.requestId === 'string' && event.requestId.length > 0)) return;
     const now = Date.now();
     for (const message of event.messages || []) {
       const key = message.key || {};
@@ -771,13 +922,7 @@ class WhatsAppAdapter extends EventEmitter {
       while (this.seenIncoming.size > 2000) this.seenIncoming.delete(this.seenIncoming.keys().next().value);
       const chatId = key.remoteJid;
       const isGroup = typeof chatId === 'string' && chatId.endsWith('@g.us');
-      const senderJid = isGroup ? key.participant : chatId;
-      const senderAlt = isGroup ? key.participantAlt : key.remoteJidAlt;
-      const directPhone = phoneFromJid(senderJid);
-      const alternatePhone = phoneFromJid(senderAlt);
-      const isLid = typeof senderJid === 'string' && senderJid.endsWith('@lid');
-      const senderNumber = directPhone || (isLid ? alternatePhone : null);
-      const verified = Boolean(senderNumber) && (!directPhone || !alternatePhone || directPhone === alternatePhone);
+      const { contact, ...identity } = this._identityContext(key, isGroup);
       const body = unwrapMessage(message.message);
       let type;
       let text = '';
@@ -789,8 +934,7 @@ class WhatsAppAdapter extends EventEmitter {
       else continue;
       this.emit('incoming', {
         messageId: key.id,
-        senderNumber: senderNumber || '',
-        verified,
+        ...identity,
         isGroup,
         forwarded: hasForwardedMetadata(message.message),
         fromMe: key.fromMe === true,
@@ -807,10 +951,12 @@ class WhatsAppAdapter extends EventEmitter {
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado.', true);
     if (typeof chatId !== 'string' || (!phoneFromJid(chatId) && !/^\d+@lid$/.test(chatId))) throw definitiveError('Conversa de controle inválida.');
     const socket = this.socket;
+    const messageId = this.library.generateMessageIDV2?.(socket.user?.id) || randomBytes(16).toString('hex').toUpperCase();
+    this._markAutomatic(messageId, 'control-reply');
     let timer;
     try {
       const result = await Promise.race([
-        socket.sendMessage(chatId, { text: String(text) }),
+        socket.sendMessage(chatId, { text: String(text) }, { messageId }),
         new Promise((_resolve, reject) => {
           timer = setTimeout(() => {
             if (this.socket === socket) {
@@ -824,7 +970,8 @@ class WhatsAppAdapter extends EventEmitter {
           }, this.controlTimeoutMs);
         })
       ]);
-      return { messageId: result?.key?.id };
+      if (result?.key?.id && result.key.id !== messageId) this._markAutomatic(result.key.id, 'control-reply');
+      return { messageId: result?.key?.id || messageId };
     } finally { clearTimeout(timer); }
   }
 

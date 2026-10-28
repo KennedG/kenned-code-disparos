@@ -91,7 +91,7 @@ const { _electron, expect } = require('@playwright/test');
     assert.equal(await page.locator('#buscas-results').count(), 0);
     assert((await rpc('searchesState')).error, 'Backend bloqueia BUSCAS sem login');
     assert.deepEqual(errors, []);
-    console.log('BUSCAS GUI real Electron: módulo desativado, 6 abas, grupos independentes, prefixo atualizado, edição preservada, captura simulada, ranking sem parcelas/versões diferentes, mensagem original, entrega privada ao dono confirmada, comando vazio, ofertas para revisão, histórico, duas limpezas APAGAR, campanhas/grupos preservados e logout protegido passaram.');
+    console.log('BUSCAS GUI real Electron: módulo desativado, 7 abas, grupos independentes, prefixo atualizado, edição preservada, captura simulada, ranking sem parcelas/versões diferentes, mensagem original, entrega privada ao dono confirmada, comando vazio, ofertas para revisão, histórico, duas limpezas APAGAR, campanhas/grupos preservados e logout protegido passaram.');
   } finally {
     if (app) await app.close();
     fs.rmSync(dir, { recursive: true, force: true });

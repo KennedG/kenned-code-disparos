@@ -252,6 +252,7 @@ test('real storage: a settings write fault immediately before transport prevents
   const store = await createStore(dir, { beforeWrite: () => { if (injectFault) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); } });
   t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const example = fixture({ count: 1 });
+  store.setSetting('integrationMode','simulated');
   store.upsertGroups([...example.store.groups.values()]);
   store.saveCampaign(example.store.getCampaign('c1'));
   let submissions = 0;
