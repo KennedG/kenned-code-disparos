@@ -28,10 +28,6 @@ const PERMISSIONS = Object.freeze([
   ['search.filters', 'Alterar filtros e apelidos de BUSCAS', 'BUSCAS'],
   ['search.manage', 'Gerenciar monitoramento e autorizações de BUSCAS', 'BUSCAS'],
   ['automation.control', 'Parar e retomar todas as automações', 'Controle do sistema'],
-  ['stock.view','Visualizar estoque e disponibilidade','Estoque'], ['stock.manage','Cadastrar, reservar e alterar estoque','Estoque'],
-  ['supplier.view','Consultar fornecedores','Fornecedores'], ['supplier.manage','Gerenciar fornecedores e compras','Fornecedores'],
-  ['commerce.view','Consultar listas, oportunidades e demandas','Comercial'], ['commerce.manage','Gerenciar oportunidades, demandas e públicos','Comercial'], ['commerce.list','Montar listas e anúncios comerciais','Comercial'],
-  ['finance.view','Consultar custos, margens, vendas e caixa','Financeiro'], ['finance.manage','Registrar vendas, recebimentos e movimentações','Financeiro'], ['finance.reports','Consultar e receber relatórios financeiros','Financeiro'], ['finance.export','Exportar dados financeiros e recuperação','Financeiro'],
   ...['view','create','edit','delete','control'].map(action=>[`reminder.${action}`,({view:'Visualizar lembretes',create:'Criar lembretes',edit:'Editar lembretes',delete:'Excluir lembretes',control:'Ativar, pausar e testar lembretes'})[action],'Lembretes'])
 ].map(([id, label, section]) => Object.freeze({ id, label, section })));
 const PERMISSION_IDS = new Set(PERMISSIONS.map(p => p.id));
@@ -39,7 +35,7 @@ const ALL = [...PERMISSION_IDS];
 const DEFAULT_ROLES = Object.freeze([
   { id: 'role-owner', name: 'Dono', permissions: ALL, campaignScope: 'all', isOwner: true, builtIn: true },
   { id: 'role-admin', name: 'Administrador', permissions: ALL.filter(p => p !== 'users.assignOwner' && !p.startsWith('search.')), campaignScope: 'all', isOwner: false, builtIn: true },
-  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !p.startsWith('search.') && !p.startsWith('finance.') && !p.startsWith('supplier.') && !['stock.manage','commerce.manage','commerce.list','history.clear', 'settings.edit', 'connection.manage', 'audit.view', 'automation.control'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
+  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !p.startsWith('search.') && !['history.clear', 'settings.edit', 'connection.manage', 'audit.view', 'automation.control'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
   { id: 'role-seller', name: 'Vendedor', permissions: ['campaign.view', 'campaign.create', 'campaign.edit', 'campaign.start', 'campaign.pause', 'campaign.stop', 'contacts.view', 'contacts.create', 'contacts.edit', 'groups.view', 'media.view', 'media.create', 'reports.view', 'history.view', 'notifications.view'], campaignScope: 'own', isOwner: false, builtIn: true }
 ]);
 
@@ -56,9 +52,8 @@ function name(value) {
 }
 function phone(value) {
   if (value === undefined || value === null || value === '') return '';
-  if (typeof value !== 'string') throw error('Informe o telefone com código do país e DDD.', 'AUTH_INVALID');
-  const cleaned = value.replace(/[\s()+-]/g, '');
-  if (!/^[1-9]\d{9,14}$/.test(cleaned)) throw error('Informe de 10 a 15 dígitos, com código do país e DDD.', 'AUTH_INVALID');
+  const cleaned = require('./phone.cjs').normalizePhone(value);
+  if (!cleaned) throw error('Informe de 10 a 15 dígitos, com código do país e DDD.', 'AUTH_INVALID');
   return cleaned;
 }
 function password(value) {
@@ -108,11 +103,6 @@ class AuthService {
           if (role?.builtIn===true) this.store.saveEntity('roles',{...role,permissions:[...new Set([...(role.permissions||[]),...ALL.filter(p=>p.startsWith('reminder.')||id==='role-admin'&&p==='automation.control')])]});
         }
         this.store.setSetting('authPermissionSchema230',true);
-      }
-      if (!this.store.getSetting('authPermissionSchema300')) {
-        const admin=this.store.getEntity('roles','role-admin');
-        if(admin?.builtIn===true)this.store.saveEntity('roles',{...admin,permissions:[...new Set([...(admin.permissions||[]),...ALL.filter(p=>/^(stock|supplier|commerce|finance)\./.test(p))])]});
-        this.store.setSetting('authPermissionSchema300',true);
       }
     });
   }
@@ -185,8 +175,20 @@ class AuthService {
   findAuthorizedPhone(value) {
     let number; try { number = phone(value); } catch { return null; }
     if (!number) return null;
-    const user = this._users().find(u => u.active !== false && !u.requirePasswordChange && this._role(u) && [u.phone, ...(u.authorizedPhones || [])].includes(number));
-    return this._public(user);
+    const users = this._users().filter(u => u.active !== false && !u.requirePasswordChange && this._role(u) && [u.phone, ...(u.authorizedPhones || [])].some(value=>{try{return phone(value)===number;}catch{return false;}}));
+    return users.length===1?this._public(users[0]):null;
+  }
+  resolveWhatsAppActor(context) {
+    const denied=(code,reason,number='')=>({user:null,number,code,reason});
+    if(!context||context.verified!==true)return denied('WA_IDENTITY_UNVERIFIED','A integração não confirmou o telefone do remetente.');
+    let number;try{number=phone(context.senderNumber);}catch{return denied('WA_PHONE_INVALID','O remetente não possui telefone válido com código do país e DDD.');}
+    if(!number)return denied('WA_PHONE_UNAVAILABLE','O WhatsApp não informou um telefone confiável para este remetente.');
+    const identities=[context.senderId,...(Array.isArray(context.senderIds)?context.senderIds:[])].filter(value=>typeof value==='string');
+    for(const jid of identities){const match=jid.match(/^([1-9]\d{9,14})(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/);if(match&&match[1]!==number)return denied('WA_IDENTITY_CONFLICT','O telefone confirmado diverge do identificador do remetente.',number);}
+    const matches=this._users().filter(u=>u.active!==false&&!u.requirePasswordChange&&this._role(u)&&[u.phone,...(u.authorizedPhones||[])].some(value=>{try{return phone(value)===number;}catch{return false;}}));
+    if(matches.length>1)return denied('WA_AUTH_AMBIGUOUS','O número está vinculado a mais de um usuário. Revise o cadastro de autorizações.',number);
+    if(!matches.length)return denied('WA_SENDER_NOT_AUTHORIZED','O número confirmado não pertence a um usuário ativo autorizado.',number);
+    return {user:this._public(matches[0]),number,code:'WA_IDENTITY_AUTHORIZED',reason:'Identidade confirmada e vinculada a um único usuário ativo.'};
   }
   async setupOwner(input) {
     return this._exclusive(async () => {

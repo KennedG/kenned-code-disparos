@@ -201,6 +201,79 @@ class WhatsAppAdapter extends EventEmitter {
     this.deliveryProofs = new Map();
     this.replyProofKey = null;
     this.identityHydrations = new Map();
+    this.pendingDecryption = new Map();
+    this.commandPrefix = '!busca';
+    this.submissionTraceIds = new Map();
+  }
+
+  _receiveTraceId(key = {}, accountId = this._ownAccount().id) {
+    const chatId = accountJid(key.remoteJid) || (typeof key.remoteJid === 'string' && key.remoteJid.endsWith('@g.us') ? key.remoteJid : '');
+    return `wa-receive-${createHash('sha256').update(`${accountId}:${chatId}:${key.id || ''}`).digest('hex').slice(0, 24)}`;
+  }
+
+  _validTraceId(value) {
+    return typeof value === 'string' && /^(?:wa-receive-[a-f0-9]{24}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/i.test(value) ? value : '';
+  }
+
+  _submissionTrace(messageId, supplied) {
+    if (this.submissionTraceIds.has(messageId)) return this.submissionTraceIds.get(messageId);
+    let traceId = '';
+    // Existing operational ledgers survive restart. Read their parent trace
+    // without adding a new backup-visible credential or operational setting.
+    try {
+      const alerts = this.store?.findAlertsByMessageId?.(messageId) || [];
+      traceId = this._validTraceId(alerts.find(row => this._validTraceId(row.traceId))?.traceId);
+      if (!traceId) {
+        const result = this.store?.listSearchDeliveries?.({ messageId, limit: 1 });
+        const rows = Array.isArray(result) ? result : result?.items || [];
+        traceId = this._validTraceId(rows[0]?.traceId || rows[0]?.runId);
+      }
+      if (!traceId) {
+        const commands = this.store?.getSetting?.('recentCommandIds', []);
+        if (Array.isArray(commands)) traceId = this._validTraceId(commands.slice(-2000).find(row => Array.isArray(row.replies) && row.replies.some(reply => reply.messageId === messageId))?.traceId);
+      }
+    } catch { /* Trace lookup is optional metadata; it never authorizes an operation. */ }
+    traceId ||= this._validTraceId(supplied);
+    if (traceId && messageId) {
+      this.submissionTraceIds.set(messageId, traceId);
+      while (this.submissionTraceIds.size > 5000) this.submissionTraceIds.delete(this.submissionTraceIds.keys().next().value);
+    }
+    return traceId;
+  }
+
+  _commandCandidate(message) {
+    const text = messageContent(message?.message)?.text;
+    if (typeof text !== 'string') return false;
+    const normalized = text.trimStart().toLowerCase();
+    return [this.commandPrefix, '!mega'].some(prefix => normalized.startsWith(prefix.toLowerCase()) &&
+      (normalized.length === prefix.length || /\s/.test(normalized[prefix.length])));
+  }
+
+  _transportDiagnostic(message, stage, code, description, detail = {}, operationTraceId) {
+    const key = message?.key || {};
+    const messageId = typeof key.id === 'string' ? key.id.slice(0, 128) : '';
+    const chatId = accountJid(key.remoteJid) || (typeof key.remoteJid === 'string' && key.remoteJid.endsWith('@g.us') ? key.remoteJid : '');
+    const outgoing = ['transport.submitting', 'transport.accepted', 'transport.delivered', 'transport.failed'].includes(stage);
+    const unknownPrivate = !chatId.endsWith('@g.us') && message?.messageStubType === (this.library?.WAMessageStubType?.CIPHERTEXT ?? 2);
+    const commandCandidate = this._commandCandidate(message);
+    if (!outgoing && !commandCandidate && !unknownPrivate) return;
+    const traceId = outgoing ? this._submissionTrace(messageId, operationTraceId) || this._receiveTraceId(key) : this._receiveTraceId(key);
+    // Deliberately exclude text, raw protocol objects, credentials and signed reply proofs.
+    const level = stage === 'transport.failed' ? 'error' : stage === 'transport.ignored' || stage === 'transport.waiting' ? 'warning' : 'info';
+    this.emit('transportDiagnostic', { traceId, messageId, at: Date.now(), level, stage, code, description,
+      detail: { isGroup: chatId.endsWith('@g.us'), fromMe: key.fromMe === true, commandCandidate, ...detail } });
+  }
+
+  _decryptionKey(message, generation = this.generation) {
+    const key = message?.key || {};
+    return `${generation}:${accountJid(key.remoteJid) || key.remoteJid || ''}:${key.id || ''}`;
+  }
+
+  _isPendingRecovery(message, generation = this.generation) {
+    const pending = this.pendingDecryption.get(this._decryptionKey(message, generation));
+    const timestamp = messageTimestamp(message?.messageTimestamp);
+    return Boolean(pending && pending.expiresAt >= Date.now() && timestamp === pending.timestamp &&
+      (message?.key?.fromMe === true) === pending.fromMe);
   }
 
   _status(state, detail, extras = {}) {
@@ -238,6 +311,7 @@ class WhatsAppAdapter extends EventEmitter {
     const generation = ++this.generation;
     this.recipientCache.clear();
     this.recipientResolutions.clear();
+    this.pendingDecryption.clear();
     this.connectStartedAt = Date.now();
     try {
       if (this.socket) this.socket.end(new Error('Reconexão solicitada.'));
@@ -354,6 +428,8 @@ class WhatsAppAdapter extends EventEmitter {
       const protocolAck = node => {
         if (generation !== this.generation || !node?.attrs?.id) return;
         if (node.attrs.error) {
+          const protocolStatus = /^\d{1,4}$/.test(String(node.attrs.error)) ? String(node.attrs.error) : 'unknown';
+          this._transportDiagnostic({ key: { id: node.attrs.id, remoteJid: this.pendingAcks.get(node.attrs.id)?.targetId, fromMe: true } }, 'transport.failed', `WA_PROTOCOL_REJECTED_${protocolStatus.toUpperCase()}`, protocolStatus === '463' ? 'O WhatsApp recusou a mensagem por restrição da conta ou ausência de autorização de privacidade da conversa. O envio não será repetido automaticamente.' : `O WhatsApp retornou uma rejeição de protocolo (${protocolStatus}). Revise o diagnóstico antes de reenviar.`, { protocolStatus });
           if (['403', '429', '463'].includes(String(node.attrs.error))) this._restrict(socket);
           this._uncertain(node.attrs.id);
         } else this._ack(node.attrs.id);
@@ -486,9 +562,10 @@ class WhatsAppAdapter extends EventEmitter {
     return result;
   }
 
-  configureSearchCapture({ enabled = false, importHistory = false, groupIds, commandGroupIds } = {}) {
+  configureSearchCapture({ enabled = false, importHistory = false, groupIds, commandGroupIds, commandPrefix } = {}) {
     const normalize = value => Array.isArray(value) ? new Set(value.filter(id => typeof id === 'string' && id.endsWith('@g.us'))) : null;
     this.searchCapture = { enabled: enabled === true, importHistory: importHistory === true, groupIds: normalize(groupIds), commandGroupIds: normalize(commandGroupIds) };
+    if (typeof commandPrefix === 'string' && commandPrefix.length <= 50 && commandPrefix.trim()) this.commandPrefix = commandPrefix.trim();
     return { enabled: this.searchCapture.enabled, importHistory: this.searchCapture.importHistory, ...this.getSearchCapabilities() };
   }
 
@@ -527,6 +604,7 @@ class WhatsAppAdapter extends EventEmitter {
     const ready = [];
     for (const message of event?.messages || []) {
       const key = message?.key || {};
+      this._transportDiagnostic(message, 'transport.received', 'WA_EVENT_RECEIVED', 'Evento de mensagem recebido pela integração.', { eventType: event.type || 'unknown', recovered: Boolean(event.requestId) });
       const jid = accountJid(key.remoteJid);
       const lookup = this.socket?.signalRepository?.lidMapping?.getPNForLID;
       if (event.type !== 'notify' || key.fromMe || !jid.endsWith('@lid') || phoneFromJid(key.remoteJidAlt) || this.contacts.get(jid)?.phoneNumber || typeof lookup !== 'function') {
@@ -600,11 +678,11 @@ class WhatsAppAdapter extends EventEmitter {
     } catch { throw definitiveError('Não foi possível validar a origem privada do comando. Envie o comando novamente.', false, 'WA_REPLY_CONTEXT_INVALID'); }
     const own = this._ownAccount();
     if (payload.v !== 1 || !accountJid(payload.chatId) || !accountJid(payload.senderId) || !own.ids.includes(payload.accountId) || payload.chatId !== accountJid(context.chatId) || payload.senderId !== accountJid(context.senderId) || payload.senderNumber !== String(context.senderNumber || '') || !Number.isFinite(payload.timestamp) || payload.timestamp > Date.now() + 30000 || payload.timestamp < Date.now() - 7 * 86400000) throw definitiveError('A origem ou a conta deste comando mudou. Envie o comando novamente na conversa autorizada.', false, 'WA_REPLY_CONTEXT_INVALID');
-    return { jid: payload.chatId, phone: payload.senderNumber, requestedPhone: payload.senderNumber, isSelf: payload.fromMe && payload.senderNumber === own.phone, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-private-message' };
+    return { jid: payload.chatId, phone: payload.senderNumber, requestedPhone: payload.senderNumber, isSelf: payload.fromMe && payload.senderNumber === own.phone, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-private-message', traceId: this._receiveTraceId({ id: payload.messageId, remoteJid: payload.chatId }, payload.accountId) };
   }
 
-  async resolveSearchRecipient(number, replyContext) {
-    if (!replyContext) return this.resolveRecipient(number);
+  async resolveSearchRecipient(number, replyContext, options = {}) {
+    if (!replyContext) return this.resolveRecipient(number, options);
     const resolved = await this.resolveReplyRecipient(replyContext);
     if (String(number || '') !== resolved.phone && String(number || '') !== resolved.jid) throw definitiveError('O destinatário difere de quem enviou o comando. Nenhuma mensagem foi enviada.', false, 'WA_REPLY_RECIPIENT_MISMATCH');
     return resolved;
@@ -696,7 +774,7 @@ class WhatsAppAdapter extends EventEmitter {
     if (!edits && (!timestamp || timestamp > Date.now() + 30000)) return null;
     const isGroup = chatId.endsWith('@g.us');
     const { contact, ...identity } = this._identityContext(key, isGroup);
-    const normalized = {
+      const normalized = {
       messageId: String(key.id), chatId, isGroup, fromMe: key.fromMe === true,
       ...identity,
       pushName: typeof message.pushName === 'string' ? message.pushName : contact.notify || '',
@@ -704,6 +782,7 @@ class WhatsAppAdapter extends EventEmitter {
       savedName: contact.name || '', ...content, capturedAt: Date.now(),
       forwarded: hasForwardedMetadata(message.message), history, revisionAt: edits ? timestamp || Date.now() : null
     };
+    normalized.traceId = this._receiveTraceId(key);
     // An edit timestamp belongs to the edit; never replace the original offer time with it.
     if (!edits) normalized.timestamp = timestamp;
     if (!history && !edits) normalized.replyProof = this._replyProof(normalized);
@@ -739,10 +818,11 @@ class WhatsAppAdapter extends EventEmitter {
       if (!this._captureChatAllowed(message.key?.remoteJid)) continue;
       if (this._captureProtocol(message)) continue;
       const timestamp = messageTimestamp(message.messageTimestamp);
-      // requestId identifies a message recovered from the linked phone. It may
-      // have a recent timestamp, but it must never become a live search command.
+      // An unsolicited phone recovery is history. The one exception is the
+      // recovery of a recent live ciphertext already observed by this socket:
+      // rc14 uses requestId when the linked phone supplies its decrypted body.
       const recovered = typeof event.requestId === 'string' && event.requestId.length > 0;
-      const history = recovered || timestamp < Math.max(this.connectStartedAt - 5000, now - 120000);
+      const history = (recovered && !this._isPendingRecovery(message, generation)) || timestamp < Math.max(this.connectStartedAt - 5000, now - 120000);
       const context = this._captureContext(message, { history });
       if (!context) continue;
       const dedupeId = `${context.chatId}:${context.messageId}`;
@@ -800,6 +880,7 @@ class WhatsAppAdapter extends EventEmitter {
 
   _ack(messageId, proof = {}) {
     if (!messageId || !this._isAutomaticMessage(messageId)) return;
+    const targetId = this.pendingAcks.get(messageId)?.targetId || this.submittedOutcomes.get(messageId)?.targetId;
     this.receipts.set(messageId, Date.now());
     this._rememberOutcome(messageId, 'confirmed');
     if (proof.confirmationScope === 'whatsapp-delivered' || proof.confirmationScope === 'whatsapp-read') {
@@ -815,6 +896,7 @@ class WhatsAppAdapter extends EventEmitter {
       pending.resolve({ status: 'confirmed', messageId, ...(this.deliveryProofs.get(messageId) || {}) });
     }
     this.emit('receipt', { messageId, status: 'confirmed', mode: 'whatsapp', simulation: false, confirmationScope: 'whatsapp-server', ...proof });
+    this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, proof.confirmationScope === 'whatsapp-read' || proof.confirmationScope === 'whatsapp-delivered' ? 'transport.delivered' : 'transport.accepted', proof.confirmationScope === 'whatsapp-read' ? 'WA_MESSAGE_READ' : proof.confirmationScope === 'whatsapp-delivered' ? 'WA_MESSAGE_DELIVERED' : 'WA_SERVER_ACCEPTED', proof.confirmationScope === 'whatsapp-read' ? 'Leitura confirmada pelo recibo disponibilizado pelo WhatsApp.' : proof.confirmationScope === 'whatsapp-delivered' ? 'Entrega confirmada pelo recibo disponibilizado pelo WhatsApp.' : 'O servidor do WhatsApp confirmou a aceitação. Isso não comprova recebimento no celular.', { confirmationScope: proof.confirmationScope || 'whatsapp-server' });
   }
 
   _rememberOutcome(messageId, status, targetId) {
@@ -853,74 +935,110 @@ class WhatsAppAdapter extends EventEmitter {
     }
   }
 
-  async send(groupId, item, media, { beforeSubmit } = {}) {
-    if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado. Envios pausados.', true);
-    if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) throw definitiveError('O destino precisa ser um grupo do WhatsApp.');
-    if (!ALLOWED_TYPES.has(item?.type)) throw definitiveError('Tipo de conteúdo não suportado.');
-    const group = this.store?.getGroup(groupId);
-    if (!group || !group.authorized || group.simulation) throw definitiveError('O grupo não tem autorização registrada para envio real.');
-    const content=item.type==='text'?{text:String(item.text||'')}:await this._prepareContent(item,media);
-    if(item.type==='text'&&!content.text.trim())throw definitiveError('O texto da mensagem está vazio.');
-    const live=this._beforeSubmit(beforeSubmit)||item;this._refreshContent(content,live);
-    return this._submitVerified(groupId,content,item.clientMessageId);
+  _textContent(item) {
+    if (typeof item?.text !== 'string' || !item.text.trim() || item.text.length > 16000) throw definitiveError('Informe um texto de 1 a 16.000 caracteres.');
+    return { text: item.text };
   }
 
-  async _prepareContent(item,media) {
-    if(!ALLOWED_TYPES.has(item?.type))throw definitiveError('Tipo de conteúdo não suportado.');
-    let content;
+  async _managedContent(item, media) {
+    if (!ALLOWED_TYPES.has(item?.type)) throw definitiveError('Tipo de conteúdo não suportado.');
     if (item.type === 'text') {
-      if (!String(item.text || '').trim()) throw definitiveError('O texto da mensagem está vazio.');
-      content = { text: String(item.text) };
-    } else {
-      if (!media?.path) throw definitiveError('Mídia não encontrada na pasta gerenciada.');
-      let stat, filename, libraryDirectory;
-      try {
-        libraryDirectory = await fs.realpath(path.join(this.store.dir, 'media'));
-        filename = await fs.realpath(media.path);
-        stat = await fs.stat(filename);
-      } catch { throw definitiveError('O arquivo da biblioteca não está disponível.'); }
-      if (!filename.startsWith(libraryDirectory + path.sep)) throw definitiveError('O arquivo está fora da pasta gerenciada.');
-      if (!stat.isFile()) throw definitiveError('O arquivo da biblioteca não é válido.');
-      if (!stat.size || stat.size > MAX_MEDIA_BYTES) throw definitiveError('A mídia precisa ter entre 1 byte e 64 MB.');
-      let bytes;
-      try { bytes = await fs.readFile(filename); } catch { throw definitiveError('Não foi possível ler a mídia gerenciada.'); }
-      if (!media.sha256 || createHash('sha256').update(bytes).digest('hex') !== media.sha256) throw definitiveError('A mídia foi alterada na pasta gerenciada. Importe o arquivo novamente.');
-      // Send the verified bytes, avoiding a second path read between verification and upload.
-      content = { [item.type]: bytes, mimetype: media.mime || 'application/octet-stream' };
-      if (item.caption) content.caption = String(item.caption);
-      if (item.type === 'document') content.fileName = media.name || path.basename(media.path);
+      return this._textContent(item);
     }
+    if (!media?.path || !this.store?.dir) throw definitiveError('Mídia não encontrada na pasta gerenciada.', false, 'WA_MEDIA_MISSING');
+    let stat, filename, libraryDirectory;
+    try {
+      libraryDirectory = await fs.realpath(path.join(this.store.dir, 'media'));
+      filename = await fs.realpath(media.path);
+      stat = await fs.stat(filename);
+    } catch { throw definitiveError('O arquivo da biblioteca não está disponível.', false, 'WA_MEDIA_MISSING'); }
+    if (!filename.startsWith(libraryDirectory + path.sep)) throw definitiveError('O arquivo está fora da pasta gerenciada.', false, 'WA_MEDIA_PATH');
+    if (!stat.isFile()) throw definitiveError('O arquivo da biblioteca não é válido.', false, 'WA_MEDIA_INVALID');
+    if (!stat.size || stat.size > MAX_MEDIA_BYTES) throw definitiveError('A mídia precisa ter entre 1 byte e 64 MB.', false, 'WA_MEDIA_SIZE');
+    let bytes;
+    try { bytes = await fs.readFile(filename); } catch { throw definitiveError('Não foi possível ler a mídia gerenciada.', false, 'WA_MEDIA_READ'); }
+    if (!media.sha256 || createHash('sha256').update(bytes).digest('hex') !== media.sha256) throw definitiveError('A mídia foi alterada na pasta gerenciada. Importe o arquivo novamente.', false, 'WA_MEDIA_CHANGED');
+    if (item.caption != null && (typeof item.caption !== 'string' || item.caption.length > 16000)) throw definitiveError('Legenda precisa ter até 16.000 caracteres.', false, 'WA_CAPTION_INVALID');
+    const content = { [item.type]: bytes, mimetype: media.mime || 'application/octet-stream' };
+    if (item.caption) content.caption = item.caption;
+    if (item.type === 'document') content.fileName = media.name || path.basename(media.path);
     return content;
   }
 
-  _refreshContent(content,item) { if(item.type==='text')content.text=String(item.text||'');else if(item.caption)content.caption=String(item.caption);else delete content.caption; }
   _beforeSubmit(callback) {
-    try { const value=callback?.(); if(value&&typeof value.then==='function')throw new Error('A verificação de envio precisa ser síncrona.'); return value; }
-    catch(error) { throw Object.assign(error instanceof Error?error:new Error('Verificação de envio recusada.'),{definitive:true,submitted:false,safeToRetry:false}); }
+    if (callback == null) return;
+    if (typeof callback !== 'function') throw definitiveError('Validação final do envio inválida.', false, 'WA_SUBMISSION_GUARD_INVALID');
+    try {
+      const result = callback();
+      if (result && typeof result.then === 'function') throw definitiveError('A validação final do envio precisa ser síncrona.', false, 'WA_SUBMISSION_GUARD_ASYNC');
+      if (result === false) throw definitiveError('O envio foi bloqueado pela validação final.', false, 'WA_SUBMISSION_GUARD_REJECTED');
+    } catch (error) {
+      // A guard fails before transport submission; it is never an uncertain
+      // send and must not leave an outbound reservation that could hide it.
+      throw Object.assign(error instanceof Error ? error : new Error('O envio foi bloqueado antes da submissão.'), { definitive: true, safeToRetry: false, temporary: false, submitted: false, code: error?.code || 'WA_SUBMISSION_GUARD_REJECTED' });
+    }
   }
 
-  async sendPrivateContent(number,item,media,{beforeSubmit}={}) {
-    const recipient=await this.resolveRecipient(String(number));
-    const socket=this.socket,generation=this.generation;
-    const content=item.type==='text'?{text:String(item.text||'')}:await this._prepareContent(item,media);
-    if(item.type==='text'&&!content.text.trim())throw definitiveError('O texto da mensagem está vazio.');
-    const live=this._beforeSubmit(beforeSubmit)||item;this._refreshContent(content,live);
-    if(this.socket!==socket||this.generation!==generation)throw definitiveError('A conexão mudou antes do envio privado.',true,'WA_RECIPIENT_CONNECTION_CHANGED');
-    return this._submitVerified(recipient.jid,content,item.clientMessageId);
+  _assertTransport(socket, generation) {
+    if (socket !== this.socket || generation !== this.generation || this.status.state !== 'connected') throw definitiveError('A conexão mudou antes da submissão. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_CONNECTION_CHANGED');
   }
 
-  async sendPrivate(number, text, { clientMessageId, beforeSubmit } = {}) {
+  async send(groupId, item, media, { beforeSubmit, traceId } = {}) {
+    if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado. Envios pausados.', true);
+    if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) throw definitiveError('O destino precisa ser um grupo do WhatsApp.');
+    const group = this.store?.getGroup(groupId);
+    if (!group || !group.authorized || group.simulation) throw definitiveError('O grupo não tem autorização registrada para envio real.');
+    const socket = this.socket, generation = this.generation;
+    // Keep text submission synchronous up to socket.sendMessage, so an
+    // immediate ACK or disconnect cannot race an unnecessary promise turn.
+    const content = item?.type === 'text' ? this._textContent(item) : await this._managedContent(item, media);
+    this._assertTransport(socket, generation);
+    // Media reads are asynchronous. Check local authorization again after them.
+    const current = this.store?.getGroup(groupId);
+    if (!current?.authorized || current.simulation) throw definitiveError('A autorização do grupo mudou antes do envio.', false, 'WA_GROUP_AUTHORIZATION_CHANGED');
+    return this._submitVerified(groupId, content, item.clientMessageId, beforeSubmit, traceId);
+  }
+
+  async sendPrivate(number, text, { clientMessageId, beforeSubmit, traceId } = {}) {
     const digits = String(number || '');
     if (!/^[1-9]\d{9,14}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.');
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Informe um alerta de 1 a 16.000 caracteres.');
-    const recipient = await this.resolveRecipient(digits);
-    // Resolution may wait on the network. The caller's current authorization,
-    // stop latch and occurrence must be checked at the irreversible boundary.
-    this._beforeSubmit(beforeSubmit);
-    return this._submitVerified(recipient.jid, { text }, clientMessageId);
+    const socket = this.socket, generation = this.generation;
+    const recipient = await this.resolveRecipient(digits, { traceId });
+    this._assertTransport(socket, generation);
+    return this._submitVerified(recipient.jid, { text }, clientMessageId, beforeSubmit, traceId);
   }
 
-  async resolveRecipient(number) {
+  async sendPrivateContent(target, item, media, { clientMessageId = item?.clientMessageId, replyContext, beforeSubmit, traceId } = {}) {
+    if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado antes de enviar o documento.', true, 'WA_RECIPIENT_OFFLINE');
+    const socket = this.socket, generation = this.generation;
+    let recipient;
+    if (replyContext) {
+      recipient = await this.resolveReplyRecipient(replyContext);
+      if (![recipient.jid, recipient.phone].includes(target)) throw definitiveError('O destino do documento difere do solicitante do comando.', false, 'WA_REPLY_RECIPIENT_MISMATCH');
+    } else {
+      const number = /^[1-9]\d{9,14}$/.test(String(target || '')) ? target : phoneFromJid(target);
+      if (!number) throw definitiveError('Informe o telefone do destinatário privado com código do país e DDD.', false, 'WA_RECIPIENT_INVALID');
+      recipient = await this.resolveRecipient(number, { traceId });
+    }
+    const content = await this._managedContent(item, media);
+    this._assertTransport(socket, generation);
+    return this._submitVerified(recipient.jid, content, clientMessageId, beforeSubmit, recipient.traceId || traceId);
+  }
+
+  async sendSearchDocument(target, document, options = {}) {
+    return this.sendPrivateContent(target, { type: 'document', caption: document?.caption || '' }, document, options);
+  }
+
+  async resolveRecipient(number, { traceId } = {}) {
+    try { return await this._resolveRecipient(number); }
+    catch (error) {
+      if (this._validTraceId(traceId)) this._transportDiagnostic({ key: { id: '', remoteJid: /^\d{10,15}$/.test(String(number || '')) ? `${number}@s.whatsapp.net` : '', fromMe: true } }, 'transport.failed', /^[A-Z0-9_]{1,80}$/.test(error?.code || '') ? error.code : 'WA_RECIPIENT_LOOKUP_REJECTED', 'Não foi possível resolver o destinatário pela integração. Nenhuma mensagem foi submetida.', { submitted: false }, traceId);
+      throw error;
+    }
+  }
+
+  async _resolveRecipient(number) {
     const digits = String(number || '');
     if (!/^[1-9]\d{9,14}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.', false, 'WA_RECIPIENT_INVALID');
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado antes de resolver o destinatário.', true, 'WA_RECIPIENT_OFFLINE');
@@ -976,22 +1094,24 @@ class WhatsAppAdapter extends EventEmitter {
     finally { if (this.recipientResolutions.get(digits) === operation) this.recipientResolutions.delete(digits); }
   }
 
-  async sendSearchText(target, text, { clientMessageId, replyContext } = {}) {
+  async sendSearchText(target, text, { clientMessageId, replyContext, beforeSubmit, traceId } = {}) {
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Resultado da busca precisa ter de 1 a 16.000 caracteres.');
     if (typeof target !== 'string') throw definitiveError('Destinatário da busca inválido.');
+    const socket = this.socket, generation = this.generation;
     let targetId;
     if (replyContext) {
       const resolved = await this.resolveReplyRecipient(replyContext);
       if (![resolved.jid, resolved.phone].includes(target)) throw definitiveError('O destino da resposta difere do comando recebido.', false, 'WA_REPLY_RECIPIENT_MISMATCH');
       targetId = resolved.jid;
+      traceId = resolved.traceId || traceId;
     }
-    else if (/^[1-9]\d{9,14}$/.test(target)) targetId = (await this.resolveRecipient(target)).jid;
-    else if (phoneFromJid(target)) targetId = (await this.resolveRecipient(phoneFromJid(target))).jid;
+    else if (/^[1-9]\d{9,14}$/.test(target)) targetId = (await this.resolveRecipient(target, { traceId })).jid;
+    else if (phoneFromJid(target)) targetId = (await this.resolveRecipient(phoneFromJid(target), { traceId })).jid;
     else if (accountJid(target) && target.endsWith('@lid')) {
       const normalized = accountJid(target);
       const mapped = this.contacts.get(normalized)?.phoneNumber || phoneFromJid(await this.socket?.signalRepository?.lidMapping?.getPNForLID?.(normalized));
       if (!mapped) throw definitiveError('O número real desse destinatário não foi disponibilizado pelo WhatsApp. Cadastre o telefone com código do país e DDD.', false, 'WA_RECIPIENT_NUMBER_UNAVAILABLE');
-      targetId = (await this.resolveRecipient(mapped)).jid;
+      targetId = (await this.resolveRecipient(mapped, { traceId })).jid;
     }
     else if (target.endsWith('@g.us')) {
       const group = this.store?.getGroup(target);
@@ -1000,14 +1120,16 @@ class WhatsAppAdapter extends EventEmitter {
     } else throw definitiveError('Destinatário da busca inválido.');
     // Sending to a group is permitted here only after the service explicitly authorizes
     // the origin-recipient option; no result is broadcast or sent via unconfirmed reply().
-    return this._submitVerified(targetId, { text }, clientMessageId);
+    this._assertTransport(socket, generation);
+    return this._submitVerified(targetId, { text }, clientMessageId, beforeSubmit, traceId);
   }
 
-  async _submitVerified(targetId, content, clientMessageId) {
+  async _submitVerified(targetId, content, clientMessageId, beforeSubmit, traceId) {
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado antes da submissão. Envios pausados.', true);
     if (clientMessageId != null && (typeof clientMessageId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(clientMessageId))) throw definitiveError('Identificador de envio inválido.');
     if (this.pendingAcks.size >= 64 && !this.pendingAcks.has(clientMessageId)) throw definitiveError('Há envios demais aguardando confirmação. Aguarde a fila atual.', true);
     const messageId = clientMessageId || this.library.generateMessageIDV2?.(this.socket.user?.id) || randomBytes(16).toString('hex').toUpperCase();
+    this._submissionTrace(messageId, traceId);
     const pendingSubmission = this.pendingAcks.get(messageId);
     if (pendingSubmission) {
       if (pendingSubmission.targetId !== targetId) throw definitiveError('O identificador do envio já pertence a outro destino.');
@@ -1019,7 +1141,16 @@ class WhatsAppAdapter extends EventEmitter {
       return { status: outcome.status, messageId, ...(outcome.status === 'confirmed' ? this.deliveryProofs.get(messageId) || {} : {}) };
     }
     if (this.receipts.has(messageId)) return { status: 'confirmed', messageId };
-    const socket = this.socket;
+    const socket = this.socket, generation = this.generation;
+    // Publish diagnostics before the final guard: listeners may synchronously
+    // pause the system or invalidate a recipient. No external event listener
+    // runs between that guard and actual socket submission.
+    this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, 'transport.submitting', 'WA_SUBMISSION_PREPARED', 'Preparando o envio pela integração; a validação final ocorre antes de submeter a mensagem.', { submitted: false, type: Buffer.isBuffer(content.document) ? 'document' : Buffer.isBuffer(content.image) ? 'image' : Buffer.isBuffer(content.video) ? 'video' : 'text' });
+    try { this._beforeSubmit(beforeSubmit); this._assertTransport(socket, generation); }
+    catch (error) {
+      this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, 'transport.failed', /^[A-Z0-9_]{1,80}$/.test(error?.code || '') ? error.code : 'WA_SUBMISSION_GUARD_REJECTED', 'Envio bloqueado pela validação final, antes de qualquer submissão à integração.', { submitted: false });
+      throw error;
+    }
     if (!this._markAutomatic(messageId)) {
       // Only the transport reservation proves this ID already reached submission.
       // Queued jobs/alerts/search deliveries are automatic, but have not been sent.
@@ -1029,6 +1160,7 @@ class WhatsAppAdapter extends EventEmitter {
     const resultPromise = new Promise(resolve => {
       const timer = setTimeout(() => {
         if (!this.pendingAcks.has(messageId)) return;
+        this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, 'transport.failed', 'WA_SUBMISSION_TIMEOUT', 'O transporte excedeu o tempo de submissão. Resultado incerto; não será repetido automaticamente.', { submitted: true });
         this._status('disconnected', 'O envio excedeu o tempo de resposta. Resultado incerto; revise o Histórico antes de retomar.', { errorCode: 'WA_SUBMISSION_TIMEOUT', reasonCode: 'unexpected' });
         this._resolveAllPending();
         // Close the old socket so a delayed media upload cannot submit after the queue is paused.
@@ -1047,11 +1179,16 @@ class WhatsAppAdapter extends EventEmitter {
       const pending = this.pendingAcks.get(messageId);
       if (pending) {
         clearTimeout(pending.timer);
-        pending.timer = setTimeout(() => this._uncertain(messageId), this.ackTimeoutMs);
+        pending.timer = setTimeout(() => {
+          this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, 'transport.failed', 'WA_ACK_TIMEOUT', 'A integração não disponibilizou confirmação no prazo. Resultado incerto; revise antes de reenviar.', { submitted: true });
+          this._uncertain(messageId);
+        }, this.ackTimeoutMs);
       }
     };
     const failed = error => {
       const code = Number(error?.output?.statusCode || error?.statusCode);
+      const protocolStatus = Number.isInteger(code) && code >= 100 && code <= 999 ? code : null;
+      this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, 'transport.failed', protocolStatus ? `WA_SUBMISSION_ERROR_${protocolStatus}` : 'WA_SUBMISSION_ERROR', 'A integração apresentou erro após iniciar a submissão. Resultado incerto; não será repetido automaticamente.', { submitted: true, ...(protocolStatus ? { protocolStatus } : {}) });
       if (code === 429 || code === 403 || code === 463) this._restrict(socket);
       // A transport exception after submission cannot prove the server did not accept the item.
       this._uncertain(messageId);
@@ -1062,15 +1199,27 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   _incoming(event, generation) {
-    if (generation !== this.generation || event?.type !== 'notify' || (typeof event.requestId === 'string' && event.requestId.length > 0)) return;
+    if (generation !== this.generation) return;
     const now = Date.now();
+    for (const [id, pending] of this.pendingDecryption) if (pending.expiresAt < now) this.pendingDecryption.delete(id);
     for (const message of event.messages || []) {
       const key = message.key || {};
+      const recovered = typeof event.requestId === 'string' && event.requestId.length > 0;
+      if (event?.type !== 'notify' || (recovered && !this._isPendingRecovery(message, generation))) {
+        this._transportDiagnostic(message, 'transport.ignored', recovered ? 'WA_RECOVERY_NOT_LIVE' : 'WA_HISTORY_NOT_COMMAND', recovered ? 'Recuperação sem mensagem privada recente observada; não executada como comando.' : 'Evento de histórico não executado como comando.', { eventType: event.type || 'unknown' });
+        continue;
+      }
       const timestamp = messageTimestamp(message.messageTimestamp);
-      if (!key.id || !timestamp || timestamp < Math.max(this.connectStartedAt - 5000, now - 120000) || timestamp > now + 30000 || this.seenIncoming.has(key.id)) continue;
-      this.seenIncoming.set(key.id, now);
-      while (this.seenIncoming.size > 2000) this.seenIncoming.delete(this.seenIncoming.keys().next().value);
       const chatId = accountJid(key.remoteJid) || key.remoteJid;
+      const dedupeId = key.id;
+      if (!key.id || !timestamp || timestamp < Math.max(this.connectStartedAt - 5000, now - 120000) || timestamp > now + 30000) {
+        this._transportDiagnostic(message, 'transport.ignored', 'WA_MESSAGE_OUTSIDE_LIVE_WINDOW', 'Mensagem sem identificação/data válida ou fora da janela de comandos em tempo real. Reenvie o comando após conectar.');
+        continue;
+      }
+      if (this.seenIncoming.has(dedupeId)) {
+        this._transportDiagnostic(message, 'transport.ignored', 'WA_EVENT_DUPLICATE', 'Evento repetido; comando não executado novamente.');
+        continue;
+      }
       const isGroup = typeof chatId === 'string' && chatId.endsWith('@g.us');
       const { contact, ...identity } = this._identityContext(key, isGroup);
       const body = unwrapMessage(message.message);
@@ -1081,9 +1230,23 @@ class WhatsAppAdapter extends EventEmitter {
       else if (body.imageMessage) { type = 'image'; text = body.imageMessage.caption || ''; }
       else if (body.videoMessage) { type = 'video'; text = body.videoMessage.caption || ''; }
       else if (body.documentMessage) { type = 'document'; text = body.documentMessage.caption || ''; }
-      else continue;
+      else {
+        // Do not consume its command ID before decryption succeeds. Without
+        // this, a ciphertext event permanently suppresses the recovered body.
+        const ciphertext = this.library?.WAMessageStubType?.CIPHERTEXT ?? this.library?.proto?.WebMessageInfo?.StubType?.CIPHERTEXT ?? 2;
+        if (message.messageStubType === ciphertext) {
+          this.pendingDecryption.set(this._decryptionKey(message, generation), { timestamp, fromMe: key.fromMe === true, expiresAt: now + 120000 });
+          while (this.pendingDecryption.size > 2000) this.pendingDecryption.delete(this.pendingDecryption.keys().next().value);
+          this._transportDiagnostic(message, 'transport.waiting', 'WA_DECRYPTION_PENDING', 'Mensagem recebida sem conteúdo decifrado. Aguardando recuperação suportada pela integração.');
+        } else this._transportDiagnostic(message, 'transport.ignored', 'WA_MESSAGE_CONTENT_UNSUPPORTED', 'Evento sem texto ou mídia compatível; não interpretado como comando.');
+        continue;
+      }
+      this.pendingDecryption.delete(this._decryptionKey(message, generation));
+      this.seenIncoming.set(dedupeId, now);
+      while (this.seenIncoming.size > 2000) this.seenIncoming.delete(this.seenIncoming.keys().next().value);
       const context = {
         messageId: key.id,
+        traceId: this._receiveTraceId(key),
         ...identity,
         pushName: typeof message.pushName === 'string' ? message.pushName.slice(0, 500) : contact.notify || '',
         displayName: typeof message.pushName === 'string' ? message.pushName.slice(0, 500) : contact.notify || '',
@@ -1095,19 +1258,22 @@ class WhatsAppAdapter extends EventEmitter {
         text,
         type,
         raw: message,
-        timestamp
+        timestamp,
+        ...(recovered ? { recoveredAfterDecryption: true } : {})
       };
       context.replyProof = this._replyProof(context);
+      this._transportDiagnostic(message, 'transport.identity', context.verified ? 'WA_IDENTITY_RESOLVED' : 'WA_IDENTITY_UNRESOLVED', context.verified ? 'Remetente identificado pelo protocolo; autorização será verificada pelo serviço.' : 'Telefone do remetente indisponível ou divergente. Nenhum telefone foi inferido do nome ou do identificador interno.', { identityVerified: context.identityVerified, verified: context.verified, automaticMessage: context.automaticMessage, recoveredAfterDecryption: recovered });
       this.emit('incoming', context);
     }
   }
 
-  async reply(chatId, text, { replyContext, clientMessageId } = {}) {
-    if (replyContext) return this.sendSearchText(chatId, String(text), { replyContext, clientMessageId });
+  async reply(chatId, text, { replyContext, clientMessageId, beforeSubmit, traceId } = {}) {
+    if (replyContext) return this.sendSearchText(chatId, String(text), { replyContext, clientMessageId, beforeSubmit, traceId });
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado.', true);
     if (typeof chatId !== 'string' || (!phoneFromJid(chatId) && !/^\d+@lid$/.test(chatId))) throw definitiveError('Conversa de controle inválida.');
     const socket = this.socket;
     const messageId = this.library.generateMessageIDV2?.(socket.user?.id) || randomBytes(16).toString('hex').toUpperCase();
+    this._beforeSubmit(beforeSubmit);
     this._markAutomatic(messageId, 'control-reply');
     let timer;
     try {

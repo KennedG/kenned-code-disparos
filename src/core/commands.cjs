@@ -10,14 +10,18 @@ const HISTORY_WINDOW = 5 * 60 * 1000;
 const REPLAY_TTL = 24 * 60 * 60 * 1000;
 const MEDIA_TYPES = new Set(['image', 'video', 'document']);
 const clone = value => JSON.parse(JSON.stringify(value));
-const phone = value => typeof value === 'string' && /^\+?\d{7,15}$/.test(value) ? value.replace(/^\+/, '') : null;
+const { normalizePhone: phone } = require('./phone.cjs');
+const codeOf = (value, fallback) => typeof value === 'string' && /^[A-Z0-9_]{1,64}$/.test(value) ? value : fallback;
+const safeReason = value => String(value || '').slice(0, 800)
+  .replace(/(Bearer\s+)[\w.\-]+/gi, '$1[omitido]')
+  .replace(/((?:["']?)(?:password|senha|token|secret|authorization|credential|cookie|qr|session|private.?key|api.?key)(?:["']?)\s*[:=]\s*)[^\r\n]*/gi, '$1[omitido]');
 const compact = value => String(value || '').replace(/\s+/g, ' ').slice(0, 150);
 const fold = value => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 class ControlError extends Error {}
 const fail = message => { throw new ControlError(message); };
 
 class CommandController {
-  constructor({ store, scheduler, adapter, mediaManager, authService, automationControl, statusProvider, sendAdminReply, commercialService, now = () => Date.now() }) {
+  constructor({ store, scheduler, adapter, mediaManager, authService, automationControl, statusProvider, sendAdminReply, now = () => Date.now() }) {
     this.store = store;
     this.scheduler = scheduler;
     this.adapter = adapter;
@@ -25,7 +29,7 @@ class CommandController {
     this.authService = authService || null;
     this.automationControl = automationControl || null;
     this.statusProvider = statusProvider || null;
-    this.sendAdminReply = sendAdminReply || null;this.commercialService=commercialService||null;
+    this.sendAdminReply = sendAdminReply || null;
     this.actorContext = new AsyncLocalStorage();
     this.now = now;
     this.sessions = new Map();
@@ -33,110 +37,252 @@ class CommandController {
     this._tail = Promise.resolve();
     this._waiting = 0;
     this.replyFailures = new WeakSet();
+    this.replyIndex = new Map();
+    this.closed = false;
+    this.adapterRevision = 0;
+    this.receiptListener = receipt => this._receipt(receipt);
+    this._recoverReplies();
+    this.adapter.on?.('receipt', this.receiptListener);
   }
 
   setAdapter(adapter) {
+    this.adapter.off?.('receipt', this.receiptListener);
     this.adapter = adapter;
-    // A conversa de configuração não atravessa uma troca de integração/conta.
+    this.adapterRevision++;
+    // Configuration and replies cannot cross an integration/account switch.
     this.sessions.clear();
     this.pending.clear();
+    this.replyIndex.clear();
+    this._recoverReplies();
+    this.adapter.on?.('receipt', this.receiptListener);
+  }
+
+  close() {
+    this.closed = true;
+    this.adapter.off?.('receipt', this.receiptListener);
+    this.sessions.clear();
+    this.pending.clear();
+    this.replyIndex.clear();
   }
 
   handle(context) {
-    if (!this._authorized(context)) return Promise.resolve(false);
+    if (this.closed || !context) return Promise.resolve(false);
     const sender = phone(context.senderNumber);
-    if (!(context?.type === 'text' && /^!mega(?:\s|$)/i.test(String(context.text || '').trim())) && !this.sessions.has(sender)) return Promise.resolve(false);
-    // An administrator's stop must not wait for a media download or a slow reply.
-    // _handle still checks the protocol identity and durable replay guard first.
-    if (context?.type === 'text' && /^!mega\s+(?:parar\s+tudo|pausar\s+\S+)\s*$/i.test(String(context.text || '').trim())) {
-      return this._handle(context);
+    const command = context.type === 'text' && /^!mega(?:\s|$)/i.test(String(context.text || '').trim());
+    if (!command && !this.sessions.has(sender)) return Promise.resolve(false);
+    context = { ...context, commandTraceId: /^wa-receive-[a-f0-9]{24}$/.test(context.traceId || '') ? context.traceId : randomUUID(),
+      commandAdapterRevision: this.adapterRevision, commandStorageMode: this.store.getStorageMode?.() || this.adapter.status?.mode || 'whatsapp' };
+    this._trace(context, 'recebimento', 'ADMIN_COMMAND_RECEIVED',
+      context.fromMe === true ? 'Comando manual da conta conectada observado.' : 'Mensagem de controle recebida; autorização ainda não validada.');
+    const authorization = this._authorization(context);
+    if (!authorization.allowed) {
+      this._trace(context, 'autorizacao', authorization.code, authorization.reason);
+      return Promise.resolve(false);
     }
-    if (this._waiting >= 64) return Promise.resolve(false);
+    context.commandActorId = authorization.user?.id || null;
+    // An administrator's stop cannot wait for media preparation or slow replies.
+    if (command && /^!mega\s+(?:parar\s+tudo|pausar\s+\S+)\s*$/i.test(String(context.text || '').trim())) return this._handle(context);
+    if (this._waiting >= 64) {
+      this._trace(context, 'fila', 'ADMIN_COMMAND_QUEUE_FULL', 'Fila de comandos cheia; comando não executado. Aguarde e envie um novo comando.');
+      return Promise.resolve(false);
+    }
     this._waiting++;
     const operation = this._tail.then(() => this._handle(context)).finally(() => { this._waiting--; });
     this._tail = operation.catch(() => {});
     return operation;
   }
 
-  _authorized(context) {
-    if (!context || context.verified !== true || context.isGroup !== false ||
-      context.forwarded !== false || context.historical === true ||
-      context.isHistory === true || context.history === true) return false;
-    if (context.automaticMessage === true || context.machineGenerated === true ||
-      this.store.isOutboundMessageId?.(context.messageId)) return false;
-    if (context.fromMe !== false) {
-      if (context.fromMe !== true || context.trustedSelf !== true || context.selfChat !== true ||
-        !this.adapter.isTrustedSelfContext?.(context)) return false;
-    }
+  _authorization(context) {
+    const denied = (code, reason) => ({ allowed: false, code, reason });
+    if (!context || context.verified !== true) return denied('ADMIN_IDENTITY_UNVERIFIED', 'O adaptador não confirmou o telefone real do remetente. Confira a resolução de PN/LID.');
+    if (context.isGroup !== false) return denied('ADMIN_PRIVATE_CHAT_REQUIRED', 'Comandos administrativos são aceitos somente em conversa privada.');
+    if (context.forwarded !== false) return denied('ADMIN_FORWARDED_REJECTED', 'Mensagem encaminhada ou sem confirmação de origem direta; nenhuma operação executada.');
+    if (context.historical === true || context.isHistory === true || context.history === true) return denied('ADMIN_HISTORY_REJECTED', 'Evento de histórico não executa comandos.');
+    if (context.automaticMessage === true || context.machineGenerated === true || this.store.isOutboundMessageId?.(context.messageId)) return denied('ADMIN_AUTOMATION_ECHO_REJECTED', 'Eco de mensagem automática ignorado para evitar loops.');
+    if (context.fromMe !== false && (context.fromMe !== true || context.trustedSelf !== true || context.selfChat !== true || !this.adapter.isTrustedSelfContext?.(context))) return denied('ADMIN_SELF_IDENTITY_REJECTED', 'Mensagem da própria conta fora da conversa consigo mesma ou sem prova de identidade.');
     const sender = phone(context.senderNumber);
-    if (!sender) return false;
-    if (this.authService) {
-      const user = this.authService.findAuthorizedPhone(sender);
-      if (!user || (this.automationControl && !this.authService.canFor(user, 'automation.control'))) return false;
-    } else {
-      // Compatibility for isolated core consumers/tests. Production always injects AuthService.
-      const admins = this.store.getSetting('admins', []);
-      if (!Array.isArray(admins) || !admins.some(number => phone(number) === sender)) return false;
-    }
-    // Um LID só é aceito com o telefone real resolvido e verificado pelo adaptador.
+    if (!sender) return denied('ADMIN_PHONE_INVALID', 'Telefone real ausente ou inválido; identificadores internos não são usados como telefone.');
     const directPhone = context.chatId === `${sender}@s.whatsapp.net`;
     const verifiedLid = /^\d+@lid$/.test(context.chatId || '');
-    return directPhone || verifiedLid;
+    if (!directPhone && !verifiedLid) return denied('ADMIN_REPLY_CHAT_MISMATCH', 'A conversa privada não corresponde à identidade do remetente verificado.');
+    let user = null;
+    if (this.authService) {
+      // Production uses the central collision-safe account resolver. The fallback
+      // preserves existing isolated consumers, without accepting legacy admins.
+      const resolved = this.authService.resolveWhatsAppActor?.(context);
+      user = this.authService.resolveWhatsAppActor ? resolved?.user || resolved : this.authService.findAuthorizedPhone(sender);
+      if (!user?.id) return denied(codeOf(resolved?.code, 'ADMIN_SENDER_UNAUTHORIZED'), resolved?.reason || 'O telefone não está vinculado de forma inequívoca a um usuário ativo autorizado.');
+      if (this.automationControl && !this.authService.canFor(user, 'automation.control')) return denied('ADMIN_CONTROL_PERMISSION_DENIED', 'Usuário identificado, mas sem permissão de controle administrativo. Permissão de busca não autoriza controle do sistema.');
+    } else {
+      const admins = this.store.getSetting('admins', []);
+      if (!Array.isArray(admins) || !admins.some(number => phone(number) === sender)) return denied('ADMIN_SENDER_UNAUTHORIZED', 'Remetente não consta entre os administradores autorizados.');
+      user = { id: null, legacy: true };
+    }
+    return { allowed: true, user, sender };
   }
 
-  _fresh(context) {
-    if (typeof context.messageId !== 'string' || !context.messageId || context.messageId.length > 512) return false;
+  _authorized(context) { return this._authorization(context).allowed; }
+
+  _recentCommands() {
+    const values = this.store.getSetting('recentCommandIds', []);
+    return (Array.isArray(values) ? values : []).filter(entry => entry && Number.isFinite(entry.at) && entry.at >= Number(this.now()) - REPLAY_TTL);
+  }
+
+  _recoverReplies() {
+    const entries = this._recentCommands();
+    let changed = false;
+    for (const entry of entries) for (const reply of entry.replies || []) {
+      if (reply.status === 'processing') {
+        reply.status = 'uncertain';
+        reply.code = 'ADMIN_REPLY_INTERRUPTED';
+        reply.reason = 'Aplicativo interrompido durante o envio; aguarde confirmação ou revise antes de repetir.';
+        reply.resultAt = Number(this.now());
+        changed = true;
+      } else if (reply.status === 'pending') {
+        reply.status = 'cancelled';
+        reply.code = 'ADMIN_REPLY_NOT_SUBMITTED';
+        reply.reason = 'Resposta não submetida antes da interrupção; envie um novo comando se necessário.';
+        reply.resultAt = Number(this.now());
+        changed = true;
+      }
+      if (reply.messageId) this.replyIndex.set(reply.messageId, entry.id);
+    }
+    if (changed) {
+      this.store.setSetting('recentCommandIds', entries);
+      for (const entry of entries) for (const reply of entry.replies || []) if (['ADMIN_REPLY_INTERRUPTED', 'ADMIN_REPLY_NOT_SUBMITTED'].includes(reply.code) && reply.resultAt === Number(this.now())) {
+        this._trace({ commandTraceId: entry.traceId, commandActorId: entry.actorId, chatId: entry.chatId }, 'recuperacao', reply.code, reply.reason, { messageId: reply.messageId, status: reply.status });
+      }
+    }
+  }
+
+  _claim(context) {
+    const rejected = (code, description) => {
+      this._trace(context, 'duplicidade', code, description);
+      return false;
+    };
+    if (typeof context.messageId !== 'string' || !context.messageId || context.messageId.length > 512) return rejected('ADMIN_MESSAGE_ID_INVALID', 'Comando sem identificador válido; nenhuma operação executada.');
     const rawTimestamp = Number(context.timestamp);
-    if (!Number.isFinite(rawTimestamp) || rawTimestamp <= 0) return false;
+    if (!Number.isFinite(rawTimestamp) || rawTimestamp <= 0) return rejected('ADMIN_MESSAGE_TIME_INVALID', 'Comando sem horário original válido; nenhuma operação executada.');
     const timestamp = rawTimestamp < 1e12 ? rawTimestamp * 1000 : rawTimestamp;
     const now = Number(this.now());
-    if (timestamp < now - HISTORY_WINDOW || timestamp > now + 60_000) return false;
-    const saved = this.store.getSetting('recentCommandIds', []);
-    const seen = (Array.isArray(saved) ? saved : []).filter(entry =>
-      entry && Number.isFinite(entry.at) && entry.at >= now - REPLAY_TTL);
+    if (timestamp < now - HISTORY_WINDOW || timestamp > now + 60_000) return rejected('ADMIN_COMMAND_STALE', 'Comando fora da janela de segurança; envie uma nova mensagem privada.');
+    const seen = this._recentCommands();
+    const activeKeys = new Set(seen.map(entry => entry.id));
+    for (const [messageId, commandKey] of this.replyIndex) if (!activeKeys.has(commandKey)) this.replyIndex.delete(messageId);
     const key = `${phone(context.senderNumber)}:${context.messageId}`;
-    if (seen.some(entry => entry.id === key)) return false;
-    // Preserve every fresh ID: dropping the oldest ID during a command burst allows replay.
-    // A bounded flood fails closed until entries leave the freshness window.
-    const recent = seen.filter(entry => entry.at >= now - HISTORY_WINDOW - 60_000);
-    if (recent.length >= 10000) return false;
-    recent.push({ id: key, at: now });
-    this.store.setSetting('recentCommandIds', recent);
+    const previous = seen.find(entry => entry.id === key);
+    if (previous) {
+      context.commandTraceId = previous.traceId || context.commandTraceId;
+      return rejected('ADMIN_COMMAND_DUPLICATE', 'Evento já processado; operação e resposta não foram repetidas.');
+    }
+    // Retain the durable identities for 24 hours, not just the freshness window.
+    // A bounded flood fails closed rather than evicting live replay protection.
+    if (seen.length >= 10000) return rejected('ADMIN_REPLAY_CAPACITY', 'Limite diário de comandos atingido; processamento bloqueado para proteger contra repetição.');
+    seen.push({ id: key, at: now, traceId: context.commandTraceId, actorId: context.commandActorId || null, chatId: context.chatId, replies: [] });
+    this.store.setSetting('recentCommandIds', seen);
+    context.commandLedgerKey = key;
     return true;
+  }
+
+  _replyRecord(context, messageId, patch) {
+    if (context.commandStorageMode && context.commandStorageMode !== (this.store.getStorageMode?.() || this.adapter.status?.mode || 'whatsapp')) throw Object.assign(new Error('A integração foi alterada; a resposta da conta anterior não atravessa os modos.'), { code: 'ADMIN_REPLY_MODE_CHANGED', submitted: true });
+    if (!context.commandLedgerKey) return null;
+    const entries = this._recentCommands();
+    const entry = entries.find(value => value.id === context.commandLedgerKey);
+    if (!entry) throw Object.assign(new ControlError('O controle persistente da resposta não foi encontrado.'), { code: 'ADMIN_REPLY_LEDGER_MISSING', definitive: true, submitted: false });
+    entry.replies ||= [];
+    const previous = entry.replies.find(value => value.messageId === messageId);
+    const reply = { ...(previous || {}), ...patch, messageId };
+    if (previous?.confirmationScope === 'whatsapp-read') reply.confirmationScope = 'whatsapp-read';
+    if (previous?.deliveredAt) reply.deliveredAt = previous.deliveredAt;
+    if (previous?.readAt) reply.readAt = previous.readAt;
+    // A late accepted result cannot downgrade a receipt already reconciled.
+    if (previous && ['confirmed', 'delivered'].includes(previous.status) && !['confirmed', 'delivered'].includes(reply.status)) return previous;
+    if (previous?.status === 'delivered' && reply.status === 'confirmed') return previous;
+    entry.replies = [...entry.replies.filter(value => value.messageId !== messageId), reply];
+    this.store.setSetting('recentCommandIds', entries);
+    this.replyIndex.set(messageId, entry.id);
+    return reply;
+  }
+
+  _receipt(receipt) {
+    if (this.closed || !receipt?.messageId || !['confirmed', 'delivered', 'read'].includes(receipt.status)) return;
+    const key = this.replyIndex.get(receipt.messageId);
+    if (!key) return;
+    const simulated = this.adapter.status?.mode === 'simulated';
+    if (receipt.simulation === true && !simulated || receipt.mode && (receipt.mode === 'simulated') !== simulated) return;
+    try {
+      const entry = this._recentCommands().find(value => value.id === key);
+      const reply = entry?.replies?.find(value => value.messageId === receipt.messageId);
+      if (!entry || !reply || ['pending', 'cancelled', 'failed'].includes(reply.status)) return;
+      const delivered = ['delivered', 'read'].includes(receipt.status) || ['whatsapp-delivered', 'whatsapp-read'].includes(receipt.confirmationScope);
+      const scope = reply.confirmationScope === 'whatsapp-read' ? 'whatsapp-read' : receipt.confirmationScope || reply.confirmationScope || (simulated ? 'simulation-only' : 'whatsapp-server');
+      if (reply.status === 'delivered' && !delivered) return;
+      if (reply.status === (delivered ? 'delivered' : 'confirmed') && reply.confirmationScope === scope && (!receipt.readAt || reply.readAt)) return;
+      const context = { commandLedgerKey: key, commandTraceId: entry.traceId, commandActorId: entry.actorId, chatId: entry.chatId };
+      this._replyRecord(context, receipt.messageId, { status: delivered || reply.status === 'delivered' ? 'delivered' : 'confirmed', confirmationScope: scope, resultAt: reply.resultAt || Number(this.now()), ...(delivered ? { deliveredAt: reply.deliveredAt || receipt.deliveredAt || Number(this.now()) } : {}), ...(receipt.readAt ? { readAt: reply.readAt || receipt.readAt } : {}), code: null, reason: null });
+      this._trace(context, 'confirmacao', delivered ? 'ADMIN_REPLY_DELIVERED' : 'ADMIN_REPLY_ACCEPTED', delivered ? 'Entrega da resposta confirmada pelo WhatsApp.' : 'Resposta aceita pelo servidor; a entrega ao dispositivo ainda não foi confirmada.', { messageId: receipt.messageId, confirmationScope: scope });
+    } catch { this.scheduler?.blockOnPersistenceFailure?.(); }
   }
 
   async _reply(context, text) {
     const value = String(text);
-    // Listas grandes são divididas, sem transformar conteúdo em comandos.
+    const actorId = this.actorContext.getStore()?.id || null;
     for (let offset = 0; offset < value.length; offset += 3500) {
       const part = value.slice(offset, offset + 3500);
-      const userId = this.actorContext.getStore()?.id || null;
-      const submission = () => {
-        if (!this._authorized(context)) throw new ControlError('A autorização foi alterada antes do envio da resposta.');
-        this._trace(context, 'envio', 'ADMIN_REPLY_SUBMITTED', 'Resposta administrativa submetida à integração.');
-        return this.adapter.reply(context.chatId, part, { replyContext: context, clientMessageId: randomBytes(16).toString('hex').toUpperCase() });
+      const messageId = randomBytes(16).toString('hex').toUpperCase();
+      const index = Math.floor(offset / 3500) + 1;
+      let adapterInvoked = false;
+      const assertAuthorized = () => {
+        if (this.closed || context.commandAdapterRevision !== this.adapterRevision) throw Object.assign(new ControlError('O aplicativo foi encerrado ou a integração foi alterada antes do envio.'), { code: 'ADMIN_REPLY_INTEGRATION_CHANGED', definitive: true, submitted: false });
+        const live = this._authorization(context);
+        if (!live.allowed || (live.user?.id || null) !== actorId) throw Object.assign(new ControlError('A identidade ou autorização foi alterada antes do envio da resposta.'), { code: 'ADMIN_REPLY_AUTH_CHANGED', definitive: true, submitted: false });
       };
-      this._trace(context, 'fila', 'ADMIN_REPLY_QUEUED', 'Resposta administrativa colocada na fila manual.');
+      const submission = () => {
+        assertAuthorized();
+        this._replyRecord(context, messageId, { status: 'processing', submittedAt: Number(this.now()) });
+        this._trace(context, 'envio', 'ADMIN_REPLY_SUBMITTED', 'Resposta administrativa submetida à integração.', { messageId, recipient: context.chatId, part: index });
+        adapterInvoked = true;
+        if (this.sendAdminReply) return this.sendAdminReply(context, part, { manual: true, userId: actorId, clientMessageId: messageId, traceId: context.commandTraceId, beforeSubmit: assertAuthorized });
+        return this.adapter.reply(context.chatId, part, { replyContext: context, clientMessageId: messageId, traceId: context.commandTraceId, beforeSubmit: assertAuthorized });
+      };
       try {
-        const result = this.sendAdminReply ? await this.sendAdminReply(context, part, { manual: true, userId }) :
-          this.scheduler?.runExternalSubmission ? await this.scheduler.runExternalSubmission(submission, { manual: true }) : await submission();
-        this._trace(context, 'resultado', result?.status === 'confirmed' ? 'ADMIN_REPLY_CONFIRMED' : 'ADMIN_REPLY_UNCONFIRMED',
-          result?.status === 'confirmed' ? 'Resposta confirmada pelo servidor; não implica entrega ao dispositivo.' : 'A integração ainda não confirmou a resposta.');
+        this._replyRecord(context, messageId, { status: 'pending', queuedAt: Number(this.now()), part: index, parts: Math.ceil(value.length / 3500), recipient: context.chatId });
+        this._trace(context, 'fila', 'ADMIN_REPLY_QUEUED', 'Resposta administrativa colocada na fila manual para o solicitante original.', { messageId, recipient: context.chatId, part: index });
+        const result = this.sendAdminReply ? await submission() : this.scheduler?.runExternalSubmission ?
+          await this.scheduler.runExternalSubmission(submission, { manual: true }) : await submission();
+        const delivered = ['delivered', 'read'].includes(result?.status) || ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope);
+        const accepted = result?.status === 'confirmed' || delivered;
+        const status = delivered ? 'delivered' : accepted ? 'confirmed' : 'uncertain';
+        this._replyRecord(context, messageId, { status, resultAt: Number(this.now()), confirmationScope: result?.confirmationScope || null, ...(delivered ? { deliveredAt: result.deliveredAt || Number(this.now()) } : {}), code: accepted ? null : 'ADMIN_REPLY_UNCERTAIN', reason: accepted ? null : 'A integração não confirmou a resposta; não será reenviada automaticamente.' });
+        this._trace(context, 'resultado', delivered ? 'ADMIN_REPLY_DELIVERED' : accepted ? 'ADMIN_REPLY_ACCEPTED' : 'ADMIN_REPLY_UNCERTAIN',
+          delivered ? 'Entrega da resposta confirmada pelo WhatsApp.' : accepted ? 'Resposta aceita pelo servidor; não implica entrega ao dispositivo.' : 'Resultado incerto. Confira o WhatsApp e aguarde confirmação; o sistema não repetirá automaticamente.', { messageId: result?.messageId || messageId, recipient: context.chatId, confirmationScope: result?.confirmationScope || null });
+        // A partially uncertain multi-part response must not continue with new
+        // parts, nor generate a second error response with different IDs.
+        if (!accepted) return;
       } catch (error) {
-        this._trace(context, 'erro', typeof error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'ADMIN_REPLY_FAILED',
-          'Não foi possível enviar a resposta administrativa. Confira a conexão, o destinatário e o diagnóstico.');
+        const definitive = !adapterInvoked || error?.submitted === false || error?.definitive === true && error?.submitted !== true;
+        const code = codeOf(error?.code, definitive ? 'ADMIN_REPLY_FAILED' : 'ADMIN_REPLY_UNCERTAIN');
+        const reason = safeReason(error?.message || 'A integração não informou o motivo da falha.');
+        try { this._replyRecord(context, messageId, { status: definitive ? 'failed' : 'uncertain', resultAt: Number(this.now()), code, reason }); }
+        catch (writeError) { if (writeError?.code !== 'ADMIN_REPLY_MODE_CHANGED') this.scheduler?.blockOnPersistenceFailure?.(); }
+        this._trace(context, 'erro', code, reason, { messageId, recipient: context.chatId, submitted: !definitive, temporary: error?.safeToRetry === true });
         if (error && (typeof error === 'object' || typeof error === 'function')) this.replyFailures.add(error);
         throw error;
       }
     }
   }
 
-  _trace(context, stage, code, description) {
-    if (!this.store.addDiagnostic) return;
-    try { this.store.addDiagnostic({ id: randomUUID(), traceId: context.commandTraceId || null,
-      at: Number(this.now()), userId: this.actorContext.getStore()?.id || null, campaignId: null,
-      stage: `admin.${stage}`, code, description, attempts: 0, action: 'Controle administrativo pelo WhatsApp.',
-      guidance: 'Use uma conversa privada autorizada. A resposta exige conexão ativa.' }); }
+  _trace(context, stage, code, description, detail = {}) {
+    if (!this.store.addDiagnostic || context.commandStorageMode && context.commandStorageMode !== (this.store.getStorageMode?.() || this.adapter.status?.mode || 'whatsapp')) return;
+    const level = stage === 'erro' && code !== 'ADMIN_OPERATION_DENIED' || ['ADMIN_REPLY_UNCERTAIN', 'ADMIN_REPLY_INTERRUPTED'].includes(code) ? 'error' :
+      stage === 'duplicidade' || stage === 'autorizacao' && code !== 'ADMIN_AUTH_APPROVED' || code === 'ADMIN_COMMAND_QUEUE_FULL' || code === 'ADMIN_REPLY_NOT_SUBMITTED' || code === 'ADMIN_OPERATION_DENIED' ? 'warning' : 'info';
+    try { this.store.addDiagnostic({ id: randomUUID(), traceId: context.commandTraceId || null, level,
+      at: Number(this.now()), userId: context.commandActorId || this.actorContext.getStore()?.id || null, campaignId: null,
+      stage: `admin.${stage}`, code, description: safeReason(description), attempts: stage === 'envio' ? 1 : 0,
+      action: 'Controle administrativo privado; autorização preservada e resposta ao solicitante original.',
+      guidance: 'Confira a etapa, a identidade verificada, a conexão e o código da falha. Resultados incertos exigem revisão.',
+      detail: { chatId: context.chatId || null, fromMe: context.fromMe === true, identityVerified: context.verified === true, ...detail } }); }
     catch { this.scheduler?.blockOnPersistenceFailure?.(); }
   }
 
@@ -147,11 +293,19 @@ class CommandController {
   }
 
   async _handle(context) {
-    if (!this._authorized(context)) return false;
-    const user = this.authService ? this.authService.findAuthorizedPhone(phone(context.senderNumber)) : { id: null, legacy: true };
-    if (!user || !this._fresh(context)) return false;
-    context = { ...context, commandTraceId: randomUUID() };
-    this._trace(context, 'recebimento', 'ADMIN_COMMAND_RECEIVED', 'Comando privado recebido com identidade verificada.');
+    if (this.closed) return false;
+    if (context.commandAdapterRevision !== this.adapterRevision) {
+      this._trace(context, 'autorizacao', 'ADMIN_INTEGRATION_CHANGED', 'A integração mudou enquanto o comando aguardava; envie uma nova mensagem.');
+      return false;
+    }
+    const authorization = this._authorization(context);
+    if (!authorization.allowed || (authorization.user?.id || null) !== (context.commandActorId || null)) {
+      this._trace(context, 'autorizacao', authorization.allowed ? 'ADMIN_ACTOR_CHANGED' : authorization.code,
+        authorization.allowed ? 'O vínculo de usuário mudou enquanto o comando aguardava na fila.' : authorization.reason);
+      return false;
+    }
+    const user = authorization.user;
+    if (!this._claim(context)) return false;
     return this.actorContext.run(user, () => {
       this._trace(context, 'autorizacao', 'ADMIN_AUTH_APPROVED', 'Identidade vinculada a usuário ativo com permissão de controle.');
       return this._handleAuthorized(context);
@@ -254,7 +408,7 @@ class CommandController {
   _validateActivation(campaign) {
     this._validateProposal(campaign);
     if (this.adapter.status?.state !== 'connected') fail('Conecte o WhatsApp ou o modo simulado no aplicativo antes de ativar.');
-    if (!campaign.groupIds.length&&!(campaign.contactIds||[]).length) fail('Selecione pelo menos um grupo ou contato antes de ativar a campanha.');
+    if (!campaign.groupIds.length) fail('Selecione pelo menos um grupo antes de ativar a campanha.');
     for (const id of campaign.groupIds) {
       const override = campaign.groupOverrides?.[id];
       const items = override?.enabled && Array.isArray(override.items) && override.items.length ? override.items : campaign.items;
@@ -268,8 +422,7 @@ class CommandController {
     const days = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
     const schedule = campaign.schedule || {};
     const groups = campaign.groupIds.map(id => this.store.getGroup(id));
-    const contacts = (campaign.contactIds || []).map(id => this.store.getEntity('contacts',id));
-    const perRound = (groups.length + contacts.length) * (campaign.mode === 'rotate' ? Math.min(1, campaign.items.length) : campaign.items.length);
+    const perRound = groups.length * (campaign.mode === 'rotate' ? Math.min(1, campaign.items.length) : campaign.items.length);
     const [startH, startM] = (schedule.startTime || '00:00').split(':').map(Number);
     const [endH, endM] = (schedule.endTime || '23:59').split(':').map(Number);
     let minutes = endH * 60 + endM - startH * 60 - startM;
@@ -290,7 +443,6 @@ class CommandController {
       `Modo: ${campaign.mode === 'rotate' ? 'próximo item a cada rodada' : 'repetir todos os itens'}\n` +
       `Conteúdos (${campaign.items.length}):\n${contents || '(nenhum)'}\n` +
       `Grupos (${groups.length}):\n${groups.map(group => `${group?.name || '(indisponível)'} — ${group?.id || ''}`).join('\n') || '(nenhum)'}\n` +
-      `Contatos privados (${contacts.length}):\n${contacts.map(contact => `${contact?.name || '(indisponível)'} — ${contact?.phone || ''}`).join('\n') || '(nenhum)'}\n` +
       `Intervalo entre inícios de rodadas: ${campaign.intervalMinutes} min\nEspaçamento entre grupos: ${campaign.spacingSeconds} s\n` +
       `Horário local do computador: ${schedule.startTime}–${schedule.endTime}; ${(schedule.days || []).map(day => days[day]).join(', ')}\n` +
       `Datas: ${schedule.startDate || 'sem início definido'} a ${schedule.endDate || 'sem encerramento definido'}\n` +
@@ -422,7 +574,7 @@ class CommandController {
       '1 Criar campanha\n2 Editar/selecionar campanha\n3 Selecionar/remover grupos e configurar grupo\n' +
       '4 Horários, intervalos e limites\n5 Adicionar texto ou mídia\n6 Ordenar/remover conteúdos\n7 Resultados e falhas\n8 Prévia e ativação\n' +
       `${this.statusProvider ? '9 Estado de filas, monitoramento, alertas e lembretes\n' : ''}` +
-      '0 Encerrar menu\nAnúncio revisável: !mega anuncio varejo pronta entrega | modelo e preço\nResponda com o número. Para retornar de uma etapa: !mega menu.' +
+      '0 Encerrar menu\nResponda com o número. Para retornar de uma etapa: !mega menu.' +
       `${this.automationControl ? '\nEmergência: !mega parar tudo. Reabrir as filas: !mega retomar sistema.' : ''}`;
   }
 
@@ -430,15 +582,6 @@ class CommandController {
     const words = body.trim().split(/\s+/);
     const command = fold(words.shift() || 'menu');
     this._trace(context, 'interpretacao', 'ADMIN_COMMAND_PARSED', `Comando administrativo interpretado: ${['ajuda','menu','cancelar','confirmar','status','campanhas','grupos','parar','criar','editar','previa','pausar','ativar','retomar','intervalo','adicionar-grupo','remover-grupo'].includes(command) ? command : 'não reconhecido'}.`);
-    if(command==='anuncio'){
-      if(!this.commercialService)fail('O módulo de anúncios não está disponível.');this._assert('commerce.list');this._assert('campaign.create');
-      const match=/^(varejo|atacado)\s+(pronta entrega|sob encomenda)\s*\|\s*([\s\S]+)$/i.exec(words.join(' '));
-      if(!match)fail('Use !mega anuncio varejo pronta entrega | iPhone 15 Pro Max 256GB Azul seminovo R$ 3.850,00. Informe somente os fatos conhecidos.');
-      const draft=this.commercialService.createAdDraft({text:match[3],audience:match[1].toLowerCase()==='varejo'?'retail':'wholesale',availability:match[2].toLowerCase()});
-      const campaign=this._newCampaign('Anúncio — '+draft.facts.model);const saved=this.store.saveCampaign({...campaign,audience:draft.audience,items:[{id:randomUUID(),type:'text',text:draft.text}]});
-      this._session(sender,saved);this._audit('commerce.ad.draft',saved.id);
-      return this._reply(context,'📝 *PRÉVIA DO ANÚNCIO*\n\n'+draft.text+'\n\nRascunho salvo: '+saved.id+'\nRevise texto, valor, público e fotos no aplicativo ou com !mega menu. Selecione destinos e peça !mega ativar '+saved.id+'. A ativação exige confirmação; nada foi publicado.');
-    }
     if (command === 'ajuda') return this._reply(context, this._help());
     if (command === 'menu') {
       const old = this.sessions.get(sender);
@@ -462,9 +605,9 @@ class CommandController {
       const connection = ({ connected: 'conectado', disconnected: 'desconectado', connecting: 'conectando', qr: 'aguardando leitura do QR', restricted: 'restrito' })[this.adapter.status?.state] || 'indisponível';
       return this._reply(context, `Conexão: ${connection}\n` +
         `Campanhas: ${campaigns.length}; ativas: ${campaigns.filter(campaign => campaign.state === 'active').length}\n` +
-        `Próximo envio: ${next ? new Date(next).toLocaleString('pt-BR') : 'não programado'}\n` +
+        `Próximo envio: ${next ? new Date(next).toLocaleString('pt-BR', { timeZone: this.store.getSetting('buscasSettings', {})?.timezone || 'America/Sao_Paulo' }) : 'não programado'}\n` +
         `${this.automationControl ? `Automação: ${this.automationControl.isStopped() ? 'INTERROMPIDA — retomada explícita necessária' : 'habilitada'}\n` : ''}` +
-        `${details ? `Filas: ${counts(details.queues || details.queue || details.scheduler)}\nMonitoramento: ${counts(details.monitoring || details.monitor || details.search)}\nAlertas: ${counts(details.alerts)}\nLembretes: ${counts(details.reminders)}\nOportunidades e relatórios: ${counts(details.commerce)}\n` : ''}` +
+        `${details ? `Filas: ${counts(details.queues || details.queue || details.scheduler)}\nMonitoramento: ${counts(details.monitoring || details.monitor || details.search)}\nAlertas: ${counts(details.alerts)}\nLembretes: ${counts(details.reminders)}\n` : ''}` +
         `${this.adapter.status?.mode === 'simulated' ? 'Modo simulado: nenhuma mensagem real é enviada.' : 'O envio requer computador ligado, internet e conexão ativa.'}`);
     }
     if (command === 'campanhas') return this._reply(context, this._campaignList());
@@ -479,7 +622,7 @@ class CommandController {
         const report = await this.automationControl.stop({ actorId: this.actorContext.getStore()?.id || null, source: 'whatsapp' });
         this._audit('automation.stop-all', null, { report });
         const count = value => typeof value === 'number' ? value : Number(value?.cancelled ?? value?.stopped ?? value?.campaigns ?? value?.count) || 0;
-        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\nOportunidades, demandas e relatórios cancelados: ${count(report.commerce)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
+        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
       }
       await this.scheduler.stopAll();
       this._audit('campaign.stop-all');

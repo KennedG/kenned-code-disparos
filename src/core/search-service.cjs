@@ -2,6 +2,9 @@
 
 const { EventEmitter } = require('node:events');
 const { randomUUID, createHash } = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { generateSearchExcel } = require('./search-excel.cjs');
 
 const DEFAULT_SEARCH_SETTINGS = Object.freeze({ enabled: false, prefix: '!busca', maxResults: 10,
   timezone: 'America/Sao_Paulo', monitoredGroupIds: [], commandGroupIds: [], privateCommandsEnabled: true,
@@ -11,7 +14,7 @@ const DEFAULT_SEARCH_SETTINGS = Object.freeze({ enabled: false, prefix: '!busca'
   recipientMode: 'owner', ownerRecipientUserId: null, responsibleRecipientIds: [], allowOriginReplies: false, selfCommandsEnabled: true,
   importHistory: false, userRateLimit: { max: 10, windowSeconds: 60 } });
 const PERMISSIONS = { search: 'search.run', history: 'search.history', filters: 'search.filters', manage: 'search.manage', view: 'search.view' };
-const phone = value => typeof value === 'string' && /^[1-9]\d{9,14}$/.test(value) ? value : null;
+const { normalizePhone:phone } = require('./phone.cjs');
 const page = value => Array.isArray(value) ? value : value?.items || [];
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
 const fail = (message, code = 'SEARCH_INVALID') => { throw Object.assign(new Error(message), { code }); };
@@ -103,8 +106,9 @@ function validateSearchSettings(input, previous = DEFAULT_SEARCH_SETTINGS) {
 }
 
 class SearchService extends EventEmitter {
-  constructor({ store, adapter, authService, scheduler, now = () => Date.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), automationGuard = () => true }) {
+  constructor({ store, adapter, authService, scheduler, now = () => Date.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), automationGuard = () => true, mediaManager }) {
     super(); Object.assign(this, { store, adapter, authService, scheduler, now, sleep, automationGuard });
+    this.mediaManager = mediaManager || new (require('./media.cjs').MediaManager)(store); this.listPreviews = new Map();
     this.started = false; this.closed = false; this.paused = false; this.capturePump = null; this.deliveryPump = null;
     this.waitingCommands = 0; this.commandTail = Promise.resolve(); this.rateLimits = new Map(); this.cleanupTokens = new Map();
     this.monitor = store.getSetting('buscasMonitor', { startedAt: null, lastCaptureAt: null, lastSyncAt: null, lastHeartbeatAt: null, openGap: null });
@@ -133,12 +137,12 @@ class SearchService extends EventEmitter {
   _audit(action, actorId, details = {}) { this.store.addAudit?.({ id: randomUUID(), at: this.now(), actorId: actorId || null, action, details }); }
   _diagnostic(code, description, error) { this.store.addDiagnostic?.({ id: randomUUID(), at: this.now(), stage: 'buscas', code, description, action: 'Consulte BUSCAS e reveja a captura ou o resultado incerto.', guidance: 'Verifique conexão, grupos selecionados e permissões. Ofertas ambíguas não entram no ranking.', attempts: 0, detail: error?.code || null }); }
   _trace(traceId, stage, details = {}) {
-    const descriptions = { received: 'Comando recebido.', authorization: 'Autorização do comando verificada.', parsed: 'Comando interpretado.', results: 'Consulta de ofertas concluída.', recipient: 'Destinatário da busca definido.', queued: 'Resposta colocada na fila persistente.', submitted: 'Resposta submetida à integração.', integration: 'Resultado da integração recebido.', rejected: 'Comando ignorado.', failure: 'Falha no processamento da busca.', retry: 'Nova tentativa de entrega solicitada.' };
+    const descriptions = { received: 'Comando recebido.', authorization: 'Autorização do comando verificada.', parsed: 'Comando interpretado.', results: 'Consulta de ofertas concluída.', recipient: 'Destinatário da busca definido.', queued: 'Resposta colocada na fila persistente.', submitted: 'Resposta submetida à integração.', integration: 'Resultado da integração recebido.', rejected: 'Comando ignorado.', failure: 'Falha no processamento da busca.', retry: 'Nova tentativa de entrega solicitada.', export: 'Geração do arquivo Excel.' };
     const explanations = { conversation_not_enabled: 'Comando privado bloqueado pelas configurações de conversas habilitadas. Confira BUSCAS → Configurações: aceitar comandos privados e a lista opcional de números.', sender_not_authorized: 'O número real do remetente não possui autorização de busca e permissões correspondentes.', sender_identity_unavailable: 'O WhatsApp não forneceu identidade e telefone confiáveis suficientes para autorizar o comando.', module_disabled_or_paused: 'O módulo BUSCAS está desativado ou pausado.', old_or_missing_timestamp: 'O comando é antigo ou não possui data original confiável; foi ignorado para evitar repetição.', duplicate_message: 'Este comando já foi processado; nenhuma resposta duplicada foi criada.' };
-    this.store.addDiagnostic?.({ id: randomUUID(), at: this.now(), traceId, stage: `buscas.${stage}`, code: details.code || `SEARCH_${stage.toUpperCase()}`, description: explanations[details.reason] || descriptions[stage] || 'Etapa do processamento de BUSCAS.', actorId: details.actorId || null, action: details.action || 'Consulte o histórico de BUSCAS para acompanhar a entrega.', attempts: details.attempts || 0, detail: Object.fromEntries(Object.entries(details).filter(([key]) => ['reason', 'approved', 'resultCount', 'deliveryId', 'recipientId', 'target', 'status', 'messageId', 'source', 'confirmationScope'].includes(key))) });
+    this.store.addDiagnostic?.({ id: randomUUID(), at: this.now(), traceId, stage: `buscas.${stage}`, code: details.code || `SEARCH_${stage.toUpperCase()}`, description: details.explanation && boundedText(details.explanation, 512) ? details.explanation : explanations[details.reason] || descriptions[stage] || 'Etapa do processamento de BUSCAS.', actorId: details.actorId || null, level: ['failure'].includes(stage) || details.status === 'failed' || details.status === 'uncertain' ? 'error' : stage === 'rejected' ? 'warning' : 'info', action: details.action || 'Consulte o histórico de BUSCAS para acompanhar a entrega.', attempts: details.attempts || 0, detail: Object.fromEntries(Object.entries(details).filter(([key]) => ['reason', 'approved', 'resultCount', 'deliveryId', 'recipientId', 'target', 'status', 'messageId', 'source', 'confirmationScope'].includes(key))) });
   }
   _safeError(error) {
-    const messages = { SEARCH_RECIPIENT_MISSING: 'Nenhum destinatário válido está configurado', SEARCH_OWNER_RECIPIENT_INVALID: 'O dono selecionado está inativo ou sem telefone válido', SEARCH_RATE_LIMIT: 'Limite de buscas atingido; aguarde antes de tentar novamente', SEARCH_DENIED: 'A autorização para buscar foi removida', SEARCH_DISABLED: 'O módulo BUSCAS está desativado', SEARCH_MODE_CHANGED: 'O modo de operação mudou durante a busca; pesquise novamente', RECIPIENT_NOT_REGISTERED: 'O destinatário não foi encontrado no WhatsApp', PRIVATE_RECIPIENT_INVALID: 'Telefone do destinatário inválido; confira código do país e DDD', DISCONNECTED: 'O WhatsApp está desconectado', SEARCH_TARGET_DISABLED: 'O destinatário ou a autorização mudou antes do envio; nenhuma mensagem foi enviada', SEARCH_RESULT_UNCERTAIN: 'Não foi possível confirmar a entrega; revise o histórico antes de repetir', AUTOMATION_STOPPED: 'Os envios automáticos foram interrompidos; retome explicitamente para enviar novamente', SEARCH_INVALID: 'Os filtros ou a configuração da busca são inválidos' };
+    const messages = { SEARCH_RECIPIENT_MISSING: 'Nenhum destinatário válido está configurado', SEARCH_OWNER_RECIPIENT_INVALID: 'O dono selecionado está inativo ou sem telefone válido', SEARCH_RATE_LIMIT: 'Limite de buscas atingido; aguarde antes de tentar novamente', SEARCH_DENIED: 'A autorização para buscar foi removida', SEARCH_DISABLED: 'O módulo BUSCAS está desativado', SEARCH_MODE_CHANGED: 'O modo de operação mudou durante a busca; pesquise novamente', RECIPIENT_NOT_REGISTERED: 'O destinatário não foi encontrado no WhatsApp', PRIVATE_RECIPIENT_INVALID: 'Telefone do destinatário inválido; confira código do país e DDD', DISCONNECTED: 'O WhatsApp está desconectado', SEARCH_TARGET_DISABLED: 'O destinatário ou a autorização mudou antes do envio; nenhuma mensagem foi enviada', SEARCH_RESULT_UNCERTAIN: 'Não foi possível confirmar a entrega; revise o histórico antes de repetir', AUTOMATION_STOPPED: 'Os envios automáticos foram interrompidos; retome explicitamente para enviar novamente', WA_MEDIA_MISSING: 'O documento da biblioteca não está disponível; gere o Excel novamente', WA_MEDIA_INVALID: 'O arquivo gerenciado não é um documento válido', WA_MEDIA_READ: 'Não foi possível ler o documento gerenciado; confira acesso à pasta de dados', WA_MEDIA_CHANGED: 'O arquivo gerenciado foi alterado; gere o Excel novamente antes de enviar', WA_MEDIA_SIZE: 'O documento está vazio ou excede o limite de 64 MB', WA_MEDIA_PATH: 'O documento não pertence à pasta gerenciada; gere o Excel novamente', WA_CAPTION_INVALID: 'A legenda do documento excede o tamanho permitido', SEARCH_INVALID: 'Os filtros ou a configuração da busca são inválidos' };
     Object.assign(messages, { WA_RECIPIENT_INVALID: 'Telefone inválido; confira código do país, DDD e número', WA_RECIPIENT_OFFLINE: 'O WhatsApp está desconectado; o envio permanece pendente', WA_RECIPIENT_NOT_FOUND: 'O número configurado não foi encontrado no WhatsApp', WA_RECIPIENT_AMBIGUOUS: 'O WhatsApp retornou mais de um destinatário; revise o telefone', WA_RECIPIENT_MISMATCH: 'O telefone resolvido difere do cadastrado; revise o destinatário', WA_RECIPIENT_INVALID_JID: 'O WhatsApp retornou um identificador de destinatário inválido', WA_RECIPIENT_NUMBER_UNAVAILABLE: 'Cadastre o telefone real do destinatário com código do país e DDD', WA_RECIPIENT_UNSUPPORTED: 'A integração instalada não disponibiliza a validação do destinatário; atualize o aplicativo', WA_RECIPIENT_TIMEOUT: 'O WhatsApp não respondeu à validação do telefone; será feita uma tentativa limitada', WA_RECIPIENT_CONNECTION_CHANGED: 'A conexão mudou durante a validação; nenhuma mensagem foi enviada', WA_RECIPIENT_LOOKUP_INCOMPLETE: 'O WhatsApp não confirmou o destinatário; nenhuma mensagem foi enviada', WA_RECIPIENT_LOOKUP_TEMPORARY: 'Falha temporária na validação do telefone; será feita uma tentativa limitada', WA_RECIPIENT_LOOKUP_REJECTED: 'O WhatsApp recusou a validação do telefone; verifique a conexão e restrições', WA_RECIPIENT_BUSY: 'A fila de validação de destinatários está ocupada; aguarde uma nova tentativa', WA_REPLY_CONTEXT_INVALID: 'A conversa não possui prova válida do comando privado; envie o comando novamente pela conversa autorizada', WA_REPLY_RECIPIENT_MISMATCH: 'O destino da resposta difere do remetente autenticado; nenhuma mensagem foi enviada' });
     return messages[error?.code] || 'Não foi possível concluir a busca ou confirmar sua entrega';
   }
@@ -147,19 +151,19 @@ class SearchService extends EventEmitter {
   _closeGap(at = this.now()) { if (!this.monitor.openGap) return; this.store.recordSearchGap?.({ ...this.monitor.openGap, endedAt: at, complete: false }); this.monitor.openGap = null; this._persistMonitor(); }
   _attach(adapter) { for (const [name, listener] of Object.entries(this.listeners)) adapter?.on(name, listener); }
   _detach(adapter) { for (const [name, listener] of Object.entries(this.listeners)) adapter?.off(name, listener); }
-  _configure() { const s = this._settings(); this.groups = new Map(this.store.listGroups().map(group => [group.id, group])); this.adapter?.configureSearchCapture?.({ enabled: s.enabled && !this.paused, importHistory: s.importHistory, groupIds: s.monitoredGroupIds, commandGroupIds: s.commandGroupIds }); }
+  _configure() { const s = this._settings(); this.groups = new Map(this.store.listGroups().map(group => [group.id, group])); this.adapter?.configureSearchCapture?.({ enabled: s.enabled && !this.paused, importHistory: s.importHistory, groupIds: s.monitoredGroupIds, commandGroupIds: s.commandGroupIds, commandPrefix: s.prefix }); }
   refreshGroups() { this._configure(); this.emit('change'); }
   start() {
     if (this.started || this.closed) return; this.started = true; this._attach(this.adapter);
     const s = this._settings(); if (s.enabled && this.monitor.lastHeartbeatAt && this.now() > this.monitor.lastHeartbeatAt + 1000) this.store.recordSearchGap?.({ id: randomUUID(), startedAt: this.monitor.lastHeartbeatAt, endedAt: this.now(), reason: 'application_not_running', complete: false });
     if (s.enabled && !this.monitor.startedAt) this.monitor.startedAt = this.now();
     this.monitor.lastHeartbeatAt = this.now(); this._persistMonitor();
-    for (const delivery of page(this.store.listSearchDeliveries?.({ status: 'sending', limit: 500 }))) this.store.updateSearchDelivery(delivery.id, { status: 'uncertain', resultAt: this.now(), error: 'Envio interrompido; revisão necessária antes de repetir.' });
+    let interrupted; do { interrupted = page(this.store.listSearchDeliveries?.({ status: 'sending', limit: 500 })); for (const delivery of interrupted) this.store.updateSearchDelivery(delivery.id, { status: 'uncertain', resultAt: this.now(), code: 'SEARCH_RESTART_UNCERTAIN', safeToRetry: false, error: 'Envio interrompido; revisão necessária antes de repetir.' }); } while (interrupted.length);
     this._configure(); this._onStatus(this.adapter?.status || { state: 'disconnected' }); this._drain();
     this.timer = setInterval(() => { if (this.closed) return; try { this.monitor.lastHeartbeatAt = this.now(); this._persistMonitor(); this.store.applySearchRetention?.({ days: this._settings().retentionDays, at: this.now() }); this._drain(); this._flushInBackground(); } catch (e) { this._diagnostic('SEARCH_MAINTENANCE_ERROR', 'Falha na manutenção da captura.', e); } }, 30_000); this.timer.unref?.();
   }
   async shutdown() { if (this.closed) return; this.closed = true; clearInterval(this.timer); this._detach(this.adapter); await this.capturePump?.catch(() => {}); await this.commandTail.catch(() => {}); await this.deliveryPump?.catch(() => {}); this.monitor.lastHeartbeatAt = this.now(); this._persistMonitor(); }
-  setAdapter(adapter) { this._detach(this.adapter); this.adapter = adapter; this.monitor = this.store.getSetting('buscasMonitor', { startedAt: null, lastCaptureAt: null, lastSyncAt: null, lastHeartbeatAt: null, openGap: null }); this.rateLimits.clear(); this.cleanupTokens.clear(); if (this.started && !this.closed) this._attach(adapter); this._configure(); this._onStatus(adapter?.status || { state: 'disconnected' }); }
+  setAdapter(adapter) { this._detach(this.adapter); this.adapter = adapter; this.monitor = this.store.getSetting('buscasMonitor', { startedAt: null, lastCaptureAt: null, lastSyncAt: null, lastHeartbeatAt: null, openGap: null }); this.rateLimits.clear(); this.cleanupTokens.clear(); this.listPreviews.clear(); if (this.started && !this.closed) this._attach(adapter); this._configure(); this._onStatus(adapter?.status || { state: 'disconnected' }); }
   async suspendCapture(reason = 'maintenance') { this.paused = true; if (this._settings().enabled) this._openGap(reason); this._configure(); await this.capturePump?.catch(() => {}); await this.commandTail.catch(() => {}); await this.deliveryPump?.catch(() => {}); }
   resumeCapture() { this.paused = false; this._configure(); this._onStatus(this.adapter?.status || { state: 'disconnected' }); this._drain(); }
   async _waitCaptureIdle() { while (!this.closed && !this.paused) { const running = this._drain(); if (running) await running; if (!page(this.store.listSearchInbox({ status: 'queued', limit: 1 })).length) break; } }
@@ -168,6 +172,7 @@ class SearchService extends EventEmitter {
   getState(actorId) {
     this.groups = new Map(this.store.listGroups().map(group => [group.id, group]));
     const permissions = Object.fromEntries(Object.keys(PERMISSIONS).map(p => [p, this._can(actorId, p)]));
+    permissions.export = permissions.search && permissions.view; permissions.send = permissions.export && permissions.manage;
     if (!Object.values(permissions).some(Boolean)) return { authorized: false, permissions, enabled: false };
     const settings = this._settings(), stats = this.store.getSearchMonitorStats?.() || {};
     const publicSettings = permissions.manage ? settings : { ...settings, commandPrivateNumbers: [], ownerRecipientUserId: null, responsibleRecipientIds: [], blockedSupplierIds: [] };
@@ -281,15 +286,16 @@ class SearchService extends EventEmitter {
     if (!ctx || ctx.dataOnly === true || ctx.type !== 'text' || ctx.forwarded !== false || ctx.history === true || ctx.historical === true || ctx.isHistory === true || ctx.machineGenerated === true || ctx.automaticMessage === true) return false;
     const text = typeof ctx.text === 'string' ? ctx.text.trim() : '', lower = text.toLocaleLowerCase('pt-BR'), prefix = settings.prefix.toLocaleLowerCase('pt-BR');
     if (!lower.startsWith(prefix) || text.length > prefix.length && !/\s/.test(text[prefix.length])) return false;
-    const traceId = randomUUID(); this._trace(traceId, 'received', { messageId: ctx.messageId, source: ctx.fromMe ? 'manual-own-account' : 'incoming' });
-    const reject = reason => { this._trace(traceId, 'rejected', { reason, approved: false }); return false; };
+    const traceId = typeof ctx.traceId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(ctx.traceId) ? ctx.traceId : randomUUID(); this._trace(traceId, 'received', { messageId: ctx.messageId, source: ctx.fromMe ? 'manual-own-account' : 'incoming' });
+    const reject = (reason, code, explanation) => { this._trace(traceId, 'rejected', { reason, code, explanation, approved: false }); return false; };
     if (!settings.enabled || this.paused) return reject('module_disabled_or_paused');
     if (!this._modeMatches(ctx)) return reject('integration_mode_mismatch');
     const own = this._trustedSelf(ctx);
     if (ctx.fromMe !== false && !own) return reject('untrusted_own_account_message');
     if (!(ctx.identityVerified === true || ctx.verified === true) || !phone(ctx.senderNumber) || !boundedText(ctx.messageId, 512) || !ctx.messageId) return reject('sender_identity_unavailable');
-    const actor = this.authService.findAuthorizedPhone(ctx.senderNumber);
-    if (!actor || !this._can(actor.id, 'search') || own && !this._user(actor.id)?.isOwner) return reject('sender_not_authorized');
+    const senderResolution = this.authService.resolveWhatsAppActor?.(ctx), actor = senderResolution ? senderResolution.user : this.authService.findAuthorizedPhone(ctx.senderNumber);
+    if (!actor) return reject('sender_not_authorized', senderResolution?.code, senderResolution?.reason);
+    if (!this._can(actor.id, 'search') || own && !this._user(actor.id)?.isOwner) return reject('sender_not_authorized', 'SEARCH_DENIED');
     if (!this._commandLocation(ctx, settings, own)) return reject('conversation_not_enabled');
     this._trace(traceId, 'authorization', { actorId: actor.id, approved: true });
     const timestamp = milliseconds(ctx.timestamp); if (!timestamp || timestamp < this.now() - 300_000 || timestamp > this.now() + 60_000) return reject('old_or_missing_timestamp');
@@ -298,11 +304,11 @@ class SearchService extends EventEmitter {
     const operation = this.commandTail.then(async () => {
       const current = this._settings();
       if (capturedMode !== this._mode() || !this._can(actor.id, 'search') || !current.enabled || this.paused || this.closed || current.prefix.toLocaleLowerCase('pt-BR') !== prefix || !this._commandLocation(ctx, current, own)) return reject('authorization_or_settings_changed');
-      const claim = this.store.claimSearchRun({ id: randomUUID(), traceId, chatId: ctx.chatId, messageId: ctx.messageId, actorId: actor.id, requestedAt: this.now(), originalAt: timestamp, source: own ? 'whatsapp-self' : ctx.isGroup ? 'whatsapp-group' : 'whatsapp-private', query: text.slice(prefix.length).trim(), status: 'queued', storageMode: capturedMode });
+      const claim = this.store.claimSearchRun({ id: randomUUID(), traceId, chatId: ctx.chatId, messageId: ctx.messageId, actorId: actor.id, requestedAt: this.now(), originalAt: timestamp, source: own ? 'whatsapp-self' : ctx.isGroup ? 'whatsapp-group' : 'whatsapp-private', query: parseSearchCommand(text.slice(prefix.length).trim()).query, outputFormat: parseSearchCommand(text.slice(prefix.length).trim()).format, status: 'queued', storageMode: capturedMode });
       if (!claim.claimed) return reject('duplicate_message');
       const run = claim.run; this._trace(traceId, 'parsed', { actorId: actor.id });
       if (!this._consumeRate(actor.id)) { this.store.saveSearchRun({ ...run, status: 'rate_limited', resultCount: 0, completedAt: this.now() }); this._trace(traceId, 'failure', { actorId: actor.id, code: 'SEARCH_RATE_LIMIT' }); await this._queueFailureNotice(run, ctx, Object.assign(new Error(), { code: 'SEARCH_RATE_LIMIT' })); return false; }
-      try { await this._execute(run.query, {}, actor.id, { run, context: ctx, deliver: true, rateChecked: true }); }
+      try { await this._execute(run.query, {}, actor.id, { run, context: ctx, deliver: true, outputFormat: run.outputFormat || 'text', rateChecked: true }); }
       catch (error) { await this._queueFailureNotice(run, ctx, error); }
       return true;
     }).finally(() => { this.waitingCommands--; }); this.commandTail = operation.catch(() => {}); return operation;
@@ -324,8 +330,8 @@ class SearchService extends EventEmitter {
     const customFrom = settings.customFrom ? parseZonedTime(settings.customFrom, settings.timezone) : null;
     const period = { from: customFrom === null ? ageFrom : ageFrom === null ? customFrom : Math.max(customFrom, ageFrom), to: settings.customTo ? parseZonedTime(settings.customTo, settings.timezone) : this.now(), maxAgeMinutes: ageMinutes }; 
     const stale = this.adapter?.status?.state !== 'connected' || !!this.monitor.openGap;
-    let results = [], parsedFilters = {}, guidance = null;
-    if (!query) guidance = `Use ${settings.prefix} iPhone 18 Pro Max 256GB Silver para buscar ofertas capturadas.`;
+    let results = [], allResults = [], parsedFilters = {}, effectiveFilters = {}, persistedQueryFilters = null, guidance = null;
+    if (!query) guidance = `Use ${settings.prefix} iPhone 18 Pro Max 256GB Silver para buscar ofertas capturadas.\nPara Excel: ${settings.prefix} --excel iPhone 15 Pro Max 256GB\nPara texto e Excel: ${settings.prefix} --ambos iPhone 15 Pro Max 256GB`; 
     else {
       const { parseQuery, rankOffers, normalize } = require('./search-parser.cjs'); parsedFilters = parseQuery(query, { aliases: settings.aliases });
       if (parsedFilters.valid === false || parsedFilters.unknownTokens?.length || !parsedFilters.modelKey) guidance = parsedFilters.errors?.[0] || 'Informe o modelo e a versão exatos do aparelho. Exemplo: iPhone 18 Pro Max 256GB Silver.';
@@ -338,43 +344,193 @@ class SearchService extends EventEmitter {
         const queryFilters = { ...effective, minBattery: effective.batteryMin, maxBattery: effective.batteryMax, minPriceCents: effective.priceMinCents, maxPriceCents: effective.priceMaxCents, priceKind: settings.priceCriterion === 'announced' ? undefined : settings.priceCriterion, order: settings.sort === 'recent' ? 'recent' : settings.sort === 'cashDescending' ? 'price-desc' : 'price', onePerSupplier: settings.onePerSupplier, from: period.from, to: period.to, excludedSupplierKeys: settings.blockedSupplierIds, excludedGroupIds: settings.blockedGroupIds, confidence: 'confirmed', latest: true, limit: 500, offset: 0, includeReview: false, includeUnavailable: false };
         const requestedGroups = effective.groupIds || (effective.groupId ? [effective.groupId] : null);
         queryFilters.groupIds = requestedGroups ? settings.monitoredGroupIds.filter(id => requestedGroups.includes(id)) : settings.monitoredGroupIds;
-        delete queryFilters.valid; delete queryFilters.reason;
-        const candidates = page(this.store.querySearchOffers(queryFilters));
-        results = rankOffers(candidates, effective, { priceCriterion: settings.priceCriterion, candidateLimit: 500, maxResults: 10, onePerSupplier: false, blockedSuppliers: settings.blockedSupplierIds, blockedGroups: settings.blockedGroupIds }); const seenSuppliers = new Set();
-        const order = settings.sort === 'recent' ? (a, b) => b.messageAt - a.messageAt : settings.sort === 'cashDescending' ? (a, b) => b.priceCents - a.priceCents : (a, b) => a.priceCents - b.priceCents || b.messageAt - a.messageAt;
-        results.sort(order); if (settings.onePerSupplier) results = results.filter(offer => { if (seenSuppliers.has(offer.supplierKey)) return false; seenSuppliers.add(offer.supplierKey); return true; }); results = results.slice(0, settings.maxResults);
+        delete queryFilters.valid; delete queryFilters.reason; effectiveFilters = effective; persistedQueryFilters = queryFilters;
+        allResults = await this._collectMatches(queryFilters, effective, settings, actorId);
+        results = allResults.slice(0, settings.maxResults);
       }
     }
     const warnings = ['A base inclui somente mensagens capturadas; o histórico pode conter lacunas.']; if (stale) warnings.unshift('⚠️ Captura desatualizada ou interrompida. Valores podem não refletir anúncios recentes.');
     if (results.some(o => o.forwarded)) warnings.push('Encaminhamentos: o remetente é quem republicou; o fornecedor original pode ser desconhecido.');
-    const answer = { runId: run.id, traceId: run.traceId || run.id, query, results, count: results.length, period, order: settings.sort, timezone: settings.timezone, stale, warnings, guidance, filters: parsedFilters, delivery: [] };
-    this.store.saveSearchRun({ ...run, query, status: 'completed', resultCount: results.length, resultOfferIds: results.map(o => o.id), filters: parsedFilters, period, warnings, completedAt: this.now() });
+    const answer = { runId: run.id, traceId: run.traceId || run.id, query, results, count: results.length, totalCount: allResults.length, period, order: settings.sort, timezone: settings.timezone, stale, warnings, guidance, filters: effectiveFilters.modelKey ? effectiveFilters : parsedFilters, delivery: [] };
+    this.store.saveSearchRun({ ...run, query, status: 'completed', resultCount: results.length, totalCount: allResults.length, resultOfferIds: results.map(o => o.id), filters: effectiveFilters.modelKey ? effectiveFilters : parsedFilters, queryFilters: persistedQueryFilters, resultSettings: { sort: settings.sort, maxResults: settings.maxResults, priceCriterion: settings.priceCriterion, onePerSupplier: settings.onePerSupplier, blockedSupplierIds: settings.blockedSupplierIds, blockedGroupIds: settings.blockedGroupIds, timezone: settings.timezone }, period, warnings, completedAt: this.now() });
     this._trace(run.traceId || run.id, 'results', { actorId, resultCount: results.length });
     this._audit('search.executed', actorId, { runId: run.id, source: run.source, resultCount: results.length });
     if (options.deliver) {
-      const targets = this._targets(settings, actorId, options.context); const chunks = formatSearchResults(answer, settings);
+      const targets = this._targets(settings, actorId, options.context), outputFormat = options.outputFormat || 'text';
       if (!targets.length) fail('Nenhum destinatário autorizado com telefone válido está configurado.', 'SEARCH_RECIPIENT_MISSING');
-      for (const target of targets) for (const [index, text] of chunks.entries()) this._queueDelivery({ id: `${run.id}:${hash(target).slice(0, 16)}:${index}`, run, actorId, target, text, recipientMode: settings.recipientMode, context: options.context });
+      // Empty/invalid queries and no-match searches always receive useful text,
+      // including when an Excel output flag was requested.
+      const chunks = outputFormat !== 'excel' || answer.guidance || !allResults.length ? formatSearchResults(answer, settings) : [];
+      let document = null;
+      if (['excel', 'both'].includes(outputFormat) && !answer.guidance && allResults.length) document = await this._createExcel(results, this.store.getSearchRun(run.id), 'command', actorId);
+      for (const target of targets) {
+        for (const [index, text] of chunks.entries()) this._queueDelivery({ id: `${run.id}:${hash(target).slice(0, 16)}:${index}`, run, actorId, target, text, recipientMode: settings.recipientMode, context: options.context });
+        if (document) this._queueDelivery({ id: `${run.id}:${hash(target).slice(0, 16)}:excel`, run, actorId, target, text: this._excelCaption(run.query, document.count, run.traceId || run.id), document, recipientMode: settings.recipientMode, context: options.context });
+      }
       if (options.asyncDelivery) this._flushInBackground(); else await this.flushDeliveries(); answer.delivery = page(this.store.listSearchDeliveries({ runId: run.id, limit: 100 })).map(delivery => this._deliveryView(delivery));
     }
     this.emit('change'); return answer;
     } catch (error) { this.store.saveSearchRun({ ...this.store.getSearchRun(run.id), status: 'failed', code: error.code || 'SEARCH_QUERY_ERROR', error: this._safeError(error), completedAt: this.now() }); this._trace(run.traceId || run.id, 'failure', { actorId, code: error.code || 'SEARCH_QUERY_ERROR', reason: this._safeError(error) }); this._diagnostic(error.code || 'SEARCH_QUERY_ERROR', this._safeError(error), error); this.emit('change'); throw error; }
   }
-  _queueDelivery({ id, run, actorId, target, text, recipientMode, context, recipientId, test = false, errorNotice = false }) {
+  async _collectMatches(queryFilters, effective, settings, actorId) {
+    const mode = this._mode(), candidates = []; let offset = 0;
+    do {
+      this._assert(actorId, 'search'); if (mode !== this._mode()) fail('O modo de operação mudou durante a busca.', 'SEARCH_MODE_CHANGED');
+      const records = this.store.querySearchOffers({ ...queryFilters, limit: 500, offset });
+      for (const offer of page(records)) { const compact = { ...offer }; delete compact.originalText; compact.snippet = String(offer.snippet || offer.originalExcerpt || offer.notes || '').slice(0, 1800); compact.originalExcerpt = compact.snippet; if (compact.notes) compact.notes = String(compact.notes).slice(0, 1800); candidates.push(compact); }
+      offset += page(records).length; if (!page(records).length || offset >= records.total) break;
+      await new Promise(resolve => setImmediate(resolve));
+    } while (!this.closed);
+    this._assert(actorId, 'search'); if (this.closed || mode !== this._mode()) fail('O modo de operação mudou durante a busca.', 'SEARCH_MODE_CHANGED');
+    const { rankOffers } = require('./search-parser.cjs');
+    let matches = rankOffers(candidates, effective, { allResults: true, priceCriterion: settings.priceCriterion, onePerSupplier: false, blockedSuppliers: settings.blockedSupplierIds || [], blockedGroups: settings.blockedGroupIds || [] });
+    const order = settings.sort === 'recent' ? (a, b) => b.messageAt - a.messageAt : settings.sort === 'cashDescending' ? (a, b) => b.priceCents - a.priceCents || b.messageAt - a.messageAt : (a, b) => a.priceCents - b.priceCents || b.messageAt - a.messageAt;
+    matches.sort(order);
+    if (settings.onePerSupplier) { const seen = new Set(); matches = matches.filter(offer => { const key = offer.supplierKey || offer.id; if (seen.has(key)) return false; seen.add(key); return true; }); }
+    return matches;
+  }
+  async _resolveListRun(payload, actorId) {
+    this._assert(actorId, 'search'); this._assert(actorId, 'view');
+    if (!this._settings().enabled) fail('Ative BUSCAS antes de exportar ou enviar uma lista.', 'SEARCH_DISABLED');
+    let run = payload?.runId && this.store.getSearchRun(payload.runId);
+    if (!run && payload?.runId) fail('A pesquisa não está disponível neste modo. Pesquise novamente.', 'SEARCH_RUN_MISSING');
+    if (!run) { const answer = await this.executeSearch({ query: payload?.query || '', filters: payload?.filters || {} }, actorId); run = this.store.getSearchRun(answer.runId); }
+    if (run.actorId !== actorId && !this._user(actorId)?.isOwner) fail('Você não pode acessar os resultados de outra pessoa.', 'SEARCH_DENIED');
+    if (run.storageMode !== this._mode() || run.status !== 'completed') fail('A pesquisa não está concluída no modo atual. Pesquise novamente.', 'SEARCH_RUN_MISSING');
+    if (!run.queryFilters || !run.filters?.modelKey) fail('Informe um modelo válido e execute a busca antes de exportar.', 'SEARCH_QUERY_REQUIRED');
+    return run;
+  }
+  async _offersForRun(run, actorId, payload = {}) {
+    const matches = await this._collectMatches(run.queryFilters, run.filters, run.resultSettings || this._settings(), actorId), selection = payload.selection || 'all';
+    if (!['selected', 'all'].includes(selection)) fail('Escolha ofertas selecionadas ou todos os resultados filtrados.');
+    if (selection === 'all') return matches;
+    const ids = strings(payload.offerIds || [], 100_000); if (!ids.length) fail('Selecione ao menos uma oferta para exportar ou enviar.', 'SEARCH_SELECTION_EMPTY');
+    const selected = new Set(ids), offers = matches.filter(offer => selected.has(offer.id));
+    if (offers.length !== ids.length) fail('Uma oferta selecionada foi alterada, removida ou não corresponde aos filtros. Atualize a pesquisa e selecione novamente.', 'SEARCH_SELECTION_CHANGED');
+    return offers;
+  }
+  async resultPage(payload, actorId) {
+    const run = await this._resolveListRun(payload, actorId), offers = await this._offersForRun(run, actorId), offset = safeNumber(payload.offset ?? 0, 0, 10_000_000, 'Página'), limit = safeNumber(payload.limit ?? 50, 1, 100, 'Limite da página');
+    return { runId: run.id, items: offers.slice(offset, offset + limit), total: offers.length, offset, limit, query: run.query, filters: run.filters, period: run.period, order: run.resultSettings?.sort || 'cashAscending' };
+  }
+  _excelCaption(query, count, traceId) { return `🔎 Kenned Code Disparos — lista de ofertas\n📱 ${String(query || '').slice(0, 500)}\n📊 ${count} oferta${count === 1 ? '' : 's'}\n📎 Excel com filtros e horários originais.\nValores conforme anúncios capturados. Confirme disponibilidade e condições com o fornecedor.\nRastreamento: ${traceId}`; }
+  async _createExcel(offers, run, selection, actorId) {
+    const mode = this._mode(); this._assert(actorId, 'search');
+    this._trace(run.traceId || run.id, 'export', { actorId, resultCount: offers.length, status: 'processing' });
+    const metadata = { query: run.query, filters: run.filters, period: run.period, order: run.resultSettings?.sort || this._settings().sort, timezone: run.resultSettings?.timezone || this._settings().timezone, generatedAt: this.now(), selection, resultLimit: selection === 'command' ? run.resultSettings?.maxResults || this._settings().maxResults : null, traceId: run.traceId || run.id, warnings: run.warnings || [] };
+    let output, target;
+    try {
+      output = await generateSearchExcel({ offers, directory: path.join(this.store.dir, 'exports', mode), metadata });
+      this._assert(actorId, 'search'); if (mode !== this._mode()) fail('O modo de operação mudou durante a exportação.', 'SEARCH_MODE_CHANGED');
+      const mediaId = randomUUID(); target = path.join(this.mediaManager.dir, `${mediaId}.xlsx`); await fs.promises.rename(output.path, target);
+      this._assert(actorId, 'search'); if (mode !== this._mode()) fail('O modo de operação mudou durante a exportação.', 'SEARCH_MODE_CHANGED');
+      const media = this.store.saveMedia({ id: mediaId, name: output.name, path: target, type: 'document', mime: output.mime, size: output.size, sha256: output.sha256, createdAt: this.now(), generatedBy: 'search-excel', sourceRunId: run.id });
+      this._audit('search.excel_generated', actorId, { runId: run.id, count: offers.length, selection, mediaId });
+      this._trace(run.traceId || run.id, 'export', { actorId, resultCount: offers.length, status: 'completed' });
+      return { ...media, count: offers.length, generatedAt: metadata.generatedAt, exportId: output.id };
+    } catch (error) { if (output?.path) await fs.promises.unlink(output.path).catch(() => {}); if (target) await fs.promises.unlink(target).catch(() => {}); this._trace(run.traceId || run.id, 'failure', { actorId, code: error.code || 'SEARCH_EXCEL_ERROR', reason: 'Falha na geração persistente do Excel; nenhum documento foi enviado.' }); this._diagnostic(error.code || 'SEARCH_EXCEL_ERROR', 'Falha na geração do Excel. Nenhum sucesso foi informado.', error); throw error; }
+  }
+  assertExportPermission(actorId, expectedMode) {
+    this._assert(actorId, 'search'); this._assert(actorId, 'view');
+    if (!this._settings().enabled) fail('O módulo BUSCAS foi desativado. Ative-o antes de exportar.', 'SEARCH_DISABLED');
+    if (expectedMode && expectedMode !== this._mode()) fail('O modo de operação mudou durante a exportação.', 'SEARCH_MODE_CHANGED');
+    return { actorId, storageMode: this._mode() };
+  }
+  async exportSearchExcel(payload, actorId) {
+    this.assertExportPermission(actorId);
+    const run = await this._resolveListRun(payload, actorId), offers = await this._offersForRun(run, actorId, payload);
+    return this._createExcel(offers, run, payload.selection || 'all', actorId);
+  }
+  _listRecipients(ids) {
+    ids = strings(ids || [], 100); if (!ids.length) fail('Selecione ao menos um responsável autorizado.', 'SEARCH_RECIPIENT_MISSING');
+    const seen = new Set(); return ids.map(id => {
+      const number = this._recipientById(id); if (!number) fail('Um responsável está desativado ou sem telefone real com código do país e DDD.', 'SEARCH_RECIPIENT_MISSING');
+      if (seen.has(number)) fail('O mesmo telefone foi selecionado em cadastros diferentes. Selecione somente um registro por número.', 'SEARCH_RECIPIENT_DUPLICATE'); seen.add(number);
+      const record = id.startsWith('user:') ? this._user(id.slice(5)) : this.store.getAlertRecipient?.(id) || this.store.getEntity('alert_recipients', id);
+      return { id, name: record.name || '', phone: number };
+    });
+  }
+  _listAnswer(run, offers) { return { runId: run.id, traceId: run.traceId || run.id, query: run.query, results: offers, count: offers.length, period: run.period, order: run.resultSettings?.sort, timezone: run.resultSettings?.timezone, warnings: run.warnings || [], guidance: null }; }
+  _offersSignature(offers) { return hash(JSON.stringify(offers)); }
+  async previewSearchList(payload, actorId) {
+    this._assert(actorId, 'manage'); const run = await this._resolveListRun(payload, actorId), offers = await this._offersForRun(run, actorId, payload), format = payload.format || 'text';
+    if (!['text', 'excel', 'both'].includes(format)) fail('Escolha texto, Excel ou ambos.');
+    const recipients = this._listRecipients(payload.recipientIds), chunks = format === 'excel' ? [] : formatSearchResults(this._listAnswer(run, offers), run.resultSettings || this._settings());
+    const previewId = randomUUID(), expiresAt = this.now() + 300_000;
+    const entry = { previewId, actorId, runId: run.id, selection: payload.selection || 'all', offerIds: payload.selection === 'selected' ? strings(payload.offerIds, 100_000) : [], signature: this._offersSignature(offers), format, recipientIds: recipients.map(r => r.id), recipients, mode: this._mode(), expiresAt, createdAt: this.now(), count: offers.length };
+    for (const [id, item] of this.listPreviews) if (item.expiresAt < this.now()) this.listPreviews.delete(id);
+    if (this.listPreviews.size >= 16) this.listPreviews.delete(this.listPreviews.keys().next().value); this.listPreviews.set(previewId, entry);
+    return { previewId, count: offers.length, query: run.query, filters: run.filters, period: run.period, format, recipients, parts: chunks.length + (format !== 'text' ? 1 : 0), textParts: chunks.length, textPreview: chunks.slice(0, 2), previewPartCount: Math.min(2, chunks.length), truncated: chunks.length > 2, expiresAt, warnings: run.warnings || [] };
+  }
+  async previewSearchListPage(payload, actorId) {
+    this._assert(actorId, 'manage'); this._assert(actorId, 'search'); this._assert(actorId, 'view');
+    const entry = this.listPreviews.get(payload?.previewId);
+    if (!entry || entry.actorId !== actorId || entry.mode !== this._mode() || entry.expiresAt < this.now()) fail('A prévia expirou ou pertence a outro modo. Gere a prévia novamente.', 'SEARCH_PREVIEW_EXPIRED');
+    const run = await this._resolveListRun({ runId: entry.runId }, actorId), offers = await this._offersForRun(run, actorId, entry);
+    if (this._offersSignature(offers) !== entry.signature || JSON.stringify(this._listRecipients(entry.recipientIds)) !== JSON.stringify(entry.recipients)) fail('Ofertas ou destinatários mudaram. Gere uma nova prévia antes de enviar.', 'SEARCH_PREVIEW_CHANGED');
+    const chunks = entry.format === 'excel' ? [this._excelCaption(run.query, offers.length, run.traceId || run.id)] : formatSearchResults(this._listAnswer(run, offers), run.resultSettings || this._settings());
+    const part = safeNumber(payload.part ?? 1, 1, chunks.length, 'Parte da prévia');
+    this._assert(actorId, 'manage'); this._assert(actorId, 'search'); this._assert(actorId, 'view');
+    if (entry.mode !== this._mode() || entry.expiresAt < this.now()) fail('A prévia expirou ou o modo mudou. Gere a prévia novamente.', 'SEARCH_PREVIEW_EXPIRED');
+    return { previewId: entry.previewId, text: chunks[part - 1], part, total: chunks.length, format: entry.format, count: offers.length, expiresAt: entry.expiresAt };
+  }
+  async sendSearchList(payload, actorId) {
+    this._assert(actorId, 'manage'); this._assert(actorId, 'search'); this._assert(actorId, 'view');
+    const entry = this.listPreviews.get(payload?.previewId);
+    if (!entry || entry.actorId !== actorId || entry.mode !== this._mode() || entry.expiresAt < this.now()) fail('A prévia expirou ou pertence a outro modo. Gere a prévia novamente.', 'SEARCH_PREVIEW_EXPIRED');
+    if (entry.result) return entry.result;
+    if (entry.sending) return entry.sending;
+    entry.sending = (async () => {
+      const run = await this._resolveListRun({ runId: entry.runId }, actorId), offers = await this._offersForRun(run, actorId, entry), recipients = this._listRecipients(entry.recipientIds);
+      if (this._offersSignature(offers) !== entry.signature || JSON.stringify(recipients) !== JSON.stringify(entry.recipients)) fail('Ofertas ou destinatários mudaram. Gere uma nova prévia antes de enviar.', 'SEARCH_PREVIEW_CHANGED');
+      if (!this._automationAllowed()) fail('Os envios estão interrompidos. Retome explicitamente antes de enviar listas.', 'AUTOMATION_STOPPED');
+      const document = entry.format !== 'text' ? await this._createExcel(offers, run, entry.selection, actorId) : null;
+      const freshOffers = await this._offersForRun(run, actorId, entry);
+      if (this._offersSignature(freshOffers) !== entry.signature) fail('As ofertas mudaram durante a geração do documento. Gere uma nova prévia antes de enviar.', 'SEARCH_PREVIEW_CHANGED');
+      const chunks = entry.format !== 'excel' ? formatSearchResults(this._listAnswer(run, offers), run.resultSettings || this._settings()) : [], batchId = `${run.id}:list:${entry.previewId}`, parts = chunks.length + (document ? 1 : 0);
+      this.store.transaction(() => {
+        this._assert(actorId, 'manage'); this._assert(actorId, 'search'); this._assert(actorId, 'view');
+        if (entry.mode !== this._mode() || JSON.stringify(this._listRecipients(entry.recipientIds)) !== JSON.stringify(entry.recipients)) fail('Os destinatários ou o modo mudaram. Nenhum envio foi criado.', 'SEARCH_PREVIEW_CHANGED');
+        for (const recipient of recipients) {
+          const target = `${recipient.phone}@s.whatsapp.net`;
+          for (const [index, text] of chunks.entries()) this._queueDelivery({ id: `${batchId}:${hash(target).slice(0, 16)}:${index}`, run, actorId, target, text, batchId, manualList: true, recipientMode: 'manual-list', recipientId: recipient.id, part: index + 1, parts });
+          if (document) this._queueDelivery({ id: `${batchId}:${hash(target).slice(0, 16)}:excel`, run, actorId, target, text: this._excelCaption(run.query, offers.length, run.traceId || run.id), document, batchId, manualList: true, recipientMode: 'manual-list', recipientId: recipient.id, part: parts, parts });
+        }
+      });
+      this._audit('search.list_queued', actorId, { runId: run.id, batchId, count: offers.length, recipients: recipients.length, format: entry.format });
+      entry.result = await this.listListDeliveries({ batchId, runId: run.id }, actorId); this._flushInBackground(); this.emit('change'); return entry.result;
+    })();
+    try { return await entry.sending; } finally { entry.sending = null; }
+  }
+  async listListDeliveries(payload, actorId) {
+    this._assert(actorId, 'manage');
+    if (!boundedText(payload?.batchId, 256) || !payload.batchId) fail('Identificador de envio inválido.');
+    let offset = 0; const deliveries = []; let records;
+    do { records = this.store.listSearchDeliveries({ runId: payload.runId, limit: 500, offset }); for (const record of page(records)) if (record.batchId === payload.batchId && (record.actorId === actorId || this._user(actorId)?.isOwner)) deliveries.push(this._deliveryView(record)); offset += page(records).length; if (offset < records.total) await new Promise(resolve => setImmediate(resolve)); } while (page(records).length && offset < records.total);
+    return { batchId: payload.batchId, deliveries, total: deliveries.length };
+  }
+  _queueDelivery({ id, run, actorId, target, text, recipientMode, context, recipientId, document, batchId, manualList = false, part, parts, test = false, errorNotice = false }) {
     const clientMessageId = `KENNED-SEARCH-${randomUUID()}`;
     if (!this._automationAllowed()) fail('Os envios automáticos estão interrompidos. Retome explicitamente pelo aplicativo ou comando administrativo.', 'AUTOMATION_STOPPED');
     this._trace(run.traceId || run.id, 'recipient', { actorId, target, recipientId });
-    const delivery = this.store.saveSearchDelivery({ id, runId: run.id, traceId: run.traceId || run.id, actorId, target, recipientId: recipientId || null, text, clientMessageId, messageId: clientMessageId, recipientMode, status: 'pending', attempts: 0, createdAt: this.now(), sourceChatId: context?.chatId || null, sourceIsGroup: context?.isGroup === true, sourceSenderNumber: context?.senderNumber || null, sourceIdentityVerified: context?.identityVerified === true || context?.verified === true, sourceSenderId: context?.senderId || null, sourceReplyProof: context?.replyProof || null,  sourceTrustedSelf: context?.sourceTrustedSelf === true || this._trustedSelf(context), sourceSelfChat: context?.selfChat === true, sourceIncomingPrivate: context?.isGroup === false && context?.fromMe === false, test, errorNotice, storageMode: this._mode(), simulation: this._mode() === 'simulated' });
+    const delivery = this.store.saveSearchDelivery({ id, runId: run.id, traceId: run.traceId || run.id, actorId, target, recipientId: recipientId || null, text, document: document ? { id: document.id, path: document.path, name: document.name, mime: document.mime, size: document.size, sha256: document.sha256 } : null, mediaId: document?.id || null, kind: document ? 'document' : 'text', batchId: batchId || null, manualList, part: part || null, parts: parts || null, clientMessageId, messageId: clientMessageId, recipientMode, status: 'pending', attempts: 0, createdAt: this.now(), sourceChatId: context?.chatId || null, sourceIsGroup: context?.isGroup === true, sourceSenderNumber: context?.senderNumber || null, sourceIdentityVerified: context?.identityVerified === true || context?.verified === true, sourceSenderId: context?.senderId || null, sourceReplyProof: context?.replyProof || null,  sourceTrustedSelf: context?.sourceTrustedSelf === true || this._trustedSelf(context), sourceSelfChat: context?.selfChat === true, sourceIncomingPrivate: context?.isGroup === false && context?.fromMe === false, test, errorNotice, storageMode: this._mode(), simulation: this._mode() === 'simulated' });
     this._trace(delivery.traceId, 'queued', { actorId, deliveryId: delivery.id, target, status: 'pending' }); return delivery;
   }
   async _queueFailureNotice(run, context, error, { deferFlush = false } = {}) {
-    if (!run || !this._can(run.actorId, 'search') || this.closed || !phone(context?.senderNumber) || this.store.getSearchDelivery(`${run.id}:error-notice`)) return;
+    if (!run || !this._can(run.actorId, 'search') || this.closed || !phone(context?.senderNumber) || this.authService.findAuthorizedPhone(phone(context.senderNumber))?.id!==run.actorId || this.store.getSearchDelivery(`${run.id}:error-notice`)) return;
     try {
       this._queueDelivery({ id: `${run.id}:error-notice`, run, actorId: run.actorId, target: `${context.senderNumber}@s.whatsapp.net`, text: `⚠️ Kenned Code Disparos: ${this._safeError(error)}.\nConsulte BUSCAS e Diagnóstico no aplicativo.\nRastreamento: ${run.traceId || run.id}`, recipientMode: 'error-notice', context, errorNotice: true });
       if (!deferFlush) await this.flushDeliveries();
     } catch (noticeError) { this._trace(run.traceId || run.id, 'failure', { actorId: run.actorId, code: 'SEARCH_FAILURE_NOTICE_ERROR', reason: this._safeError(noticeError) }); }
   }
-  _recipientById(id) { if (typeof id !== 'string') return null; if (id.startsWith('user:')) { const u = this._user(id.slice(5)); return u && phone(u.phone); } const r = this.store.getAlertRecipient?.(id) || this.store.getEntity('alert_recipients', id); return r?.enabled !== false && phone(r?.phone); }
+  _recipientById(id) {
+    if(typeof id!=='string')return null;
+    if(id.startsWith('user:')){const u=this._user(id.slice(5));return u&&phone(u.phone);}
+    const recipient=this.store.getAlertRecipient?.(id)||this.store.getEntity('alert_recipients',id),number=phone(recipient?.phone);
+    if(!recipient||recipient.enabled===false||!number)return null;
+    if(recipient.userId){const linked=this._user(recipient.userId);if(!linked||linked.phone&&phone(linked.phone)!==number)return null;}
+    return number;
+  }
   _targets(settings, actorId, ctx) {
     // A received private command is a private interaction with its authenticated
     // requester. Broadcast preferences apply only to groups and application searches.
@@ -388,9 +544,9 @@ class SearchService extends EventEmitter {
     if (settings.recipientMode === 'responsibles') { const numbers = settings.responsibleRecipientIds.map(id => this._recipientById(id)); if (numbers.some(n => !n)) fail('Um responsável selecionado não tem telefone válido ou está desativado.', 'SEARCH_RECIPIENT_MISSING'); return [...new Set(numbers.map(n => `${n}@s.whatsapp.net`))]; }
     let owner = settings.ownerRecipientUserId ? this._user(settings.ownerRecipientUserId) : this.store.listEntities('users').map(u => this._user(u.id)).find(u => u?.isOwner && phone(u.phone));
     if (settings.ownerRecipientUserId && (!owner?.isOwner || !phone(owner.phone))) fail('O dono selecionado está inativo ou sem telefone válido.', 'SEARCH_OWNER_RECIPIENT_INVALID');
-    return owner && phone(owner.phone) ? [`${owner.phone}@s.whatsapp.net`] : [];
+    return owner && phone(owner.phone) ? [`${phone(owner.phone)}@s.whatsapp.net`] : [];
   }
-  _deliveryView(delivery) { if (!delivery) return null; const { id, runId, traceId, recipientId, target, resolvedTarget, status, attempts, createdAt, submittedAt, resultAt, error, code, deliveredAt, readAt, confirmationScope, safeToRetry, test, errorNotice, simulation } = delivery; return { id, runId, traceId, recipientId, target, resolvedTarget, status, attempts, createdAt, submittedAt, resultAt, error, code, deliveredAt, readAt, confirmationScope, safeToRetry, test, errorNotice, simulation }; }
+  _deliveryView(delivery) { if (!delivery) return null; const { id, runId, traceId, recipientId, batchId, kind, manualList, part, parts, target, resolvedTarget, status, attempts, createdAt, submittedAt, resultAt, error, code, deliveredAt, readAt, confirmationScope, safeToRetry, test, errorNotice, simulation } = delivery; return { id, runId, traceId, recipientId, batchId, kind, manualList, part, parts, fileName: delivery.document?.name || null, target, resolvedTarget, status, attempts, createdAt, submittedAt, resultAt, error, code, deliveredAt, readAt, confirmationScope, safeToRetry, test, errorNotice, simulation }; }
   getRecipientStatus(actorId) {
     this._assert(actorId, 'manage');
     const settings = this._settings(), selected = settings.recipientMode === 'responsibles' ? settings.responsibleRecipientIds : settings.recipientMode === 'owner' ? (settings.ownerRecipientUserId ? [`user:${settings.ownerRecipientUserId}`] : this.store.listEntities('users').filter(u => this._user(u.id)?.isOwner && phone(u.phone)).slice(0, 1).map(u => `user:${u.id}`)) : settings.recipientMode === 'requester' ? [`user:${actorId}`] : [];
@@ -408,7 +564,7 @@ class SearchService extends EventEmitter {
   }
   async retryDelivery(payload, actorId) {
     const delivery = this.store.getSearchDelivery(payload?.id); if (!delivery) fail('Entrega não encontrada.');
-    this._assert(actorId, delivery.test ? 'manage' : 'search'); if (!this._user(actorId)?.isOwner && delivery.actorId !== actorId) fail('Você não pode repetir uma entrega solicitada por outro usuário.', 'SEARCH_DENIED');
+    this._assert(actorId, delivery.test || delivery.manualList ? 'manage' : 'search'); if (!this._user(actorId)?.isOwner && delivery.actorId !== actorId) fail('Você não pode repetir uma entrega solicitada por outro usuário.', 'SEARCH_DENIED');
     if (!['failed', 'pending'].includes(delivery.status) || delivery.status === 'failed' && delivery.safeToRetry !== true) fail('Somente falhas comprovadamente anteriores ao envio podem ser repetidas. Resultados incertos precisam de revisão.', 'SEARCH_RETRY_UNSAFE');
     this.store.updateSearchDelivery(delivery.id, { status: 'pending', nextAttemptAt: 0, attempts: 0, resultAt: null, code: null, error: null }); this._trace(delivery.traceId || delivery.runId, 'retry', { actorId, deliveryId: delivery.id }); await this.flushDeliveries(); this.emit('change'); return this._deliveryView(this.store.getSearchDelivery(delivery.id));
   }
@@ -419,11 +575,12 @@ class SearchService extends EventEmitter {
   }
   _incomingPrivateDelivery(delivery) { return delivery.sourceIncomingPrivate === true || delivery.sourceIncomingPrivate === undefined && delivery.sourceIsGroup === false && delivery.sourceTrustedSelf !== true && !!phone(delivery.sourceSenderNumber) && (delivery.sourceChatId === `${delivery.sourceSenderNumber}@s.whatsapp.net` || /^\d+@lid$/.test(delivery.sourceChatId || '')); }
   _deliveryAuthorized(delivery) {
-    if (delivery.storageMode && delivery.storageMode !== this._mode() || !this._can(delivery.actorId, delivery.test ? 'manage' : 'search')) return false;
+    if (delivery.storageMode && delivery.storageMode !== this._mode() || !this._can(delivery.actorId, delivery.test || delivery.manualList ? 'manage' : 'search')) return false;
     const currentSettings = this._settings();
     if (delivery.test) return `${this._recipientById(delivery.recipientId)}@s.whatsapp.net` === delivery.target;
+    if (delivery.manualList) return currentSettings.enabled && this._can(delivery.actorId, 'view') && this._can(delivery.actorId, 'search') && `${this._recipientById(delivery.recipientId)}@s.whatsapp.net` === delivery.target;
     if (!currentSettings.enabled) return false;
-    if (delivery.errorNotice) return this._commandLocation({ chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, selfChat: delivery.sourceSelfChat }, currentSettings, delivery.sourceTrustedSelf) && `${delivery.sourceSenderNumber}@s.whatsapp.net` === delivery.target;
+    if (delivery.errorNotice) return this.authService.findAuthorizedPhone(phone(delivery.sourceSenderNumber))?.id===delivery.actorId && this._commandLocation({ chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, selfChat: delivery.sourceSelfChat }, currentSettings, delivery.sourceTrustedSelf) && `${delivery.sourceSenderNumber}@s.whatsapp.net` === delivery.target;
     return this._targets(currentSettings, delivery.actorId, delivery.sourceChatId ? { chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, sourceTrustedSelf: delivery.sourceTrustedSelf, selfChat: delivery.sourceSelfChat, sourceIncomingPrivate: this._incomingPrivateDelivery(delivery) } : null).includes(delivery.target);
   }
   _flushInBackground() {
@@ -467,7 +624,7 @@ class SearchService extends EventEmitter {
       for (const delivery of pending) {
         if (this.closed || !this._automationAllowed() || this.adapter?.status?.state !== 'connected') break;
         if (delivery.nextAttemptAt > this.now()) continue;
-        if (!this._can(delivery.actorId, delivery.test ? 'manage' : 'search')) { this.store.updateSearchDelivery(delivery.id, { status: 'failed', resultAt: this.now(), code: 'SEARCH_DENIED', safeToRetry: true, error: 'A autorização do solicitante foi removida.' }); continue; }
+        if (!this._can(delivery.actorId, delivery.test || delivery.manualList ? 'manage' : 'search')) { this.store.updateSearchDelivery(delivery.id, { status: 'failed', resultAt: this.now(), code: 'SEARCH_DENIED', safeToRetry: true, error: 'A autorização do solicitante foi removida.' }); continue; }
         let authorizedTarget = false;
         try { authorizedTarget = this._deliveryAuthorized(delivery); }
         catch (error) { this._trace(delivery.traceId || delivery.runId, 'failure', { actorId: delivery.actorId, code: error.code, reason: this._safeError(error) }); }
@@ -479,15 +636,20 @@ class SearchService extends EventEmitter {
         try {
           const number = phone(delivery.target?.match(/^(\d+)@s\.whatsapp\.net$/)?.[1]);
           const sendingAdapter = this.adapter, sendingMode = this._mode();
-          const replyContext = delivery.sourceIncomingPrivate && delivery.sourceIdentityVerified ? { chatId: delivery.sourceChatId, senderNumber: delivery.sourceSenderNumber, senderId: delivery.sourceSenderId, replyProof: delivery.sourceReplyProof, identityVerified: true, isGroup: false } : null;
-          const resolved = replyContext && sendingAdapter.resolveSearchRecipient ? await sendingAdapter.resolveSearchRecipient(delivery.sourceSenderNumber, replyContext) : number && sendingAdapter.resolveRecipient ? await sendingAdapter.resolveRecipient(number) : { jid: delivery.target }; 
+          const replyContext = delivery.sourceIncomingPrivate && delivery.sourceIdentityVerified ? { chatId: delivery.sourceChatId, senderNumber: delivery.sourceSenderNumber, senderId: delivery.sourceSenderId, replyProof: delivery.sourceReplyProof, identityVerified: true, isGroup: false, traceId: delivery.traceId || delivery.runId } : null;
+          const resolved = replyContext && sendingAdapter.resolveSearchRecipient ? await sendingAdapter.resolveSearchRecipient(delivery.sourceSenderNumber, replyContext, { traceId: delivery.traceId || delivery.runId }) : number && sendingAdapter.resolveRecipient ? await sendingAdapter.resolveRecipient(number, { traceId: delivery.traceId || delivery.runId }) : { jid: delivery.target }; 
           if (!resolved?.jid) fail('Não foi possível resolver o destinatário.', 'SEARCH_RECIPIENT_MISSING');
           if (this.closed || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected') break;
           if (this.adapter !== sendingAdapter || this._mode() !== sendingMode || !this._deliveryAuthorized(delivery)) fail('A autorização ou o destinatário mudou durante a preparação. Nenhuma mensagem foi enviada.', 'SEARCH_TARGET_DISABLED');
           this.store.updateSearchDelivery(delivery.id, { status: 'sending', attempts: attempt, submittedAt: this.now(), resolvedTarget: resolved.jid });
           this._trace(delivery.traceId || delivery.runId, 'recipient', { actorId: delivery.actorId, target: resolved.jid, deliveryId: delivery.id });
           if (this.scheduler) this.scheduler.lastSubmissionAt = this.now(); this._trace(delivery.traceId || delivery.runId, 'submitted', { actorId: delivery.actorId, deliveryId: delivery.id, attempts: attempt });
-          const result = await this.adapter.sendSearchText(resolved.jid, delivery.text, { clientMessageId: delivery.clientMessageId, replyContext });
+          const beforeSubmit = () => {
+            if (this.closed || this.paused || !this._automationAllowed() || this.adapter !== sendingAdapter || this._mode() !== sendingMode || !this._deliveryAuthorized(delivery)) throw Object.assign(new Error('O envio foi bloqueado porque a conexão, as permissões ou os destinatários mudaram.'), { code: 'SEARCH_TARGET_DISABLED', definitive: true, safeToRetry: false, submitted: false });
+          };
+          const result = delivery.document
+            ? await sendingAdapter.sendPrivateContent(resolved.jid, { type: 'document', caption: delivery.text }, this.store.getMedia(delivery.mediaId) || delivery.document, { clientMessageId: delivery.clientMessageId, replyContext, beforeSubmit, traceId: delivery.traceId || delivery.runId })
+            : await sendingAdapter.sendSearchText(resolved.jid, delivery.text, { clientMessageId: delivery.clientMessageId, replyContext, beforeSubmit, traceId: delivery.traceId || delivery.runId });
           const current = this.store.getSearchDelivery(delivery.id); const confirmed = current?.status === 'confirmed' || result?.status === 'confirmed';
           this.store.updateSearchDelivery(delivery.id, { status: confirmed ? 'confirmed' : 'uncertain', resultAt: this.now(), messageId: result?.messageId || delivery.clientMessageId, confirmationScope: result?.confirmationScope || current?.confirmationScope || (confirmed ? 'integration-ack' : null), deliveredAt: result?.deliveredAt || current?.deliveredAt || null, readAt: result?.readAt || current?.readAt || null, code: confirmed ? null : 'SEARCH_RESULT_UNCERTAIN', safeToRetry: false, error: confirmed ? null : 'Envio sem confirmação; revisar antes de repetir.' });
           this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status: confirmed ? 'confirmed' : 'uncertain', confirmationScope: result?.confirmationScope, attempts: attempt });
@@ -503,6 +665,13 @@ class SearchService extends EventEmitter {
   cleanupPreview(payload, actorId) { this._assert(actorId, 'manage'); const scope = payload?.scope; if (!['history', 'base'].includes(scope)) fail('Selecione histórico de buscas ou base de ofertas.'); const stats = this.store.getSearchMonitorStats(); const token = randomUUID(); this.cleanupTokens.set(token, { actorId, scope, expiresAt: this.now() + 300_000 }); if (this.cleanupTokens.size > 100) this.cleanupTokens.delete(this.cleanupTokens.keys().next().value); return { scope, token, stats, effect: scope === 'history' ? 'Remove apenas o histórico de consultas. Ofertas, mensagens e controles de entrega permanecem.' : 'Remove mensagens capturadas e ofertas. Campanhas, usuários, configurações, histórico de consultas e controles de entrega permanecem.' }; }
   async clearData(payload, actorId) { this._assert(actorId, 'manage'); const token = this.cleanupTokens.get(payload.token); if (!token || token.actorId !== actorId || token.scope !== payload.scope || token.expiresAt < this.now()) fail('Visualize novamente o que será removido antes de apagar.'); if (payload.confirmation !== 'APAGAR') fail('Digite APAGAR para confirmar.'); this.cleanupTokens.delete(payload.token); if (payload.scope === 'base') { await this.suspendCapture('offers_base_cleared'); try { this.store.deleteSearchBase({ actor: actorId }); this.monitor.lastSyncAt = null; this.monitor.lastCaptureAt = null; } finally { this.resumeCapture(); } } else this.store.deleteSearchHistory({ actor: actorId }); this._audit(`search.${payload.scope}_cleared`, actorId); this.emit('change'); return { cleared: true, scope: payload.scope }; }
   importHistory(actorId) { this._assert(actorId, 'manage'); if (!this._settings().enabled || !this._settings().importHistory) fail('Ative BUSCAS e a importação parcial de histórico.'); if (typeof this.adapter?.requestSearchHistory !== 'function') return { supported: false, complete: false, detail: 'A integração entrega somente o histórico parcial disponibilizado durante a sincronização. Não há importação completa sob demanda.' }; return this.adapter.requestSearchHistory({ groupIds: this._settings().monitoredGroupIds }); }
+}
+
+function parseSearchCommand(text) {
+  let query = String(text || '').trim(), format = 'text';
+  const match = query.match(/^--(excel|ambos)(?:\s+|$)/i);
+  if (match) { format = match[1].toLowerCase() === 'excel' ? 'excel' : 'both'; query = query.slice(match[0].length).trim(); }
+  return { query, format };
 }
 
 function formatSearchResults(answer, settings) {
@@ -537,7 +706,7 @@ function formatSearchResults(answer, settings) {
   blocks.push('Valores conforme anúncios capturados. Confirme disponibilidade e condições com o fornecedor.');
   const chunks = []; let current = header;
   for (const block of blocks) { if (current.length + block.length + 2 > 3500) { chunks.push(current); current = block; } else current += `\n\n${block}`; }
-  if (current) chunks.push(current); return chunks;
+  if (current) chunks.push(current); return chunks.length > 1 ? chunks.map((text, index) => `📄 Parte ${index + 1}/${chunks.length}\n\n${text}`) : chunks;
 }
 
-module.exports = { SearchService, DEFAULT_SEARCH_SETTINGS, validateSearchSettings, validateFilters, parseZonedTime, formatSearchResults };
+module.exports = { parseSearchCommand, SearchService, DEFAULT_SEARCH_SETTINGS, validateSearchSettings, validateFilters, parseZonedTime, formatSearchResults };

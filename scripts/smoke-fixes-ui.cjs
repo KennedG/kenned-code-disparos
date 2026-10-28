@@ -100,7 +100,7 @@ const { _electron, expect } = require('@playwright/test');
     const reconnectedAlerts = await rpc('alertsPage', { limit: 100 });
     assert(reconnectedAlerts.items.some(a => a.originalAt === originalFailureTime && a.confirmationScope === 'simulation-only'));
     await navigate('buscas'); await tabs('destinations');
-    await expect(page.locator('#buscas-destinations').getByText('Enviado — confirmado pelo servidor', { exact: true }).first()).toBeVisible();
+    await expect(page.locator('#buscas-destinations').getByText('Enviado — aceito pela integração', { exact: true }).first()).toBeVisible();
     await page.screenshot({ path: path.join(shots, 'destinatarios-confirmados.png'), fullPage: true });
     console.log('PASS: disconnect occurrence, per-recipient UI test pending, general UI alert test, reconnect confirmation and original failure time. Native Windows notification hardware is not tested here.');
 

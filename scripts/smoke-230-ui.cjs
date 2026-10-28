@@ -94,11 +94,14 @@ const { MediaManager } = require('../src/core/media.cjs');
     await rpc('updateUser', { id: initial.auth.user.id, phone: '5562999990001' });
     const pendingList = await rpc('listPendingContacts'); assert.equal(pendingList.total, 2);
     const extraPending = pendingList.items.find(p => p.phone === '5562999990002');
+    const expectedPending = pendingList.items.find(p => p.phone === '5562999990001'); assert(expectedPending);
     await nav('dashboard'); await nav('contacts'); await expect(page.locator('.contact-intake-form')).toHaveCount(2);
     await page.locator('[data-action=contact-intake-dismiss][data-id="' + extraPending.id + '"]').click();
     await expect.poll(async () => (await rpc('listPendingContacts')).total).toBe(1);
-    await page.locator('.contact-intake-form [name=contactIntakeName]').fill('Cliente da validação'); await page.locator('.contact-intake-form [name=contactIntakeCategories][value="Cliente Nerópolis"]').check(); await page.locator('.contact-intake-form [type=submit]').click();
-    await expect.poll(async () => (await rpc('listPendingContacts')).total).toBe(0); const savedContact = (await snap()).contacts[0]; assert.equal(savedContact.name, 'Cliente da validação'); assert.equal(savedContact.category, 'Cliente Nerópolis'); assert.equal(savedContact.addressBookSupported, false); await expect(page.locator('#main')).toContainText('Salvo no sistema');
+    await expect(page.locator('.contact-intake-form')).toHaveCount(1);
+    const contactForm = page.locator('.contact-intake-form[data-pending-id="' + expectedPending.id + '"]');
+    await contactForm.locator('[name=contactIntakeName]').fill('Cliente da validação'); await contactForm.locator('[name=contactIntakeCategory]').selectOption('Cliente Nerópolis'); await contactForm.locator('[type=submit]').click();
+    await expect.poll(async () => (await rpc('listPendingContacts')).total).toBe(0); const savedContact = (await snap()).contacts.find(c => c.phone === expectedPending.phone); assert(savedContact); assert.equal(savedContact.name, 'Cliente da validação'); assert.equal(savedContact.category, 'Cliente Nerópolis'); assert.equal(savedContact.addressBookSupported, false); await expect(page.locator('#main')).toContainText('Salvo no sistema');
     console.log('PASS: repeated verified private contact produces one pending; editable name/classification saved locally with truthful agenda limitation.');
 
     await nav('alerts'); await page.locator('[data-action=test-alert]').click();

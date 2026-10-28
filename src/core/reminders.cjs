@@ -6,7 +6,8 @@ const { randomUUID, createHash } = require('node:crypto');
 const MINUTE = 60000;
 const ON_TIME_GRACE = MINUTE;
 const terminal = new Set(['confirmed', 'delivered', 'failed', 'uncertain', 'cancelled', 'skipped']);
-const validPhone = value => typeof value === 'string' && /^[1-9]\d{9,14}$/.test(value);
+const { normalizePhone } = require('./phone.cjs');
+const validPhone = value => normalizePhone(value)!==null;
 const fail = (text, code = 'REMINDER_INVALID') => Object.assign(new Error(text), { code, definitive: true, safeToRetry: false });
 const codeOf = value => typeof value === 'string' && /^[A-Z0-9_]{1,64}$/.test(value) ? value : 'REMINDER_SEND_ERROR';
 const safeText = value => String(value || '').slice(0, 300).replace(/(Bearer\s+)[\w.\-]+/gi, '$1[omitido]').replace(/((?:password|senha|token|secret|authorization|credential)\s*[:=]\s*)[^\s,;]+/gi, '$1[omitido]');
@@ -118,8 +119,12 @@ class ReminderService extends EventEmitter {
   _fatal(error) { this.scheduler?.blockOnPersistenceFailure?.(); this.emit('change', { error: 'Falha ao persistir o processamento de lembretes.', code: 'REMINDER_STORAGE_ERROR' }); }
   recipients() {
     const choices = new Map();
-    for (const user of this._list('users')) if (user.active !== false && !user.requirePasswordChange && validPhone(user.phone) && this._get('roles', user.roleId)) choices.set(`user:${user.id}`, { id: `user:${user.id}`, name: user.name, phone: user.phone, source: 'user' });
-    for (const item of this._list('alert_recipients')) if (item.enabled !== false && validPhone(item.phone)) choices.set(item.id, { id: item.id, name: item.name, phone: item.phone, source: 'configured' });
+    for (const user of this._list('users')) if (user.active !== false && !user.requirePasswordChange && validPhone(user.phone) && this._get('roles', user.roleId)) choices.set(`user:${user.id}`, { id: `user:${user.id}`, name: user.name, phone: normalizePhone(user.phone), source: 'user' });
+    for (const item of this._list('alert_recipients')) {
+      const number=normalizePhone(item.phone),linked=item.userId?this._get('users',item.userId):null;
+      if(item.userId&&(!linked||linked.active===false||linked.requirePasswordChange||!this._get('roles',linked.roleId)||linked.phone&&normalizePhone(linked.phone)!==number))continue;
+      if(item.enabled!==false&&number)choices.set(item.id,{id:item.id,name:item.name,phone:number,source:'configured'});
+    }
     return [...choices.values()];
   }
   _recipient(id) { const value = this.recipients().find(item => item.id === id); if (!value) throw fail('Destinatário removido, desativado ou sem telefone com país e DDD.', 'REMINDER_RECIPIENT_DISABLED'); return value; }
@@ -289,13 +294,7 @@ class ReminderService extends EventEmitter {
       current = this._save('reminder_deliveries', { ...ledger, attempts: attempt, status: 'sending', submittedAt: this.now(), targetId: resolved.jid, isSelf: resolved.isSelf === true });
       this._trace(current, 'recipient', 'REMINDER_RECIPIENT_RESOLVED', 'Destinatário privado resolvido e autorização validada.', 'Submissão iniciada; confirmação ainda pendente.');
       this.inFlight.add(current.id); if (this.scheduler) this.scheduler.lastSubmissionAt = this.now(); submitted = true;
-      const result = await adapter.sendPrivate(current.number, current.text, { clientMessageId: current.messageId, beforeSubmit: () => {
-        const fresh = this._get('reminders', current.reminderId), ledger = this._get('reminder_deliveries', current.id);
-        if (this._blocked() || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode() || ledger?.status !== 'sending' || !fresh || fresh.scheduleRevision !== current.scheduleRevision || !current.test && !['active','completed'].includes(fresh.state)) throw fail('Lembrete interrompido antes da submissão.', 'REMINDER_CANCELLED');
-        if (this._recipient(current.recipientId).phone !== current.number) throw fail('O destinatário foi alterado antes da submissão.', 'REMINDER_RECIPIENT_DISABLED');
-        if (current.userId) this._assert(current.userId, 'reminder.control');
-        if (current.deadlineAt < this.now()) throw fail('O prazo do lembrete venceu antes da submissão.', 'REMINDER_OVERDUE_SKIPPED');
-      } });
+      const result = await adapter.sendPrivate(current.number, current.text, { clientMessageId: current.messageId });
       if (mode !== this._mode() || adapter !== this.adapter) return;
       const latest = this._get('reminder_deliveries', current.id), confirmed = ['confirmed', 'delivered'].includes(latest?.status) || ['confirmed', 'delivered'].includes(result?.status);
       const delivered = latest?.status === 'delivered' || result?.status === 'delivered' || confirmed && ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope);

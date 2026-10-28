@@ -7,13 +7,11 @@ const { DatabaseSync } = require('node:sqlite');
 const { configurationFingerprint } = require('./campaign-version.cjs');
 const { createSearchSchema, attachSearchStore } = require('./search-store.cjs');
 
-const BUSINESS_TABLES = ['inventory','suppliers','purchases','reservations','sales','sale_payments','sale_events','cash_sessions','cash_movements','commercial_lists','contact_categories','promotional_targets','promotion_ledger','opportunity_rules','buyer_demands','commerce_matches','commerce_deliveries','daily_reports'];
-const NEW_TABLES = ['reminders','reminder_deliveries','contact_pending','contact_intake_events',...BUSINESS_TABLES];
-const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts',...NEW_TABLES]);
+const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts','reminders','reminder_deliveries','contact_pending','contact_intake_events']);
 const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 7;
 const SHARED_TABLES = new Set(['settings','users','roles','recovery_tokens']);
-const MODE_SETTING = /^(buscas|search|commercial|commerce|dailyReport|promotion)|^recentCommandIds$|^systemAlertRecipientIds$|^automationState$/i;
+const MODE_SETTING = /^(buscas|search)|^recentCommandIds$|^systemAlertRecipientIds$|^automationState$/i;
 const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^mode:|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
 
 function atomicWrite(filename, data) {
@@ -53,7 +51,7 @@ async function createStore(dir,options={}) {
   fs.mkdirSync(dir,{recursive:true});
   const filename=path.join(dir,'mega.sqlite'),existed=fs.existsSync(filename);
   const db=new DatabaseSync(filename,{timeout:5000});
-  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0,modeIsolationReady=false;
+  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0,modeIsolationReady=false,upgradeBackup=null;
   const statements=new Map();
   const prepared=sql=>{let st=statements.get(sql);if(!st){st=db.prepare(sql);if(statements.size>=128)statements.delete(statements.keys().next().value);statements.set(sql,st);}return st;};
   const storageMode=()=>{const row=prepared("SELECT data FROM settings WHERE id='integrationMode'").get();return row&&JSON.parse(row.data).value==='simulated'?'simulated':'whatsapp';};
@@ -80,6 +78,18 @@ async function createStore(dir,options={}) {
     db.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;');
     const version=Number(db.prepare('PRAGMA user_version').get().user_version);
     if(version>SCHEMA_VERSION)throw new Error('Este banco pertence a uma versão mais recente do Kenned Code Disparos. Atualize o aplicativo.');
+    if(existed&&options.upgradeVersion){
+      const hasSettings=db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'").get();
+      const previous=hasSettings?db.prepare("SELECT data FROM settings WHERE id='lastAppUpgradeVersion'").get():null;
+      let previousVersion;try{previousVersion=previous&&JSON.parse(previous.data).value;}catch{}
+      if(previousVersion!==options.upgradeVersion){
+        const backupDir=path.join(dir,'backups');fs.mkdirSync(backupDir,{recursive:true,mode:0o700});
+        const target=path.join(backupDir,`antes-atualizacao-${String(options.upgradeVersion).replace(/[^a-zA-Z0-9.-]/g,'')}-${Date.now()}-${randomUUID()}.sqlite`);
+        db.exec('PRAGMA wal_checkpoint(FULL)');db.prepare('VACUUM INTO ?').run(target);fs.chmodSync(target,0o600);
+        const check=new DatabaseSync(target,{readOnly:true});try{if(check.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('O backup anterior à atualização não passou na verificação.');}finally{check.close();}
+        upgradeBackup={path:target,createdAt:Date.now(),schemaVersion:version,reason:'Antes de atualização do aplicativo; recuperação integral do banco local.'};
+      }
+    }
     if(existed&&version<SCHEMA_VERSION){
       db.exec('PRAGMA wal_checkpoint(FULL)');
       const backupDir=path.join(dir,'backups');fs.mkdirSync(backupDir,{recursive:true});
@@ -93,7 +103,7 @@ async function createStore(dir,options={}) {
       const addColumns=(table,columns)=>{const present=new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(r=>r.name));for(const[name,type]of Object.entries(columns))if(!present.has(name))db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);};
       addColumns('rounds',{campaignId:'TEXT',startedAt:'INTEGER',finishedAt:'INTEGER',status:'TEXT',dayKey:'TEXT'});
       addColumns('jobs',{createdAt:'INTEGER',firstAttemptAt:'INTEGER',resultAt:'INTEGER',attempts:'INTEGER NOT NULL DEFAULT 0',messageId:'TEXT',dayKey:'TEXT'});
-      for(const table of [...ENTITY_TABLES].filter(t=>!NEW_TABLES.includes(t)))db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT);
+      for(const table of [...ENTITY_TABLES].filter(t=>!['reminders','reminder_deliveries','contact_pending','contact_intake_events'].includes(t)))db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT);
         CREATE INDEX IF NOT EXISTS ${table}_created ON ${table}(createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_campaign ON ${table}(campaignId,createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_user ON ${table}(userId,createdAt DESC);
@@ -126,7 +136,7 @@ async function createStore(dir,options={}) {
         INSERT INTO group_progress(campaignId,groupId,lastAt,roundCount) SELECT campaignId,groupId,MAX(startedAt),COUNT(*) FROM group_rounds GROUP BY campaignId,groupId ON CONFLICT(campaignId,groupId) DO UPDATE SET lastAt=excluded.lastAt,roundCount=excluded.roundCount;`);
       for(const c of all('campaigns'))if(!Number.isInteger(c.configRevision))prepared('UPDATE campaigns SET data=? WHERE id=?').run(json({...c,configRevision:c.revision||1}),c.id);
       }
-      for(const table of NEW_TABLES)db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp');
+      for(const table of ['reminders','reminder_deliveries','contact_pending','contact_intake_events'])db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp');
         CREATE INDEX IF NOT EXISTS ${table}_mode_status_time ON ${table}(storageMode,status,createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_mode_user ON ${table}(storageMode,userId,createdAt DESC);`);
       db.exec(`CREATE INDEX IF NOT EXISTS reminders_due ON reminders(storageMode,json_extract(data,'$.nextDueAt'));
@@ -187,27 +197,8 @@ async function createStore(dir,options={}) {
           CREATE TRIGGER audit_immutable_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END;`);
       }
       db.exec("CREATE INDEX IF NOT EXISTS contacts_phone_mode ON contacts(storageMode,json_extract(data,'$.phone'));");
-      db.exec(`CREATE INDEX IF NOT EXISTS inventory_available ON inventory(storageMode,status,json_extract(data,'$.kind'));
-        CREATE INDEX IF NOT EXISTS sales_date ON sales(storageMode,json_extract(data,'$.soldAt'),status);
-        CREATE INDEX IF NOT EXISTS sale_payments_received ON sale_payments(storageMode,json_extract(data,'$.receivedAt'));
-        CREATE INDEX IF NOT EXISTS sales_mode_created ON sales(storageMode,createdAt DESC);
-        CREATE INDEX IF NOT EXISTS sale_payments_sale ON sale_payments(storageMode,json_extract(data,'$.saleId'),createdAt DESC);
-        CREATE INDEX IF NOT EXISTS sale_payments_reservation ON sale_payments(storageMode,json_extract(data,'$.reservationId'),createdAt DESC);
-        CREATE INDEX IF NOT EXISTS cash_movements_session ON cash_movements(storageMode,json_extract(data,'$.cashSessionId'),createdAt DESC);
-        CREATE INDEX IF NOT EXISTS cash_movements_mode_created ON cash_movements(storageMode,createdAt DESC);
-        CREATE INDEX IF NOT EXISTS commerce_deliveries_due ON commerce_deliveries(storageMode,status,json_extract(data,'$.nextAttemptAt'));
-        CREATE INDEX IF NOT EXISTS commerce_deliveries_message ON commerce_deliveries(storageMode,json_extract(data,'$.messageId'));
-        CREATE INDEX IF NOT EXISTS sale_events_sale ON sale_events(storageMode,json_extract(data,'$.saleId'),createdAt);
-        CREATE TRIGGER IF NOT EXISTS sale_events_immutable_update BEFORE UPDATE ON sale_events BEGIN SELECT RAISE(ABORT,'Histórico financeiro imutável'); END;
-        CREATE TRIGGER IF NOT EXISTS sale_events_immutable_delete BEFORE DELETE ON sale_events BEGIN SELECT RAISE(ABORT,'Histórico financeiro imutável'); END;`);
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
     });
-    // These additive indexes also benefit databases already on schema 8.
-    if(version===SCHEMA_VERSION)db.exec(`CREATE INDEX IF NOT EXISTS sales_mode_created ON sales(storageMode,createdAt DESC);
-      CREATE INDEX IF NOT EXISTS sale_payments_sale ON sale_payments(storageMode,json_extract(data,'$.saleId'),createdAt DESC);
-      CREATE INDEX IF NOT EXISTS sale_payments_reservation ON sale_payments(storageMode,json_extract(data,'$.reservationId'),createdAt DESC);
-      CREATE INDEX IF NOT EXISTS cash_movements_session ON cash_movements(storageMode,json_extract(data,'$.cashSessionId'),createdAt DESC);
-      CREATE INDEX IF NOT EXISTS cash_movements_mode_created ON cash_movements(storageMode,createdAt DESC);`);
   }catch(error){db.close();throw error;}
   modeIsolationReady=true;
   const tagged=(table,value)=>{if(!isolated(table))return value;const old=oneRaw(table,value.id);if(old&&old.storageMode!==undefined&&old.storageMode!==storageMode())throw new Error('O registro pertence a outro modo de integração.');return {...value,storageMode:storageMode()};};
@@ -256,7 +247,7 @@ async function createStore(dir,options={}) {
     entityTable(table);if(!value?.id)throw new Error('Identificador obrigatório.');
     const time=Number(value.createdAt??value.at??Date.now()),suffix=immutable?'':' ON CONFLICT(id)DO UPDATE SET data=excluded.data,createdAt=excluded.createdAt,campaignId=excluded.campaignId,userId=excluded.userId,status=excluded.status,kind=excluded.kind';
     prepared(`INSERT INTO ${table}(id,data,createdAt,campaignId,userId,status,kind${isolated(table)?',storageMode':''})VALUES(?,?,?,?,?,?,?${isolated(table)?',?':''})${suffix}`).run(value.id,json(value),time,value.campaignId??null,value.userId??value.actorId??null,value.status??null,value.kind??value.action??value.event??null,...modeParams(table));
-    if(table==='diagnostics')projection('errors',value.id,value);
+    if(table==='diagnostics'&&!['info','debug','warning'].includes(value.level||value.severity))projection('errors',value.id,value);
     if(table==='notifications')projection('notifications',value.id,value);
     return value;
   }
@@ -276,17 +267,14 @@ async function createStore(dir,options={}) {
     const items=parseRows(prepared(`SELECT data FROM history${f.sql} ORDER BY createdAt DESC,rowid DESC LIMIT ? OFFSET ?`).all(...f.params,limit,offset));
     return {items,total,limit,offset};
   }
-  const entityFilter=(filter,table)=>queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',userId:'userId',actorId:'userId',status:'status',kind:'kind',ids:'id',saleIds:"json_extract(data,'$.saleId')",reservationIds:"json_extract(data,'$.reservationId')",cashSessionId:"json_extract(data,'$.cashSessionId')",code:"json_extract(data,'$.code')",stage:"json_extract(data,'$.stage')",traceId:"json_extract(data,'$.traceId')"},table);
+  const entityFilter=(filter,table)=>queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',userId:'userId',actorId:'userId',status:'status',kind:'kind',ids:'id',code:"json_extract(data,'$.code')",stage:"json_extract(data,'$.stage')",traceId:"json_extract(data,'$.traceId')"},table);
   const store={
-    dir,filename,schemaVersion:SCHEMA_VERSION,get persistenceFailed(){return persistenceFailed;},transaction,
+    dir,filename,schemaVersion:SCHEMA_VERSION,upgradeBackup,get persistenceFailed(){return persistenceFailed;},transaction,
     createRecoverySnapshot(destination){
-      assertWritable();if(transactionDepth)throw new Error('Aguarde a gravação terminar antes do backup.');
-      const absolute=path.resolve(destination);if(absolute===path.resolve(filename))throw new Error('Escolha outro arquivo para o backup.');
-      fs.mkdirSync(path.dirname(absolute),{recursive:true});
-      // VACUUM INTO captures a consistent SQLite snapshot, including uncheckpointed WAL.
-      db.prepare('VACUUM INTO ?').run(absolute);fs.chmodSync(absolute,0o600);
-      const check=new DatabaseSync(absolute,{readOnly:true});try{if(check.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('O backup não passou na verificação de integridade.');}finally{check.close();}
-      return {path:absolute,schemaVersion:SCHEMA_VERSION,storageMode:storageMode(),bytes:fs.statSync(absolute).size};
+      assertWritable();if(typeof destination!=='string'||!path.isAbsolute(destination))throw new Error('Informe um caminho absoluto para o backup.');
+      if(path.resolve(destination)===path.resolve(filename)||fs.existsSync(destination))throw new Error('O backup deve usar um arquivo novo, separado do banco ativo.');
+      fs.mkdirSync(path.dirname(destination),{recursive:true,mode:0o700});
+      try{db.prepare('VACUUM INTO ?').run(destination);fs.chmodSync(destination,0o600);const saved=new DatabaseSync(destination,{readOnly:true});try{if(saved.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('A cópia de recuperação não passou na verificação.');}finally{saved.close();}return {path:destination,bytes:fs.statSync(destination).size,schemaVersion:SCHEMA_VERSION};}catch(error){try{fs.unlinkSync(destination);}catch{}throw error;}
     },
     getSetting,getStorageMode:storageMode,setSetting:(id,value)=>{const key=settingKey(id);return put('settings',{id:key,value});},
     listCampaigns(filter={}){const where=['storageMode=?'],params=[storageMode()];if(filter.ownerId){where.push("json_extract(data,'$.ownerId')=?");params.push(filter.ownerId);}if(filter.ids){if(!filter.ids.length)return [];where.push(`id IN(${filter.ids.map(()=>'?').join(',')})`);params.push(...filter.ids);}return parseRows(prepared(`SELECT data FROM campaigns${where.length?' WHERE '+where.join(' AND '):''} ORDER BY rowid`).all(...params));},
@@ -373,6 +361,8 @@ async function createStore(dir,options={}) {
   // This one-time migration marker preserves deliberately cleared histories.
   if(!getSetting('historyProjectionInitialized',false))transaction(()=>{for(const row of prepared('SELECT data FROM jobs ORDER BY rowid DESC LIMIT 10000').all()){const j=JSON.parse(row.data);projection('sends',j.id,j);}for(const row of prepared('SELECT data FROM rounds ORDER BY rowid DESC LIMIT 10000').all()){const r=JSON.parse(row.data);projection('campaigns',`round:${r.id}`,{...r,kind:'round'});}putRaw('settings',{id:'historyProjectionInitialized',value:true});retentionRaw();});
   attachSearchStore(store,{db,prepared,transaction});
+  db.exec("CREATE INDEX IF NOT EXISTS diagnostics_trace_mode_time ON diagnostics(storageMode,json_extract(data,'$.traceId'),createdAt DESC)");
+  if(options.upgradeVersion)store.setSetting('lastAppUpgradeVersion',options.upgradeVersion);
   return store;
 }
 function seed(store) {

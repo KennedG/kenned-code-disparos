@@ -29,13 +29,6 @@ function campaign(input, store) {
   if (ids.some(g=>!store.getGroup(g))) throw new Error('Um grupo não está disponível. Atualize a lista.');
   const storageMode=store.getStorageMode?.();
   if(storageMode&&ids.some(g=>Boolean(store.getGroup(g).simulation)!==(storageMode==='simulated')))throw new Error('Selecione somente grupos do modo atual de integração.');
-  const contactIds=[...new Set(input.contactIds??old?.contactIds??[])];
-  if(contactIds.length>1000||contactIds.some(id=>typeof id!=='string'||!store.getEntity('contacts',id)))throw new Error('Selecione contatos cadastrados do modo atual (até 1.000).');
-  if(contactIds.some(id=>store.getEntity('contacts',id).promotionalConsent!==true))throw new Error('Registre autorização para receber mensagens promocionais antes de selecionar um contato.');
-  const audience=input.audience??old?.audience;
-  if(audience!==undefined&&!['retail','wholesale','general'].includes(audience))throw new Error('Público inválido.');
-  const promotionPolicy=input.promotionPolicy??old?.promotionPolicy;
-  if(promotionPolicy){for(const key of ['repeatLimit','minimumIntervalMinutes'])if(promotionPolicy[key]!==undefined&&(!Number.isInteger(promotionPolicy[key])||promotionPolicy[key]<0||promotionPolicy[key]>100000))throw new Error('Limite promocional inválido.');}
   if (!['repeat','rotate'].includes(input.mode)) throw new Error('Modo de conteúdo inválido.');
   for (const key of ['dailyRoundLimit','dailySendLimit']) if (input[key] !== undefined && !Number.isInteger(Number(input[key]))) throw new Error('Limites diários devem ser números inteiros.');
   const overrides = {};
@@ -51,6 +44,6 @@ function campaign(input, store) {
   const retryPolicy={maxAttempts,delaySeconds:number(policy.delaySeconds??3,3,3600,'Intervalo entre tentativas')};
   const ownerId=input.ownerId??old?.ownerId??old?.ownerUserId??null;
   if(ownerId!==null&&(typeof ownerId!=='string'||!ownerId||ownerId.length>512))throw new Error('Dono da campanha inválido.');
-  return {id,name:String(input.name).trim(),state:old?.state || 'draft',mode:input.mode,...(storageMode?{storageMode}:{}),intervalMinutes:number(input.intervalMinutes,1,10080,'Intervalo entre rodadas'),spacingSeconds:number(input.spacingSeconds,3,3600,'Espaçamento entre envios'),schedule:schedule(input.schedule),dailyRoundLimit:number(input.dailyRoundLimit || 0,0,10000,'Limite diário de rodadas'),dailySendLimit:number(input.dailySendLimit || 0,0,100000,'Limite diário de envios'),groupIds:ids,contactIds,oneShot:old?.oneShot===true||input.oneShot===true,...(audience!==undefined?{audience}:{}),...(promotionPolicy?{promotionPolicy}:{}),...(old?.commercialListId?{commercialListId:old.commercialListId}:{}),items:items(input.items || [],store),groupOverrides:overrides,ownerId,responsibleUserIds:references(input.responsibleUserIds??old?.responsibleUserIds??[],'Responsáveis'),alertRecipientIds:references(input.alertRecipientIds??old?.alertRecipientIds??[],'Destinatários'),retryPolicy,nextRunAt:old?.nextRunAt || null,roundIndex:old?.roundIndex || 0,revision:old?.revision || 0,configRevision:old?.configRevision||0};
+  return {id,name:String(input.name).trim(),state:old?.state || 'draft',mode:input.mode,...(storageMode?{storageMode}:{}),intervalMinutes:number(input.intervalMinutes,1,10080,'Intervalo entre rodadas'),spacingSeconds:number(input.spacingSeconds,3,3600,'Espaçamento entre envios'),schedule:schedule(input.schedule),dailyRoundLimit:number(input.dailyRoundLimit || 0,0,10000,'Limite diário de rodadas'),dailySendLimit:number(input.dailySendLimit || 0,0,100000,'Limite diário de envios'),groupIds:ids,items:items(input.items || [],store),groupOverrides:overrides,ownerId,responsibleUserIds:references(input.responsibleUserIds??old?.responsibleUserIds??[],'Responsáveis'),alertRecipientIds:references(input.alertRecipientIds??old?.alertRecipientIds??[],'Destinatários'),retryPolicy,nextRunAt:old?.nextRunAt || null,roundIndex:old?.roundIndex || 0,revision:old?.revision || 0,configRevision:old?.configRevision||0};
 }
 module.exports = {campaign,items,schedule,number};

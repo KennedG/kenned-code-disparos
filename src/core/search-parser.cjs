@@ -71,8 +71,17 @@ function extractModels(text,{inferIPhone=false}={}) {
   return matches.map(m=>({...m,modelKey:clean(m.model)})).sort((a,b)=>a.start-b.start);
 }
 function title(text){return text.replace(/\b\w/g,c=>c.toUpperCase());}
+function ramDetails(text){
+  const values=[],spans=[];
+  const patterns=[/\b(?:memoria\s+)?ram\s*[:=-]?\s*(\d{1,3})\s*(?:gb)?\b/g,/\b(\d{1,3})\s*gb\s*(?:de\s+)?(?:memoria\s+)?ram\b(?!\s*[:=-]?\s*\d)/g];
+  for(const re of patterns)for(const m of text.matchAll(re)){spans.push([m.index,m.index+m[0].length]);const gb=Number(m[1]);if(gb>0&&gb<=128&&!/\b(?:virtual|expandida|expansivel)\b/.test(text.slice(m.index,Math.min(text.length,m.index+m[0].length+18))))values.push(gb);}
+  return {values:[...new Set(values)],spans};
+}
 function storageValues(text){
   const values=[];
+  // Explicit RAM is not storage. Unknown memory notation stays ambiguous.
+  const spans=ramDetails(text).spans;
+  for(const [start,end] of spans.sort((a,b)=>b[0]-a[0]))text=text.slice(0,start)+' '.repeat(end-start)+text.slice(end);
   for(const m of text.matchAll(/\b(\d{1,4}(?:[.,]\d+)?)\s*(gb|tb)\b/g)) {const gb=Number(m[1].replace(',','.'))*(m[2]==='tb'?1024:1);if(Number.isInteger(gb)&&gb>0&&gb<=8192) values.push(gb);}
   // "256/512GB" states two capacities, not one 512GB product.
   for(const m of text.matchAll(/\b(\d{2,4})\s*\/\s*\d{2,4}\s*gb\b/g)) values.push(Number(m[1]));
@@ -85,10 +94,11 @@ function colorValues(text){
 }
 function conditionValues(text){return [...new Set([...text.matchAll(/\b(lacrado|seminovo|usado|cpo)\b/g)].map(m=>m[1]))];}
 function details(raw,aliases){
-  const n=normalize(raw,aliases),storages=storageValues(fold(raw)),colors=colorValues(n),conditions=conditionValues(n);
+  const folded=fold(raw),n=normalize(raw,aliases),storages=storageValues(folded),ramValues=ramDetails(folded).values,colors=colorValues(n),conditions=conditionValues(n);
+  const category=String(raw).match(/\bcategoria\s*[:=]\s*([^\n;|]{1,80})/i)?.[1]?.trim()??null;
   const battery=n.match(/\b(?:bateria|saude(?: da bateria)?|battery)\s*(?:em|de)?\s*(\d{1,3})\b/);
   const warranty=String(raw).match(/(?:garantia|warranty)[^\n;|]{0,100}/i)?.[0]?.trim()??null;
-  return {n,storages,colors,conditions,storageGB:storages.length===1?storages[0]:null,colorKey:colors.length===1?colors[0]:null,color:colors.length===1?COLOR_LABELS[colors[0]]??title(colors[0]):null,condition:conditions.length===1?conditions[0]:null,batteryPercent:battery&&Number(battery[1])<=100?Number(battery[1]):null,warranty};
+  return {n,storages,ramValues,ramGB:ramValues.length===1?ramValues[0]:null,category,colors,conditions,storageGB:storages.length===1?storages[0]:null,colorKey:colors.length===1?colors[0]:null,color:colors.length===1?COLOR_LABELS[colors[0]]??title(colors[0]):null,condition:conditions.length===1?conditions[0]:null,batteryPercent:battery&&Number(battery[1])<=100?Number(battery[1]):null,warranty};
 }
 
 function parseQuery(text,{aliases}={}){
@@ -176,6 +186,7 @@ function makeOffer(raw,context,{aliases}={}){
   if(models.length>1) reasons.push('multiple_models');
   if(models.some(m=>/^\s+(?:pro|max|ultra|plus|mini|air|lite|fe|promax|[45]\s+g)\b/.test(d.n.slice(m.end)))) reasons.push('unsupported_model_variant');
   if(d.storages.length>1) reasons.push('ambiguous_storage');
+  if(d.ramValues.length>1) reasons.push('ambiguous_ram');
   if(d.colors.length>1) reasons.push('ambiguous_color');
   if(d.conditions.length>1) reasons.push('ambiguous_condition');
   const prices=priceCandidates(raw),usable=prices.filter(p=>!p.excluded);
@@ -197,7 +208,7 @@ function makeOffer(raw,context,{aliases}={}){
   const contacts=extractContacts(raw),contact=contacts.length===1?contacts[0]:null;
   const priceKind=price?(lot?'lot':price.priceKind):'unknown',minPurchase=min?Number(min[1]):null;
   const priceQualifier=priceKind==='from'?'a partir de':priceKind==='lot'?`lote / atacado${minPurchase?`; compra mínima: ${minPurchase} unidades`:''}`:null;
-  return productFingerprint({model:model.model,modelKey:model.modelKey,storageGB,colorKey,color:colorKey?COLOR_LABELS[colorKey]??title(colorKey):null,condition,batteryPercent:d.batteryPercent??context.batteryPercent??null,warranty:d.warranty??context.warranty??null,notes:raw.trim(),priceCents:price?.priceCents??null,priceKind,priceQualifier,minPurchase,contactPhone:contact?.contactPhone??null,contactRaw:contact?.contactRaw??null,originalExcerpt:excerpt,confidence:reasons.length?'review':'confirmed',reviewReasons:reasons,unavailable,status:unavailable?'unavailable':'active'});
+  return productFingerprint({model:model.model,modelKey:model.modelKey,storageGB,ramGB:d.ramGB??context.ramGB??null,category:d.category??context.category??null,colorKey,color:colorKey?COLOR_LABELS[colorKey]??title(colorKey):null,condition,batteryPercent:d.batteryPercent??context.batteryPercent??null,warranty:d.warranty??context.warranty??null,notes:raw.trim(),priceCents:price?.priceCents??null,priceKind,priceQualifier,minPurchase,contactPhone:contact?.contactPhone??null,contactRaw:contact?.contactRaw??null,originalExcerpt:excerpt,confidence:reasons.length?'review':'confirmed',reviewReasons:reasons,unavailable,status:unavailable?'unavailable':'active'});
 }
 
 function splitPriceVariants(raw,aliases){
@@ -229,7 +240,7 @@ function parseOffers(text,{aliases}={}){
     // Standalone accessories never become phones by inherited header context.
     if(/^(?:[\W_]*)(?:capa|capinha|carregador|pelicula|fone|airpods|cabo|acessorios?)\b/.test(fold(raw))) {last=[];continue;}
     if(models.length===1){
-      context={model:models[0],storageGB:d.storageGB,colorKey:d.colorKey,condition:d.condition??globalCondition,batteryPercent:d.batteryPercent,warranty:d.warranty,header:raw,modelHeader:raw};
+      context={model:models[0],storageGB:d.storageGB,ramGB:d.ramGB,category:d.category,colorKey:d.colorKey,condition:d.condition??globalCondition,batteryPercent:d.batteryPercent,warranty:d.warranty,header:raw,modelHeader:raw};
     } else if(models.length>1) context={...context,model:models[0],header:raw};
     if(!hasPrice){
       if(models.length){last=[];if(/\b(?:esgotado|esgotada|indisponivel|sem estoque|vendido|vendida|nao disponivel)\b/.test(d.n)){const offer=makeOffer(raw,context,{aliases});if(offer){offers.push(offer);last=[offer];}}continue;}
@@ -242,9 +253,9 @@ function parseOffers(text,{aliases}={}){
       for(const color of COLORS) headerRest=headerRest.replace(new RegExp(`\\b${escapeRE(color)}\\b`,'g'),' ');
       const isHeader=(d.storages.length||d.colors.length)&&!headerRest.trim();
       if(isHeader){context={...context,storageGB:d.storages.length?d.storageGB:context.storageGB,colorKey:d.colors.length?d.colorKey:context.colorKey,header:[context.header,raw].filter(Boolean).join('\n')};last=[];continue;}
-      const observation=/\b(?:bateria|saude|garantia|cpo|lacrado|seminovo|usado|esgotado|indisponivel|sem estoque|vendido|observacao|obs|detalhe|avaria|marca|nota fiscal|nf|lote|atacado|minimo|compra minima)\b/.test(d.n);
+      const observation=/\b(?:ram|categoria|bateria|saude|garantia|cpo|lacrado|seminovo|usado|esgotado|indisponivel|sem estoque|vendido|observacao|obs|detalhe|avaria|marca|nota fiscal|nf|lote|atacado|minimo|compra minima)\b/.test(d.n);
       if(observation&&last.length){
-        for(const offer of last){offer.originalExcerpt+='\n'+raw;offer.notes+='\n'+raw;if(d.batteryPercent!==null) offer.batteryPercent=d.batteryPercent;if(d.warranty) offer.warranty=d.warranty;if(d.condition&&!offer.condition) offer.condition=d.condition;if(/\b(?:esgotado|indisponivel|sem estoque|vendido)\b/.test(d.n)){offer.unavailable=true;offer.status='unavailable';}if(/\b(?:lote|atacado|compra minima)\b/.test(d.n)) offer.priceKind='lot';const minimum=d.n.match(/\b(?:minimo|minima|min)\s+(\d+)\s*(?:un|unidades|pecas|aparelhos)\b/);if(minimum)offer.minPurchase=Number(minimum[1]);productFingerprint(offer);}
+        for(const offer of last){offer.originalExcerpt+='\n'+raw;offer.notes+='\n'+raw;if(d.ramGB!==null)offer.ramGB=d.ramGB;if(d.category)offer.category=d.category;if(d.batteryPercent!==null) offer.batteryPercent=d.batteryPercent;if(d.warranty) offer.warranty=d.warranty;if(d.condition&&!offer.condition) offer.condition=d.condition;if(/\b(?:esgotado|indisponivel|sem estoque|vendido)\b/.test(d.n)){offer.unavailable=true;offer.status='unavailable';}if(/\b(?:lote|atacado|compra minima)\b/.test(d.n)) offer.priceKind='lot';const minimum=d.n.match(/\b(?:minimo|minima|min)\s+(\d+)\s*(?:un|unidades|pecas|aparelhos)\b/);if(minimum)offer.minPurchase=Number(minimum[1]);productFingerprint(offer);}
       }else if(d.condition){globalCondition=d.condition;context={...context,condition:d.condition,header:raw};last=[];}
       else if(/\b(?:esgotado|indisponivel|sem estoque|vendido)\b/.test(d.n)&&context.model){const offer=makeOffer(raw,context,{aliases});if(offer){offers.push(offer);last=[offer];}}
       continue;
@@ -303,6 +314,7 @@ function rankOffers(offers,query,settings={}){
   }
   found=[...dedup.values()].flat().sort((a,b)=>a.priceCents-b.priceCents||originalTime(b)-originalTime(a)||supplierKey(a).localeCompare(supplierKey(b)));
   if(settings.onePerSupplier){const seen=new Set();found=found.filter(o=>{const key=supplierKey(o);if(seen.has(key))return false;seen.add(key);return true;});}
+  if(settings.allResults===true)return found;
   const internalLimit=Number.isInteger(settings.candidateLimit)?Math.max(1,Math.min(500,settings.candidateLimit)):null;
   const requested=internalLimit??settings.resultCount??settings.maxResults??10;
   return found.slice(0,Math.max(1,Math.min(internalLimit?500:10,Number.isInteger(requested)?requested:10)));

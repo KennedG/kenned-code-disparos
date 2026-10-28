@@ -3,12 +3,23 @@
 const { EventEmitter } = require('node:events');
 const { randomUUID, randomBytes } = require('node:crypto');
 const { configurationFingerprint } = require('./campaign-version.cjs');
+const { normalizePhone } = require('./phone.cjs');
 
 const validPhone = value => typeof value === 'string' && /^[1-9]\d{9,14}$/.test(value);
 const copy = value => structuredClone(value);
 const codeOf = (value, fallback) => typeof value === 'string' && /^[A-Z0-9_]{1,64}$/.test(value) ? value : fallback;
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-const safeDescription = value => String(value || '').slice(0, 500).replace(/(Bearer\s+)[\w.\-]+/gi, '$1[omitido]').replace(/((?:password|senha|token|secret|authorization|credential)\s*[:=]\s*)[^\s,;]+/gi, '$1[omitido]');
+const safeDescription = value => String(value || '')
+  .replace(/(Bearer\s+)[\w.\-]+/gi, '$1[omitido]')
+  .replace(/((?:password|senha|token|secret|authorization|credential|api[_-]?key|private[_-]?key)\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi, '$1[omitido]')
+  .replace(/https?:\/\/[^\s/@:]+:[^\s/@]+@/gi, 'https://[omitido]@')
+  .slice(0, 500);
+const technicalDescription = error => {
+  const description = safeDescription(error?.message);
+  // Some providers emit a bare credential/secret instead of a structured
+  // error. Keep actionable errors, never expose a suspicious unlabelled value.
+  return /(?:secret|password|senha|token|credential)/i.test(description.replace(/(?:password|senha|token|secret|authorization|credential)\s*[=:]\s*\[omitido\]/gi, '')) ? 'Detalhe sensível do transporte omitido.' : description;
+};
 const timestampText = (at, timezone = 'America/Sao_Paulo') => {
   try { return new Date(at).toLocaleString('pt-BR', { timeZone: timezone }); } catch { return new Date(at).toISOString(); }
 };
@@ -67,7 +78,7 @@ class AlertService extends EventEmitter {
         for (const alert of matches) {
           if (alert.messageId !== receipt.messageId || alert.status === 'cancelled') continue;
           const delivered = ['delivered', 'read'].includes(receipt.status) || ['whatsapp-delivered', 'whatsapp-read'].includes(receipt.confirmationScope);
-          this._save('alerts', { ...alert, status: delivered || alert.status === 'delivered' ? 'delivered' : 'confirmed', resultAt: alert.resultAt || this.now(), confirmationScope: alert.confirmationScope === 'whatsapp-read' ? 'whatsapp-read' : delivered ? receipt.confirmationScope || (receipt.status === 'read' ? 'whatsapp-read' : 'whatsapp-delivered') : alert.confirmationScope || receipt.confirmationScope || 'whatsapp-server', ...(delivered ? { deliveredAt: alert.deliveredAt || receipt.deliveredAt || this.now() } : {}), ...(receipt.readAt ? { readAt: alert.readAt || receipt.readAt } : {}), error: null, retryEligible: false });
+          this._save('alerts', { ...alert, status: delivered || alert.status === 'delivered' ? 'delivered' : 'confirmed', resultAt: alert.resultAt || this.now(), lastAcceptedAt: alert.lastAcceptedAt || receipt.acceptedAt || this.now(), acceptedAt: alert.acceptedAt || receipt.acceptedAt || this.now(), confirmationScope: alert.confirmationScope === 'whatsapp-read' ? 'whatsapp-read' : delivered ? receipt.confirmationScope || (receipt.status === 'read' ? 'whatsapp-read' : 'whatsapp-delivered') : alert.confirmationScope || receipt.confirmationScope || 'whatsapp-server', ...(delivered ? { deliveredAt: alert.deliveredAt || receipt.deliveredAt || this.now() } : {}), ...(receipt.readAt ? { readAt: alert.readAt || receipt.readAt } : {}), error: null, errorCode: null, technicalError: null, retryEligible: false });
           this._trace(alert, 'receipt', delivered ? 'ALERT_DELIVERED' : 'ALERT_CONFIRMED', delivered ? 'A integração confirmou entrega ao dispositivo.' : 'A integração confirmou recebimento pelo servidor.', 'Registro conciliado sem novo envio.', alert.attempts || 0);
         }
         this.emit('change');
@@ -131,8 +142,9 @@ class AlertService extends EventEmitter {
     return { cancelled, inFlight };
   }
 
-  _trace(subject, stage, code, description, action, attempts = 0) {
-    this._diagnostic(code, description, action, subject.campaignId, attempts, { traceId: subject.traceId || subject.occurrenceId || subject.id, occurrenceId: subject.occurrenceId || subject.id, alertId: subject.occurrenceId ? subject.id : null, recipientId: subject.recipientId || null, stage: `alerta.${stage}`, userId: subject.userId || null });
+  _trace(subject, stage, code, description, action, attempts = 0, detail = {}) {
+    const level = detail.level || (stage === 'failure' ? subject.status === 'pending' || subject.status === 'uncertain' ? 'warning' : 'error' : code === 'ALERT_SEND_UNCERTAIN' ? 'warning' : stage === 'occurrence' && code !== 'ALERT_TEST' ? subject.event === 'disconnect' ? 'warning' : 'error' : 'info');
+    this._diagnostic(code, description, action, subject.campaignId, attempts, { traceId: subject.traceId || subject.occurrenceId || subject.id, occurrenceId: subject.occurrenceId || subject.id, alertId: subject.occurrenceId ? subject.id : null, recipientId: subject.recipientId || null, targetId: subject.targetId || null, originalAt: subject.originalAt ?? subject.at ?? null, status: subject.status || null, level, error: level === 'error', warning: level === 'warning', stage: `alerta.${stage}`, userId: subject.userId || null, ...detail });
   }
 
   start() {
@@ -182,13 +194,15 @@ class AlertService extends EventEmitter {
     const configured = campaign ? campaign.alertRecipientIds || [] : this.store.getSetting('systemAlertRecipientIds', null);
     const explicit = Array.isArray(configured) ? new Set(configured) : null;
     for (const r of this._list('alert_recipients')) {
-      if (r.enabled !== false && (explicit ? explicit.has(r.id) : r.systemAlerts !== false) && validPhone(r.phone)) result.set(r.phone, { id: r.id, phone: r.phone });
+      const number=normalizePhone(r.phone);
+      if (r.enabled !== false && (explicit ? explicit.has(r.id) : r.systemAlerts !== false) && number) result.set(number, { id: r.id, phone: number });
     }
     const responsible = new Set(campaign?.responsibleUserIds || []);
     for (const u of this._list('users')) {
-      if (u.active === false || !validPhone(u.phone)) continue;
+      const number=normalizePhone(u.phone);
+      if (u.active === false || u.requirePasswordChange === true || !number) continue;
       const role = this.store.getEntity?.('roles', u.roleId);
-      if (role?.isOwner || u.roleId === 'role-owner' || responsible.has(u.id)) result.set(u.phone, { id: `user:${u.id}`, phone: u.phone });
+      if (role?.isOwner || u.roleId === 'role-owner' || responsible.has(u.id)) result.set(number, { id: `user:${u.id}`, phone: number });
     }
     return [...result.values()];
   }
@@ -197,9 +211,12 @@ class AlertService extends EventEmitter {
     if (!validPhone(alert.number)) throw Object.assign(new Error('Telefone do destinatário inválido.'), { code: 'RECIPIENT_NUMBER_INVALID', definitive: true });
     const userRecipient = alert.recipientId?.startsWith('user:');
     const recipient = userRecipient ? this._list('users').find(user => `user:${user.id}` === alert.recipientId) : this._get('alert_recipients', alert.recipientId);
-    if (recipient && (recipient.enabled === false || recipient.active === false || recipient.phone !== alert.number)) throw Object.assign(new Error('Destinatário desativado ou telefone alterado.'), { code: 'ALERT_RECIPIENT_DISABLED', definitive: true });
+    if (recipient && (recipient.enabled === false || recipient.active === false || normalizePhone(recipient.phone) !== alert.number)) throw Object.assign(new Error('Destinatário desativado ou telefone alterado.'), { code: 'ALERT_RECIPIENT_DISABLED', definitive: true });
     if (alert.recipientId && alert.recipientId !== 'test' && !recipient) throw Object.assign(new Error('Destinatário não está mais disponível.'), { code: 'ALERT_RECIPIENT_DISABLED', definitive: true });
+    const linkedUser = !userRecipient && recipient?.userId ? this._list('users').find(user => user.id === recipient.userId) : null;
+    if (!userRecipient && recipient?.userId && (!linkedUser || linkedUser.active === false || linkedUser.requirePasswordChange === true || (linkedUser.phone && normalizePhone(linkedUser.phone) !== alert.number))) throw Object.assign(new Error('O usuário vinculado ao destinatário não está ativo, precisa recuperar o acesso ou teve o telefone alterado.'), { code: 'ALERT_RECIPIENT_DISABLED', definitive: true });
     if (userRecipient) {
+      if (recipient.requirePasswordChange === true) throw Object.assign(new Error('Usuário precisa recuperar o acesso antes de receber alertas.'), { code: 'ALERT_RECIPIENT_DISABLED', definitive: true });
       const role = this.store.getEntity?.('roles', recipient.roleId);
       const owner = role?.isOwner || ['role-owner', 'owner'].includes(recipient.roleId);
       const responsible = alert.campaignId && this.store.getCampaign(alert.campaignId)?.responsibleUserIds?.includes(recipient.id);
@@ -268,13 +285,14 @@ class AlertService extends EventEmitter {
     const id = `${incident.id}:${channel}:${recipient.phone || recipient.id}`;
     const old = this._get('alerts', id);
     if (old) return old;
-    const alert = this._save('alerts', { id, occurrenceId: incident.id, traceId: incident.traceId || incident.id, campaignId: incident.campaignId || null, recipientId: recipient.id, number: recipient.phone || null, channel, integrationMode: this._mode(), simulation: this._mode() === 'simulated', status: 'pending', createdAt: this.now(), originalAt: incident.at, messageId: randomBytes(16).toString('hex').toUpperCase(), text, attempts: 0, nextAttemptAt: this.now(), resultAt: null, code: codeOf(incident.code, 'CAMPAIGN_ERROR'), error: null });
+    const alert = this._save('alerts', { id, occurrenceId: incident.id, traceId: incident.traceId || incident.id, userId: incident.userId || null, campaignId: incident.campaignId || null, recipientId: recipient.id, number: recipient.phone || null, channel, integrationMode: this._mode(), simulation: this._mode() === 'simulated', status: 'pending', createdAt: this.now(), originalAt: incident.at, messageId: randomBytes(16).toString('hex').toUpperCase(), text, attempts: 0, nextAttemptAt: this.now(), resultAt: null, code: codeOf(incident.code, 'CAMPAIGN_ERROR'), error: null });
     this._trace(alert, 'queue', 'ALERT_QUEUED', 'Aviso colocado na fila; ainda não houve confirmação de envio.', this.adapter?.status?.state === 'connected' ? 'Aguardando processamento sequencial.' : 'Pendente até a reconexão do WhatsApp.');
     return alert;
   }
 
   async testRecipient(phone, userId, { recipientId } = {}) {
     this._requireRunning();
+    phone=normalizePhone(phone);
     if (!validPhone(phone)) throw new Error('Informe o telefone com código do país e DDD, entre 10 e 15 dígitos.');
     const incident = { id: randomUUID(), at: this.now(), code: 'ALERT_TEST', event: 'test', userId, reason: 'Teste de alerta solicitado. Nenhuma campanha foi ativada.', recipientSnapshot: [{ id: recipientId || 'test', phone }] };
     const occurrence = this.recordSystemIncident(incident);
@@ -291,14 +309,16 @@ class AlertService extends EventEmitter {
     const occurrence = this.recordSystemIncident(incident);
     this._audit('alert.test', occurrence.occurrenceId, userId, 'Teste do fluxo de ocorrência, notificação local e destinatários configurados.');
     await this._flushQueued(occurrence.alerts.map(alert => alert.id));
-    return { ...occurrence, alerts: occurrence.alerts.map(alert => this._get('alerts', alert.id)) };
+    const result = { ...occurrence, alerts: occurrence.alerts.map(alert => this._get('alerts', alert.id)) };
+    if (!result.alerts.length) Object.assign(result, { deliveryStatus: 'not-configured', deliveryCode: 'ALERT_RECIPIENTS_NOT_CONFIGURED', deliveryReason: 'Nenhum destinatário ativo com telefone válido está configurado. A notificação local foi exibida; nenhum alerta privado entrou na fila.' });
+    return result;
   }
 
   async retryAlert(id, { userId } = {}) {
     this._requireRunning();
     const alert = this._get('alerts', id);
     if (!alert || alert.status !== 'failed' || alert.retryEligible !== true) throw new Error('O alerta exige falha comprovada ou revisão explícita antes de tentar novamente. Resultados incertos não são repetidos.');
-    const retry = this._save('alerts', { ...alert, status: 'pending', messageId: alert.reviewedBy && alert.reviewedConfirmed === false ? randomBytes(16).toString('hex').toUpperCase() : alert.messageId, lifetimeAttempts: (alert.lifetimeAttempts || 0) + (alert.attempts || 0), attempts: 0, nextAttemptAt: this.now(), resultAt: null, error: null, retryEligible: false, retriedAt: this.now(), retriedBy: userId || null });
+    const retry = this._save('alerts', { ...alert, status: 'pending', messageId: alert.reviewedBy && alert.reviewedConfirmed === false ? randomBytes(16).toString('hex').toUpperCase() : alert.messageId, lifetimeAttempts: (alert.lifetimeAttempts || 0) + (alert.attempts || 0), attempts: 0, nextAttemptAt: this.now(), resultAt: null, error: null, errorCode: null, technicalError: null, retryEligible: false, retriedAt: this.now(), retriedBy: userId || null });
     this._audit('alert.retry', id, userId, 'Nova tentativa manual autorizada após falha conhecida ou revisão.');
     this._trace(retry, 'queue', 'ALERT_MANUAL_RETRY', 'Tentativa manual registrada.', 'Aviso pendente; nenhuma confirmação antecipada.');
     await this._flushQueued([id]);
@@ -309,7 +329,7 @@ class AlertService extends EventEmitter {
     const alert = this._get('alerts', id);
     if (!alert || alert.status !== 'uncertain') throw new Error('O alerta não possui resultado incerto.');
     if (typeof confirmed !== 'boolean') throw new Error('Informe se o envio foi confirmado na revisão.');
-    const result = this._save('alerts', { ...alert, status: confirmed ? 'confirmed' : 'failed', retryEligible: !confirmed, resultAt: this.now(), error: confirmed ? null : 'Revisão manual: envio não confirmado; nenhum reenvio automático.', reviewedAt: this.now(), reviewedBy: userId || null, reviewedConfirmed: confirmed });
+    const result = this._save('alerts', { ...alert, status: confirmed ? 'confirmed' : 'failed', retryEligible: !confirmed, resultAt: this.now(), confirmationScope: confirmed ? 'manual-review' : alert.confirmationScope, error: confirmed ? null : 'Revisão manual: envio não confirmado; nenhum reenvio automático.', reviewedAt: this.now(), reviewedBy: userId || null, reviewedConfirmed: confirmed });
     this._audit('alert.review', id, userId, confirmed ? 'Envio confirmado manualmente.' : 'Envio não confirmado manualmente.');
     this.emit('change');
     return result;
@@ -378,14 +398,14 @@ class AlertService extends EventEmitter {
         if (alert.channel === 'whatsapp' && last != null) await this.sleep(Math.max(0, minimum - (this.now() - last)));
         if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || (alert.channel === 'whatsapp' && adapter.status.state !== 'connected')) continue;
         const attempt = (alert.attempts || 0) + 1;
-        this._save('alerts', { ...alert, attempts: attempt });
+        this._save('alerts', { ...alert, attempts: attempt, lastAttemptAt: this.now() });
         if (this.store.persistenceFailed || this.scheduler?.persistenceFailed) break;
         let submitted = false;
         try {
           let result;
           if (alert.channel === 'whatsapp') {
             this._validateRecipient(alert);
-            const resolved = adapter.resolveRecipient ? await adapter.resolveRecipient(alert.number) : null;
+            const resolved = adapter.resolveRecipient ? await adapter.resolveRecipient(alert.number,{traceId:alert.traceId||alert.occurrenceId||alert.id}) : null;
             const targetId = typeof resolved === 'string' ? resolved : resolved?.jid || null;
             if (resolved && ((resolved.mode && resolved.mode !== mode) || (mode === 'whatsapp' && resolved.simulation === true))) throw Object.assign(new Error('Destinatário pertence a outro modo de execução.'), { code: 'RECIPIENT_MODE_MISMATCH', definitive: true });
             if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter.status.state !== 'connected') {
@@ -396,13 +416,17 @@ class AlertService extends EventEmitter {
             // Recipient lookup can wait on the network. Permission and contact
             // changes made during that wait must take effect before submission.
             this._validateRecipient(alert);
-            this._save('alerts', { ...this._get('alerts', alert.id), status: 'sending', targetId, isSelf: resolved?.isSelf === true, submittedAt: this.now() });
-            this._trace(alert, 'recipient', 'ALERT_RECIPIENT_RESOLVED', resolved?.isSelf ? 'Destinatário resolvido como a própria conta conectada.' : 'Destinatário privado resolvido pela integração.', 'Iniciando submissão; envio ainda não confirmado.', attempt);
+            const sending = this._save('alerts', { ...this._get('alerts', alert.id), status: 'sending', targetId, isSelf: resolved?.isSelf === true, submittedAt: this.now() });
+            this._trace(sending, 'recipient', 'ALERT_RECIPIENT_RESOLVED', resolved?.isSelf ? 'Destinatário resolvido como a própria conta conectada.' : 'Destinatário privado resolvido pela integração.', 'Autorização atualizada. Iniciando submissão; envio ainda não confirmado.', attempt, { authorization: 'approved' });
             if (this.scheduler) this.scheduler.lastSubmissionAt = this.now();
             submitted = true;
-            result = await adapter.sendPrivate(alert.number, alert.text, { clientMessageId: alert.messageId, beforeSubmit: () => {
-              if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || this.scheduler?.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter.status.state !== 'connected' || this._get('alerts', alert.id)?.status !== 'sending') throw Object.assign(new Error('Alerta interrompido antes da submissão.'), { code:'ALERT_CANCELLED', definitive:true, submitted:false, safeToRetry:false });
-              this._validateRecipient(alert);
+            result = await adapter.sendPrivate(alert.number, alert.text, { clientMessageId: alert.messageId, traceId: alert.traceId || alert.occurrenceId || alert.id, beforeSubmit: () => {
+              if (this._stopped() || stopRevision !== this.stopRevision) throw Object.assign(new Error('Envio interrompido antes da submissão pelo comando parar tudo.'), { code: 'AUTOMATION_STOPPED', definitive: true, submitted: false, safeToRetry: false });
+              if (this.closed || this.store.persistenceFailed || this.scheduler?.persistenceFailed) throw Object.assign(new Error('Processamento de alertas indisponível antes da submissão.'), { code: 'ALERT_PROCESSING_UNAVAILABLE', definitive: true, submitted: false, safeToRetry: false });
+              if (adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter !== this.adapter || adapter.status.state !== 'connected') throw Object.assign(new Error('A conexão mudou antes de enviar o alerta. Nenhuma mensagem foi enviada.'), { code: 'WA_RECIPIENT_CONNECTION_CHANGED', definitive: true, submitted: false, safeToRetry: true });
+              const latest = this._get('alerts', alert.id);
+              if (latest?.status !== 'sending' || latest.messageId !== alert.messageId || latest.number !== alert.number) throw Object.assign(new Error('O alerta foi cancelado ou alterado antes da submissão.'), { code: 'ALERT_SUBMISSION_CHANGED', definitive: true, submitted: false, safeToRetry: false });
+              this._validateRecipient(latest);
             } });
           } else {
             const config = this.store.getSetting('independentAlertChannel', null);
@@ -415,10 +439,10 @@ class AlertService extends EventEmitter {
             result = await this.sendWebhook({ url: config.url, secret, message: alert.text, occurrenceId: alert.occurrenceId, originalAt: alert.originalAt, idempotencyKey: alert.messageId });
           }
           const current = this._get('alerts', alert.id);
-          const confirmed = result?.status === 'confirmed' || ['confirmed', 'delivered'].includes(current.status);
-          const delivered = current.status === 'delivered' || (confirmed && ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope));
-          this._save('alerts', { ...current, status: delivered ? 'delivered' : confirmed ? 'confirmed' : 'uncertain', resultAt: current.resultAt || this.now(), messageId: result?.messageId || alert.messageId, confirmationScope: confirmed ? alert.channel === 'webhook' ? 'channel-accepted' : delivered ? current.confirmationScope || result.confirmationScope : result?.confirmationScope || current.confirmationScope || 'whatsapp-server' : null, ...(delivered ? { deliveredAt: current.deliveredAt || result?.deliveredAt || this.now() } : {}), errorCode: confirmed ? null : 'ALERT_SEND_UNCERTAIN', retryEligible: false, error: confirmed ? null : 'Resultado de alerta incerto; revisão necessária.' });
-          this._trace(alert, 'result', confirmed ? delivered ? 'ALERT_DELIVERED' : 'ALERT_CONFIRMED' : 'ALERT_SEND_UNCERTAIN', confirmed ? delivered ? 'A integração confirmou entrega ao dispositivo.' : 'A integração confirmou recebimento pelo servidor.' : 'A integração não comprovou o envio do aviso.', confirmed ? 'Resultado confirmado; nenhum reenvio.' : 'Alerta separado para revisão; nenhum reenvio automático.', attempt);
+          const confirmed = ['confirmed', 'delivered', 'read'].includes(result?.status) || ['confirmed', 'delivered'].includes(current.status);
+          const delivered = current.status === 'delivered' || ['delivered', 'read'].includes(result?.status) || (confirmed && ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope));
+          const saved = this._save('alerts', { ...current, status: delivered ? 'delivered' : confirmed ? 'confirmed' : 'uncertain', resultAt: current.resultAt || this.now(), messageId: result?.messageId || alert.messageId, ...(confirmed ? { lastAcceptedAt: current.lastAcceptedAt || this.now(), acceptedAt: current.acceptedAt || this.now() } : {}), confirmationScope: confirmed ? alert.channel === 'webhook' ? 'channel-accepted' : delivered ? current.confirmationScope || result.confirmationScope || (result?.status === 'read' ? 'whatsapp-read' : 'whatsapp-delivered') : result?.confirmationScope || current.confirmationScope || 'whatsapp-server' : null, ...(delivered ? { deliveredAt: current.deliveredAt || result?.deliveredAt || this.now() } : {}), errorCode: confirmed ? null : 'ALERT_SEND_UNCERTAIN', retryEligible: false, error: confirmed ? null : 'Resultado de alerta incerto; revisão necessária.', technicalError: null });
+          this._trace(saved, 'result', confirmed ? delivered ? 'ALERT_DELIVERED' : 'ALERT_CONFIRMED' : 'ALERT_SEND_UNCERTAIN', confirmed ? delivered ? 'A integração confirmou entrega ao dispositivo.' : 'A integração confirmou recebimento pelo servidor.' : 'A integração não comprovou o envio do aviso.', confirmed ? 'Resultado confirmado; nenhum reenvio.' : 'Alerta separado para revisão; nenhum reenvio automático.', attempt);
         } catch (error) {
           const acknowledged = this._get('alerts', alert.id);
           if (['confirmed', 'delivered'].includes(acknowledged?.status)) {
@@ -431,6 +455,11 @@ class AlertService extends EventEmitter {
           const safe = !submitted || error?.safeToRetry === true;
           const definitive = safe || error?.definitive === true;
           if (acknowledged?.status === 'cancelled') continue;
+          if (error?.code === 'AUTOMATION_STOPPED' && error.submitted === false) {
+            const cancelled = this._save('alerts', { ...acknowledged, status: 'cancelled', resultAt: this.now(), cancelledAt: this.now(), errorCode: 'AUTOMATION_STOPPED', error: 'Alerta interrompido antes da submissão pelo comando parar tudo.', retryEligible: false });
+            this._trace(cancelled, 'cancelled', 'AUTOMATION_STOPPED', cancelled.error, 'Nenhuma mensagem foi enviada e nenhuma nova tentativa automática será realizada.', attempt);
+            this.emit('change'); continue;
+          }
           const policy = (alert.campaignId ? this.store.getCampaign(alert.campaignId)?.retryPolicy : null) || this.store.getSetting('alertRetryPolicy', { maxAttempts: 3, delaySeconds: 15 });
           const max = Math.max(1, Math.min(5, Number.isInteger(policy.maxAttempts) ? policy.maxAttempts : 3));
           // The integration uses definitive=true to mean a *known failed*
@@ -439,10 +468,11 @@ class AlertService extends EventEmitter {
           const autoRetry = error?.safeToRetry === true || (!submitted && error?.definitive !== true && error?.safeToRetry !== false);
           const status = autoRetry && attempt < max ? 'pending' : definitive ? 'failed' : 'uncertain';
           const errorCode = codeOf(error?.code, 'ALERT_SEND_ERROR');
-          const explanations = { RECIPIENT_NOT_REGISTERED: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', WA_RECIPIENT_NOT_FOUND: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', RECIPIENT_NUMBER_INVALID: 'O telefone precisa conter código do país, DDD e número.', WA_RECIPIENT_INVALID: 'O telefone precisa conter código do país, DDD e número.', RECIPIENT_SELF_UNAVAILABLE: 'A integração ainda não identificou o número da própria conta. Reconecte e tente novamente.', WA_RECIPIENT_TIMEOUT: 'O WhatsApp não respondeu à consulta do destinatário. Confira a internet e tente novamente após o intervalo.', WA_RECIPIENT_OFFLINE: 'A conexão caiu antes de resolver o destinatário. O envio não ocorreu.', WA_RECIPIENT_UNSUPPORTED: 'A integração conectada não oferece a consulta de destinatários exigida. Atualize o aplicativo e reconecte o WhatsApp.', WA_RECIPIENT_MISMATCH: 'O WhatsApp retornou uma conta diferente do número solicitado. Confira o número e a sessão; o destino não foi substituído.', ALERT_RECIPIENT_DISABLED: 'O destinatário foi removido, desativado ou teve o telefone alterado. Confira o cadastro.', RECIPIENT_MODE_MISMATCH: 'O destinatário pertence a outro modo. Confira a conexão selecionada.' };
+          const explanations = { RECIPIENT_NOT_REGISTERED: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', WA_RECIPIENT_NOT_FOUND: 'O número não foi encontrado no WhatsApp. Confira país, DDD e número.', RECIPIENT_NUMBER_INVALID: 'O telefone precisa conter código do país, DDD e número.', WA_RECIPIENT_INVALID: 'O telefone precisa conter código do país, DDD e número.', RECIPIENT_SELF_UNAVAILABLE: 'A integração ainda não identificou o número da própria conta. Reconecte e tente novamente.', WA_RECIPIENT_TIMEOUT: 'O WhatsApp não respondeu à consulta do destinatário. Confira a internet e tente novamente após o intervalo.', WA_RECIPIENT_OFFLINE: 'A conexão caiu antes de resolver o destinatário. O envio não ocorreu.', WA_RECIPIENT_UNSUPPORTED: 'A integração conectada não oferece a consulta de destinatários exigida. Atualize o aplicativo e reconecte o WhatsApp.', WA_RECIPIENT_MISMATCH: 'O WhatsApp retornou uma conta diferente do número solicitado. Confira o número e a sessão; o destino não foi substituído.', WA_RECIPIENT_AMBIGUOUS: 'O WhatsApp retornou mais de uma conta possível para o telefone. O destino não foi escolhido por suposição. Confira o número e reconecte.', WA_RECIPIENT_CONNECTION_CHANGED: 'A conexão mudou durante a identificação do destinatário. Nenhuma mensagem foi enviada; uma nova tentativa limitada pode ocorrer após reconectar.', WA_RECIPIENT_LOOKUP_TEMPORARY: 'Falha temporária na consulta do destinatário. Confira a internet e aguarde a tentativa limitada.', WA_RECIPIENT_LOOKUP_REJECTED: 'O WhatsApp recusou a consulta do destinatário. Confira a conexão e eventuais restrições.', ALERT_RECIPIENT_DISABLED: 'O destinatário foi removido, desativado, teve o telefone alterado ou está vinculado a um usuário sem acesso ativo. Confira o cadastro.', RECIPIENT_MODE_MISMATCH: 'O destinatário pertence a outro modo. Confira a conexão selecionada.', ALERT_PROCESSING_UNAVAILABLE: 'O processamento de alertas foi interrompido. Confira o diagnóstico e o armazenamento antes de tentar novamente.', ALERT_SUBMISSION_CHANGED: 'O alerta foi alterado ou cancelado antes da submissão. Nenhum envio foi realizado.' };
           const explanation = explanations[errorCode] || (status === 'pending' ? 'Falha anterior à submissão; tentativa limitada pendente.' : status === 'failed' ? 'Alerta falhou. Confira a conexão, o país/DDD do número e o cadastro do destinatário.' : 'Resultado de alerta incerto; revisão necessária antes de repetir.');
-          this._save('alerts', { ...this._get('alerts', alert.id), status, resultAt: status === 'pending' ? null : this.now(), nextAttemptAt: this.now() + Math.max(3, Math.min(3600, Number(policy.delaySeconds) || 15), adapter.minimumSpacingSeconds || 3) * 1000, errorCode, retryEligible: status === 'failed' && definitive, error: explanation });
-          this._trace(alert, 'failure', errorCode, explanation, status === 'pending' ? 'Nova tentativa limitada agendada.' : status === 'failed' && definitive ? 'Envio não ocorreu. Uma nova tentativa manual pode ser solicitada.' : 'Revisão do alerta necessária.', attempt);
+          const technicalError = technicalDescription(error);
+          const failed = this._save('alerts', { ...this._get('alerts', alert.id), status, resultAt: status === 'pending' ? null : this.now(), lastFailureAt: this.now(), nextAttemptAt: this.now() + Math.max(3, Math.min(3600, Number(policy.delaySeconds) || 15), adapter.minimumSpacingSeconds || 3) * 1000, errorCode, retryEligible: status === 'failed' && definitive, error: explanation, technicalError });
+          this._trace(failed, 'failure', errorCode, explanation, status === 'pending' ? 'Nova tentativa limitada agendada.' : status === 'failed' && definitive ? 'Envio não ocorreu. Uma nova tentativa manual pode ser solicitada.' : 'Revisão do alerta necessária.', attempt, { technicalError });
         }
         this.emit('change');
       }

@@ -1,7 +1,8 @@
 'use strict';
 
 const { EventEmitter } = require('node:events');
-const { randomUUID } = require('node:crypto');
+const { randomUUID,createHash } = require('node:crypto');
+const fs=require('node:fs'),path=require('node:path');
 
 /** A local test transport. Its groups and receipts never represent WhatsApp. */
 class SimulatedAdapter extends EventEmitter {
@@ -90,8 +91,7 @@ class SimulatedAdapter extends EventEmitter {
     while (this.automaticMessages.size > 10000) this.automaticMessages.delete(this.automaticMessages.values().next().value);
   }
 
-  async send(groupId, item, media, {beforeSubmit}={}) {
-    item=beforeSubmit?.()||item;
+  async send(groupId, item, media) {
     if (this.status.state !== 'connected') {
       throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     }
@@ -120,21 +120,14 @@ class SimulatedAdapter extends EventEmitter {
     return result;
   }
 
-  async sendPrivateContent(number,item,media,{beforeSubmit}={}) {
-    const target=await this.resolveRecipient(String(number));item=beforeSubmit?.()||item;
-    if(item.type!=='text'&&!media)throw Object.assign(new Error('Mídia simulada ausente.'),{definitive:true,submitted:false});
-    const result=await this.sendPrivate(target.phone,item.text||item.caption||`Arquivo simulado: ${media.name}`,{clientMessageId:item.clientMessageId});
-    const entry=this.sent.find(e=>e.messageId===result.messageId);if(entry){entry.item={...item};entry.mediaId=media?.id;}return result;
-  }
-
-  async sendPrivate(number, text, { clientMessageId, beforeSubmit } = {}) {
+  async sendPrivate(number, text, { clientMessageId,beforeSubmit } = {}) {
     if (!/^[1-9]\d{9,14}$/.test(String(number || ''))) throw Object.assign(new Error('Telefone privado inválido. Use código do país e DDD.'), { safeToRetry: false });
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw Object.assign(new Error('Alerta privado inválido.'), { safeToRetry: false });
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
-    beforeSubmit?.();
+    this._beforeSubmit(beforeSubmit);
     const outcome = this.nextOutcome || 'confirmed';
     this.nextOutcome = null;
-    if (outcome === 'failed') throw Object.assign(new Error('Falha temporária simulada antes do alerta.'), { safeToRetry: true });
+    if (outcome === 'failed') throw Object.assign(new Error('Falha temporária simulada antes do alerta.'), { safeToRetry: true,submitted:false });
     const messageId = clientMessageId || `SIM-PRIVATE-${randomUUID()}`;
     const existing = this.sent.find(entry => entry.messageId === messageId);
     if (existing) {
@@ -156,6 +149,18 @@ class SimulatedAdapter extends EventEmitter {
     return { enabled: this.searchCapture.enabled, importHistory: this.searchCapture.importHistory, ...this.getSearchCapabilities() };
   }
 
+  _beforeSubmit(callback){if(!callback)return;try{const result=callback();if(result&&typeof result.then==='function')throw Object.assign(new Error('A guarda final deve ser síncrona.'),{code:'WA_SUBMISSION_GUARD_ASYNC'});}catch(error){throw Object.assign(new Error(error.message||'Envio bloqueado antes da submissão.'),{code:error.code||'WA_SUBMISSION_BLOCKED',definitive:true,safeToRetry:false,submitted:false});}}
+  async sendPrivateContent(target,item,media,options={}){
+    if(item?.type==='text')return this.sendSearchText(target,item.text,options);
+    if(item?.type!=='document'||!media?.path)throw Object.assign(new Error('Documento gerenciado não informado.'),{safeToRetry:false,submitted:false});
+    const filename=fs.realpathSync(media.path),library=fs.realpathSync(path.join(this.store.dir,'media'));
+    if(!filename.startsWith(library+path.sep)||fs.lstatSync(media.path).isSymbolicLink())throw Object.assign(new Error('Documento fora da biblioteca gerenciada.'),{safeToRetry:false,submitted:false});
+    const bytes=fs.readFileSync(filename);if(!bytes.length||bytes.length>64*1024*1024||bytes.length!==media.size||createHash('sha256').update(bytes).digest('hex')!==media.sha256)throw Object.assign(new Error('O documento foi alterado ou está indisponível.'),{safeToRetry:false,submitted:false});
+    const result=await this.sendSearchText(target,item.caption||'Documento de busca — simulação',options);
+    const sent=this.sent.find(entry=>entry.messageId===result.messageId);if(sent)Object.assign(sent,{document:{name:media.name,mime:media.mime,size:media.size,sha256:media.sha256},mediaId:media.id,type:'document'});
+    return result;
+  }
+  async sendSearchDocument(target,document,options={}){return this.sendPrivateContent(target,{type:'document',caption:document.caption||''},document,options);}
   getSearchCapabilities() {
     return { searchCapture: true, live: true, edits: true, deletes: true, opportunisticHistory: true, communityGroups: 'simulation-only', historySupport: 'simulated', complete: false, originalMessageLinks: false, official: false, simulation: true };
   }
@@ -168,11 +173,12 @@ class SimulatedAdapter extends EventEmitter {
     return groupIds === null || groupIds.has(chatId) || (!history && (commandGroupIds === null || commandGroupIds.has(chatId)));
   }
 
-  async sendSearchText(target, text, { clientMessageId, replyContext } = {}) {
+  async sendSearchText(target, text, { clientMessageId, replyContext,beforeSubmit } = {}) {
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw Object.assign(new Error('Resultado da busca inválido.'), { safeToRetry: false });
     if (typeof target !== 'string' || !(/^\d{10,15}$/.test(target) || /^\d+(?::\d+)?@(s\.whatsapp\.net|lid)$/.test(target) || /^sim-\d+@simulation$/.test(target))) throw Object.assign(new Error('Destinatário da busca inválido para simulação.'), { safeToRetry: false });
     if (replyContext) { const resolved = await this.resolveSearchRecipient(target, replyContext); target = resolved.jid; }
+    this._beforeSubmit(beforeSubmit);
     const targetId = /^\d{10,15}$/.test(target) ? `${target}@s.whatsapp.net` : target.replace(/:\d+(?=@)/, '');
     const messageId = clientMessageId || `SIM-SEARCH-${randomUUID()}`;
     const existing = this.sent.find(entry => entry.messageId === messageId);
@@ -200,9 +206,9 @@ class SimulatedAdapter extends EventEmitter {
     return this.status;
   }
 
-  async reply(chatId, text, { replyContext, clientMessageId } = {}) {
+  async reply(chatId, text, { replyContext, clientMessageId,beforeSubmit } = {}) {
     if (replyContext) {
-      const result = await this.sendSearchText(chatId, String(text), { replyContext, clientMessageId });
+      const result = await this.sendSearchText(chatId, String(text), { replyContext, clientMessageId,beforeSubmit });
       if (!this.replies.some(reply => reply.messageId === result.messageId)) {
         this.replies.push({ chatId, text: String(text), messageId: result.messageId, status: result.status, at: new Date().toISOString(), simulation: true });
         if (this.replies.length > 1000) this.replies.splice(0, this.replies.length - 1000);
@@ -211,7 +217,8 @@ class SimulatedAdapter extends EventEmitter {
       return result;
     }
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
-    const messageId = `SIM-REPLY-${randomUUID()}`;
+    this._beforeSubmit(beforeSubmit);
+    const messageId = clientMessageId||`SIM-REPLY-${randomUUID()}`;
     this._markAutomatic(messageId, 'simulated-control-reply');
     this.replies.push({ chatId, text: String(text), messageId, at: new Date().toISOString(), simulation: true });
     if (this.replies.length > 1000) this.replies.splice(0, this.replies.length - 1000);

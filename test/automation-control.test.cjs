@@ -78,7 +78,7 @@ test('global stop latches synchronously before any awaited callback, cancels que
 test('global stop aborts a campaign spacing wait and records an already-submitted result once', async t => {
   const f = await fixture(t), entered = f.barrier(), released = f.barrier();
   const send = f.adapter.send.bind(f.adapter);
-  f.adapter.send = async (...args) => { const submission=send(...args);entered.resolve(); await released.promise; return submission; };
+  f.adapter.send = async (...args) => { entered.resolve(); await released.promise; return send(...args); };
   await f.scheduler.activate(f.campaign.id); const round = f.scheduler.tick(); await entered.promise;
   const report = await f.control.stop();
   assert.equal(report.inFlight, 1);
