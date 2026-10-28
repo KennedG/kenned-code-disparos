@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; font-src 'self'; media-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Automação Comunidade</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app" class="app-shell" aria-busy="true">
+    <aside class="sidebar" aria-label="Menu principal">
+      <a class="brand" href="#painel" aria-label="Automação Comunidade — Painel">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40"><path d="M8 26 17 8h7l9 18h-7l-2-5h-8l-2 5Z"/><path class="brand-link" d="M12 31h18M9 35h15"/></svg></span>
+        <span>Automação<small>Comunidade</small></span>
+      </a>
+      <p class="nav-caption">SEU ESPAÇO DE TRABALHO</p>
+      <nav id="navigation"></nav>
+      <div class="sidebar-bottom"><span class="privacy-dot"></span>Dados locais e independentes<small id="sidebar-version">Carregando versão…</small></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="connection-summary"><span id="connection-dot" class="status-dot"></span><div><strong id="connection-label">Carregando conexão</strong><small id="connection-detail">Aguardando o aplicativo</small></div></div>
+        <div class="topbar-actions"><span id="current-clock" class="clock"></span><button class="button danger" id="stop-all">■ PARAR TODOS OS ENVIOS</button></div>
+      </header>
+      <div id="simulation-banner" class="simulation-banner" hidden>SIMULAÇÃO — DADOS FICTÍCIOS <span>Nenhuma mensagem será enviada para contatos reais.</span></div>
+      <div id="global-pause" class="notice warning" hidden><span><strong>Envios automáticos interrompidos.</strong> Novas entradas estão bloqueadas até a retomada explícita.</span><button class="button secondary" id="resume-automation">Retomar automação</button></div>
+      <div id="storage-error" class="notice danger-notice" hidden></div>
+      <main id="main" tabindex="-1"><div class="loading-state"><span class="spinner"></span><h1>Preparando seu espaço</h1><p>Carregando os dados salvos neste computador.</p></div></main>
+      <footer class="app-footer"><span>Envios dependem do computador ligado, aplicativo em execução e conexão disponível.</span><span>Integração WhatsApp não oficial.</span></footer>
+    </div>
+  </div>
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  <dialog id="modal"><div id="modal-content"></div></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -17,3 +17,7 @@ As pastas privadas do Google Drive permanecem preservadas; publicar aqui não to
 ## Validação
 
 Os resultados históricos de testes não significam validação atual com WhatsApp real. Na R9, 1.423 testes automatizados passaram, além do teste da interface empacotada com conexão controlada. O recebimento de comandos na R8 foi relatado pelo usuário. Não se presume que todas as versões antigas estejam aptas para produção.
+
+## Automação Comunidade
+
+Aplicativo independente, com código em `automacao-comunidade/`, banco e sessão próprios. Versão atual: **1.0.1**. Releases identificadas por `comunidade-v...`. A presença no mesmo repositório não compartilha credenciais nem altera os aplicativos.
