@@ -2,6 +2,7 @@
 
 const { EventEmitter } = require('node:events');
 const { randomUUID, randomBytes } = require('node:crypto');
+const { assertCampaignSchemaCompatible } = require('./campaign-schema-compat.cjs');
 const ITEM_TYPES = new Set(['text', 'image', 'video', 'document']);
 
 function dateKey(value) {
@@ -205,6 +206,7 @@ class Scheduler extends EventEmitter {
 
   _validateCampaign(campaign) {
     if (!campaign) throw new Error('Campanha não encontrada.');
+    assertCampaignSchemaCompatible(campaign);
     if(campaign.storageMode&&campaign.storageMode!==this.adapter.status.mode)throw new Error('A campanha pertence a outro modo de integração.');
     if (!campaign.name?.trim()) throw new Error('Informe um nome para a campanha.');
     if (!['repeat', 'rotate'].includes(campaign.mode)) throw new Error('Escolha repetir ou alternar os conteúdos.');
@@ -457,6 +459,8 @@ class Scheduler extends EventEmitter {
 
   async _sendJob(job, signal) {
     const policy = this.store.getCampaign(job.campaignId)?.retryPolicy || { maxAttempts: 3, delaySeconds: 3 };
+    try { assertCampaignSchemaCompatible(this.store.getCampaign(job.campaignId), job.itemSnapshot); }
+    catch (error) { if (error.code === 'CAMPAIGN_VERSION_REVIEW') return this._cancelVersionReviewJob(job, error); throw error; }
     for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
       if (signal.aborted || !this._maySend(job.campaignId, job.groupId)) return 'cancelled';
       const at = this.now();
@@ -475,7 +479,7 @@ class Scheduler extends EventEmitter {
       try {
         this.campaignInFlight++;
         let result;
-        try { result = await this.adapter.send(job.groupId, { ...job.itemSnapshot, clientMessageId: job.messageId }, job.itemSnapshot.mediaId ? this.store.getMedia(job.itemSnapshot.mediaId) : null, {beforeSubmit:()=>{this.licenseGuard();if(signal.aborted||!this._maySend(job.campaignId,job.groupId))throw Object.assign(new Error('Campanha interrompida antes da submissão.'),{code:'CAMPAIGN_SUBMISSION_BLOCKED',definitive:true,submitted:false,safeToRetry:false});}}); }
+        try { result = await this.adapter.send(job.groupId, { ...job.itemSnapshot, clientMessageId: job.messageId }, job.itemSnapshot.mediaId ? this.store.getMedia(job.itemSnapshot.mediaId) : null, {beforeSubmit:()=>{assertCampaignSchemaCompatible(this.store.getCampaign(job.campaignId), job.itemSnapshot);this.licenseGuard();if(signal.aborted||!this._maySend(job.campaignId,job.groupId))throw Object.assign(new Error('Campanha interrompida antes da submissão.'),{code:'CAMPAIGN_SUBMISSION_BLOCKED',definitive:true,submitted:false,safeToRetry:false});}}); }
         finally { this.campaignInFlight--; }
         const confirmed = result?.status === 'confirmed' || this.receipts.has(result?.messageId || job.messageId);
         this._persist('updateJob', job.id, {
@@ -485,6 +489,7 @@ class Scheduler extends EventEmitter {
         this.emit('change');
         return confirmed ? 'confirmed' : 'uncertain';
       } catch (error) {
+        if (error?.code === 'CAMPAIGN_VERSION_REVIEW' && error.submitted === false) return this._cancelVersionReviewJob(job, error);
         const safeRetry = error?.safeToRetry === true;
         const definitive = safeRetry || error?.definitive === true;
         const restricted = this.adapter.status.state === 'restricted' || error?.restricted === true;
@@ -507,6 +512,20 @@ class Scheduler extends EventEmitter {
       }
     }
     return 'failed';
+  }
+
+  async _cancelVersionReviewJob(job, error) {
+    this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), errorCode: error.code, error: error.message, reviewRequired: true });
+    if (this.store.addDiagnostic) this._persist('addDiagnostic', {
+      id: randomUUID(), at: this.now(), campaignId: job.campaignId,
+      stage: 'compatibilidade da campanha', code: error.code, description: error.message,
+      attempts: this.store.getJob(job.id)?.attempts || 0,
+      action: 'Envio cancelado antes da submissão e campanha pausada; cadastro original preservado.',
+      guidance: 'Crie uma campanha comum revisada nesta versão, sem os vínculos da versão comercial.'
+    });
+    await this.pause(job.campaignId, error.message);
+    this.emit('change', { error: error.message, code: error.code });
+    return 'cancelled';
   }
 
   _diagnostic(job, code, description, attempts, action) {

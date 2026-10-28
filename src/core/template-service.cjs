@@ -2,6 +2,7 @@
 
 const {randomUUID} = require('node:crypto');
 const validation = require('./validation.cjs');
+const {assertCampaignSchemaCompatible} = require('./campaign-schema-compat.cjs');
 
 const fault = (message, code) => Object.assign(new Error(message), {code});
 class TemplateService {
@@ -27,6 +28,8 @@ class TemplateService {
     const old=input.id?this._get(input.id):undefined;
     if(input.id&&!old)throw fault('O modelo não existe neste modo. Atualize a biblioteca.','TEMPLATE_NOT_FOUND');
     const user=this._assert(userId,old?'media.edit':'media.create');
+    assertCampaignSchemaCompatible(old);
+    assertCampaignSchemaCompatible(input);
     const name=typeof input.name==='string'?input.name.trim():'';
     if(!name||name.length>120||/[\x00-\x1f]/.test(name))throw fault('Informe um nome de modelo de 1 a 120 caracteres.','TEMPLATE_NAME_INVALID');
     const items=validation.items(input.items,this.store);
@@ -44,6 +47,7 @@ class TemplateService {
   }
   duplicate(id,userId) {
     const original=this.get(id,userId);this._assert(userId,'media.create');
+    assertCampaignSchemaCompatible(original);
     const copy=this.save({name:`${original.name.slice(0,110)} (cópia)`,items:original.items.map(i=>({...i,id:randomUUID()}))},userId);
     return copy;
   }
@@ -58,6 +62,7 @@ class TemplateService {
   }
   apply(id,userId) {
     const model=this.get(id,userId);
+    assertCampaignSchemaCompatible(model);
     for(const item of model.items)if(item.type!=='text')this.media.getPath(item.mediaId);
     return {templateId:model.id,name:model.name,items:model.items.map(item=>({...item,id:randomUUID()}))};
   }

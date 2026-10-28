@@ -1,0 +1,2899 @@
+{
+  "coreSchemaVersion": 7,
+  "tables": [
+    {
+      "name": "alert_recipients",
+      "sql": "CREATE TABLE alert_recipients(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "alerts",
+      "sql": "CREATE TABLE alerts(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "audit",
+      "sql": "CREATE TABLE audit(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "automation_outbound",
+      "sql": "CREATE TABLE automation_outbound(id TEXT PRIMARY KEY,at INTEGER NOT NULL,storageMode TEXT NOT NULL,kind TEXT)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_authorizations",
+      "sql": "CREATE TABLE buscas_authorizations(\n      id TEXT PRIMARY KEY,principalId TEXT,active INTEGER NOT NULL DEFAULT 1,\n      createdAt INTEGER NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "principalId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "active",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "1",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_authorizations_simulation",
+      "sql": "CREATE TABLE buscas_authorizations_simulation(\n      id TEXT PRIMARY KEY,principalId TEXT,active INTEGER NOT NULL DEFAULT 1,\n      createdAt INTEGER NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "principalId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "active",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "1",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_deliveries",
+      "sql": "CREATE TABLE buscas_deliveries(\n      id TEXT PRIMARY KEY,runId TEXT NOT NULL,status TEXT NOT NULL,createdAt INTEGER NOT NULL,\n      messageId TEXT,nextAttemptAt INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "runId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "nextAttemptAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_deliveries_simulation",
+      "sql": "CREATE TABLE buscas_deliveries_simulation(\n      id TEXT PRIMARY KEY,runId TEXT NOT NULL,status TEXT NOT NULL,createdAt INTEGER NOT NULL,\n      messageId TEXT,nextAttemptAt INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "runId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "nextAttemptAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_gaps",
+      "sql": "CREATE TABLE buscas_gaps(\n      id TEXT PRIMARY KEY,startedAt INTEGER NOT NULL,endedAt INTEGER,chatId TEXT,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "startedAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "endedAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_gaps_simulation",
+      "sql": "CREATE TABLE buscas_gaps_simulation(\n      id TEXT PRIMARY KEY,startedAt INTEGER NOT NULL,endedAt INTEGER,chatId TEXT,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "startedAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "endedAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_history",
+      "sql": "CREATE TABLE buscas_history(\n      id TEXT PRIMARY KEY,userId TEXT,chatId TEXT,createdAt INTEGER NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_history_simulation",
+      "sql": "CREATE TABLE buscas_history_simulation(\n      id TEXT PRIMARY KEY,userId TEXT,chatId TEXT,createdAt INTEGER NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_inbox",
+      "sql": "CREATE TABLE buscas_inbox(\n      id TEXT PRIMARY KEY,status TEXT NOT NULL,createdAt INTEGER NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_inbox_simulation",
+      "sql": "CREATE TABLE buscas_inbox_simulation(\n      id TEXT PRIMARY KEY,status TEXT NOT NULL,createdAt INTEGER NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_isolation_meta",
+      "sql": "CREATE TABLE buscas_isolation_meta(id TEXT PRIMARY KEY)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_messages",
+      "sql": "CREATE TABLE buscas_messages(\n      chatId TEXT NOT NULL,messageId TEXT NOT NULL,originalAt INTEGER NOT NULL,\n      capturedAt INTEGER NOT NULL,revisionAt INTEGER NOT NULL,deletedAt INTEGER,\n      senderId TEXT,forwarded INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,\n      PRIMARY KEY(chatId,messageId))",
+      "columns": [
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2,
+          "hidden": 0
+        },
+        {
+          "name": "originalAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "capturedAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "revisionAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "deletedAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "senderId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "forwarded",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_messages_simulation",
+      "sql": "CREATE TABLE buscas_messages_simulation(\n      chatId TEXT NOT NULL,messageId TEXT NOT NULL,originalAt INTEGER NOT NULL,\n      capturedAt INTEGER NOT NULL,revisionAt INTEGER NOT NULL,deletedAt INTEGER,\n      senderId TEXT,forwarded INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,\n      PRIMARY KEY(chatId,messageId))",
+      "columns": [
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2,
+          "hidden": 0
+        },
+        {
+          "name": "originalAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "capturedAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "revisionAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "deletedAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "senderId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "forwarded",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_offers",
+      "sql": "CREATE TABLE buscas_offers(\n      id TEXT PRIMARY KEY,chatId TEXT NOT NULL,messageId TEXT NOT NULL,messageAt INTEGER NOT NULL,\n      supplierKey TEXT,modelKey TEXT,storageGB INTEGER,colorKey TEXT,condition TEXT,\n      batteryPercent INTEGER,priceCents INTEGER,priceKind TEXT,confidence TEXT NOT NULL,\n      status TEXT NOT NULL,productKey TEXT,fingerprint TEXT,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "supplierKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "modelKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageGB",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "colorKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "condition",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "batteryPercent",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "priceCents",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "priceKind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "confidence",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "productKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "fingerprint",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_offers_simulation",
+      "sql": "CREATE TABLE buscas_offers_simulation(\n      id TEXT PRIMARY KEY,chatId TEXT NOT NULL,messageId TEXT NOT NULL,messageAt INTEGER NOT NULL,\n      supplierKey TEXT,modelKey TEXT,storageGB INTEGER,colorKey TEXT,condition TEXT,\n      batteryPercent INTEGER,priceCents INTEGER,priceKind TEXT,confidence TEXT NOT NULL,\n      status TEXT NOT NULL,productKey TEXT,fingerprint TEXT,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "supplierKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "modelKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageGB",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "colorKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "condition",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "batteryPercent",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "priceCents",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "priceKind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "confidence",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "productKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "fingerprint",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_runs",
+      "sql": "CREATE TABLE buscas_runs(\n      id TEXT PRIMARY KEY,chatId TEXT,messageId TEXT,userId TEXT,createdAt INTEGER NOT NULL,\n      status TEXT NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "buscas_runs_simulation",
+      "sql": "CREATE TABLE buscas_runs_simulation(\n      id TEXT PRIMARY KEY,chatId TEXT,messageId TEXT,userId TEXT,createdAt INTEGER NOT NULL,\n      status TEXT NOT NULL,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "chatId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "campaigns",
+      "sql": "CREATE TABLE campaigns(id TEXT PRIMARY KEY,data TEXT NOT NULL, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "contact_intake_events",
+      "sql": "CREATE TABLE contact_intake_events(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "contact_pending",
+      "sql": "CREATE TABLE contact_pending(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "contacts",
+      "sql": "CREATE TABLE contacts(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "diagnostics",
+      "sql": "CREATE TABLE diagnostics(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "group_progress",
+      "sql": "CREATE TABLE group_progress(campaignId TEXT NOT NULL,groupId TEXT NOT NULL,lastAt INTEGER NOT NULL,roundCount INTEGER NOT NULL, storageMode TEXT NOT NULL DEFAULT 'whatsapp',PRIMARY KEY(campaignId,groupId))",
+      "columns": [
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "groupId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2,
+          "hidden": 0
+        },
+        {
+          "name": "lastAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "roundCount",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "group_rounds",
+      "sql": "CREATE TABLE group_rounds(campaignId TEXT NOT NULL,groupId TEXT NOT NULL,roundId TEXT NOT NULL,startedAt INTEGER NOT NULL, storageMode TEXT NOT NULL DEFAULT 'whatsapp',PRIMARY KEY(campaignId,groupId,roundId))",
+      "columns": [
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "groupId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2,
+          "hidden": 0
+        },
+        {
+          "name": "roundId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 3,
+          "hidden": 0
+        },
+        {
+          "name": "startedAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "groups_data",
+      "sql": "CREATE TABLE groups_data(id TEXT PRIMARY KEY,data TEXT NOT NULL, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "history",
+      "sql": "CREATE TABLE history(id TEXT PRIMARY KEY,category TEXT NOT NULL,sourceId TEXT NOT NULL,campaignId TEXT,userId TEXT,createdAt INTEGER NOT NULL,status TEXT,data TEXT NOT NULL, storageMode TEXT NOT NULL DEFAULT 'whatsapp',UNIQUE(category,sourceId))",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "category",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "sourceId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "jobs",
+      "sql": "CREATE TABLE jobs(id TEXT PRIMARY KEY,roundId TEXT NOT NULL,campaignId TEXT NOT NULL,groupId TEXT NOT NULL,itemId TEXT NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL, createdAt INTEGER, firstAttemptAt INTEGER, resultAt INTEGER, attempts INTEGER NOT NULL DEFAULT 0, messageId TEXT, dayKey TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp',UNIQUE(roundId,groupId,itemId))",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "roundId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "groupId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "itemId",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "firstAttemptAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "resultAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "attempts",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "messageId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "dayKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "media",
+      "sql": "CREATE TABLE media(id TEXT PRIMARY KEY,data TEXT NOT NULL, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "notifications",
+      "sql": "CREATE TABLE notifications(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "recovery_tokens",
+      "sql": "CREATE TABLE recovery_tokens(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "reminder_deliveries",
+      "sql": "CREATE TABLE reminder_deliveries(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "reminders",
+      "sql": "CREATE TABLE reminders(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "roles",
+      "sql": "CREATE TABLE roles(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "rounds",
+      "sql": "CREATE TABLE rounds(id TEXT PRIMARY KEY,data TEXT NOT NULL, campaignId TEXT, startedAt INTEGER, finishedAt INTEGER, status TEXT, dayKey TEXT, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "startedAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "finishedAt",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "dayKey",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "settings",
+      "sql": "CREATE TABLE settings(id TEXT PRIMARY KEY,data TEXT NOT NULL)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "templates",
+      "sql": "CREATE TABLE templates(id TEXT PRIMARY KEY,data TEXT NOT NULL, storageMode TEXT NOT NULL DEFAULT 'whatsapp')",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "storageMode",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'whatsapp'",
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "sql": "CREATE TABLE users(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT)",
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1,
+          "hidden": 0
+        },
+        {
+          "name": "data",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "createdAt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": "0",
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "campaignId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "userId",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0,
+          "hidden": 0
+        }
+      ]
+    }
+  ],
+  "uniqueIndexes": [
+    {
+      "table": "alert_recipients",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "alerts",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "audit",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "automation_outbound",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_authorizations",
+      "name": "buscas_authorizations_principal",
+      "sql": "CREATE UNIQUE INDEX buscas_authorizations_principal ON buscas_authorizations(principalId) WHERE principalId IS NOT NULL",
+      "columns": [
+        "principalId"
+      ]
+    },
+    {
+      "table": "buscas_authorizations",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_authorizations_simulation",
+      "name": "buscas_authorizations_principal_simulation",
+      "sql": "CREATE UNIQUE INDEX buscas_authorizations_principal_simulation ON buscas_authorizations_simulation(principalId) WHERE principalId IS NOT NULL",
+      "columns": [
+        "principalId"
+      ]
+    },
+    {
+      "table": "buscas_authorizations_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_deliveries",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_deliveries_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_gaps",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_gaps_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_history",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_history_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_inbox",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_inbox_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_isolation_meta",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_messages",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "chatId",
+        "messageId"
+      ]
+    },
+    {
+      "table": "buscas_messages_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "chatId",
+        "messageId"
+      ]
+    },
+    {
+      "table": "buscas_offers",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_offers_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_runs",
+      "name": "buscas_runs_command",
+      "sql": "CREATE UNIQUE INDEX buscas_runs_command ON buscas_runs(chatId,messageId) WHERE chatId IS NOT NULL AND messageId IS NOT NULL",
+      "columns": [
+        "chatId",
+        "messageId"
+      ]
+    },
+    {
+      "table": "buscas_runs",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "buscas_runs_simulation",
+      "name": "buscas_runs_command_simulation",
+      "sql": "CREATE UNIQUE INDEX buscas_runs_command_simulation ON buscas_runs_simulation(chatId,messageId) WHERE chatId IS NOT NULL AND messageId IS NOT NULL",
+      "columns": [
+        "chatId",
+        "messageId"
+      ]
+    },
+    {
+      "table": "buscas_runs_simulation",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "campaigns",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "contact_intake_events",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "contact_pending",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "contacts",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "diagnostics",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "group_progress",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "campaignId",
+        "groupId"
+      ]
+    },
+    {
+      "table": "group_rounds",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "campaignId",
+        "groupId",
+        "roundId"
+      ]
+    },
+    {
+      "table": "groups_data",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "history",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "category",
+        "sourceId"
+      ]
+    },
+    {
+      "table": "history",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "jobs",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "roundId",
+        "groupId",
+        "itemId"
+      ]
+    },
+    {
+      "table": "jobs",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "media",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "notifications",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "recovery_tokens",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "reminder_deliveries",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "reminders",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "roles",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "rounds",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "settings",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "templates",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "table": "users",
+      "name": null,
+      "sql": null,
+      "columns": [
+        "id"
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "name": "audit_immutable_delete",
+      "tbl_name": "audit",
+      "sql": "CREATE TRIGGER audit_immutable_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END"
+    },
+    {
+      "name": "audit_immutable_update",
+      "tbl_name": "audit",
+      "sql": "CREATE TRIGGER audit_immutable_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END"
+    }
+  ]
+}

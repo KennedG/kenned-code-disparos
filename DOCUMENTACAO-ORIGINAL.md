@@ -1,4 +1,4 @@
-# Kenned Code Disparos 2.3.2
+# Kenned Code Disparos 2.3.3
 
 Atualização baseada exclusivamente no código verificado da **2.3.0**, sem módulos de vendas, caixa ou financeiro e sem nova comparação automática de ofertas equivalentes. Preserva campanhas, contatos, grupos, BUSCAS, modelos, mídias, lembretes, usuários, permissões, responsáveis, configurações e credenciais locais.
 
@@ -8,7 +8,7 @@ A 2.3.1 acrescenta Excel verdadeiro de selecionados ou de todos os resultados fi
 
 **Candidata à validação real:** testes automatizados, interface Electron e transporte controlado não comprovam recebimento no WhatsApp. Neste ambiente não havia conta da loja conectada nem número particular de teste identificado. Instalação e notificações físicas no Windows também dependem desse equipamento. Consulte [a validação da atualização](docs/VALIDACAO-2.3.1.md).
 
-Execute **Kenned-Code-Disparos-Setup-2.3.2-x64.exe**. O runtime está incluído; o uso diário dispensa Node.js e terminal. Leia antes [atualização e recuperação](docs/ATUALIZACAO-2.3.1.md), que orienta a cópia privada integral do perfil existente. Comandos e limites estão em [Excel pelo WhatsApp](docs/COMANDOS-EXCEL-2.3.1.md). O instalador não tem certificado de assinatura de código.
+Execute **Kenned-Code-Disparos-Setup-2.3.3-x64.exe**. O runtime está incluído; o uso diário dispensa Node.js e terminal. Leia antes [atualização e recuperação](docs/ATUALIZACAO-2.3.1.md), que orienta a cópia privada integral do perfil existente. Comandos e limites estão em [Excel pelo WhatsApp](docs/COMANDOS-EXCEL-2.3.1.md). O instalador não tem certificado de assinatura de código.
 
 ## Primeiros passos
 
@@ -103,3 +103,7 @@ Para desenvolver/recompilar: **Node.js 24+** e npm; execute `npm ci`, `npm test`
 Consulte [VALIDACAO-2.3.0.md](docs/VALIDACAO-2.3.0.md), [as correções 2.3.0](docs/CORRECOES-2.3.0.md), [as correções 2.2.0](docs/CORRECOES-2.2.0.md) e [as alterações da versão 2](docs/ALTERACOES-2.0.0.md). Nenhuma conta real foi conectada nem houve teste em Windows físico neste ambiente. A validação de recebimento de buscas, alertas e lembretes no WhatsApp real está pendente e deve usar somente destinatários de teste autorizados, sem clientes ou grupos de produção.
 
 Licença do aplicativo: MIT. Dependências conservam suas próprias licenças. As notas de [1.0.1](docs/CORRECOES-1.0.1.md) e [1.0.2](docs/DISTRIBUICAO-1.0.2.md) permanecem como histórico das versões anteriores.
+
+## Correção de compatibilidade 2.3.3
+
+A abertura do esquema 8 conhecido agora verifica a estrutura comum, cria backup consistente e conserva a versão e todos os registros adicionais. A primeira abertura mantém as automações pausadas para revisão. Bancos novos permanecem no esquema 7. Veja [correção e recuperação](docs/CORRECAO-BANCO-2.3.3.md).

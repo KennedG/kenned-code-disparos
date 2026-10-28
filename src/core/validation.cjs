@@ -1,4 +1,5 @@
 const {randomUUID} = require('node:crypto');
+const {assertCampaignSchemaCompatible} = require('./campaign-schema-compat.cjs');
 const validTime = t => typeof t === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(t);
 function number(value, min, max, name) { const n = Number(value); if (!Number.isFinite(n) || n < min || n > max) throw new Error(`${name}: informe um valor entre ${min} e ${max}.`); return n; }
 function schedule(s = {}) {
@@ -10,6 +11,7 @@ function schedule(s = {}) {
 }
 function items(values, store) {
   if (!Array.isArray(values) || values.length > 100) throw new Error('Use até 100 conteúdos por campanha.');
+  assertCampaignSchemaCompatible({ items: values });
   const seen = new Set();
   return values.map(v => {
     if (!['text','image','video','document'].includes(v.type)) throw new Error('Tipo de conteúdo inválido.');
@@ -22,6 +24,10 @@ function items(values, store) {
 }
 function campaign(input, store) {
   const old = input.id ? store.getCampaign(input.id) : null;
+  // Sanitizing into the 2.3 shape must never silently remove a live commercial
+  // link or execution policy. Preserve the original and require a new review.
+  assertCampaignSchemaCompatible(old);
+  assertCampaignSchemaCompatible(input);
   const id = old?.id || randomUUID();
   if (!String(input.name || '').trim() || String(input.name).length > 120) throw new Error('Informe um nome de até 120 caracteres.');
   const ids = [...new Set(input.groupIds || [])]; const max = store.getSetting('maxSelectedGroups',15);

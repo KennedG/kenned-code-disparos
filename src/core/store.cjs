@@ -6,6 +6,7 @@ const { randomUUID } = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { configurationFingerprint } = require('./campaign-version.cjs');
 const { createSearchSchema, attachSearchStore } = require('./search-store.cjs');
+const { inspectDatabaseCompatibility } = require('./schema-compatibility.cjs');
 
 const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts','reminders','reminder_deliveries','contact_pending','contact_intake_events']);
 const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
@@ -51,7 +52,7 @@ async function createStore(dir,options={}) {
   fs.mkdirSync(dir,{recursive:true});
   const filename=path.join(dir,'mega.sqlite'),existed=fs.existsSync(filename);
   const db=new DatabaseSync(filename,{timeout:5000});
-  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0,modeIsolationReady=false,upgradeBackup=null;
+  let closed=false,persistenceFailed=false,transactionDepth=0,writesSinceRetention=0,modeIsolationReady=false,upgradeBackup=null,databaseSchemaVersion=SCHEMA_VERSION,schemaCompatibility=null,compatibilityReviewRequired=false;
   const statements=new Map();
   const prepared=sql=>{let st=statements.get(sql);if(!st){st=db.prepare(sql);if(statements.size>=128)statements.delete(statements.keys().next().value);statements.set(sql,st);}return st;};
   const storageMode=()=>{const row=prepared("SELECT data FROM settings WHERE id='integrationMode'").get();return row&&JSON.parse(row.data).value==='simulated'?'simulated':'whatsapp';};
@@ -77,14 +78,20 @@ async function createStore(dir,options={}) {
   try {
     db.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;');
     const version=Number(db.prepare('PRAGMA user_version').get().user_version);
-    if(version>SCHEMA_VERSION)throw new Error('Este banco pertence a uma versão mais recente do Kenned Code Disparos. Atualize o aplicativo.');
-    if(existed&&options.upgradeVersion){
+    schemaCompatibility=inspectDatabaseCompatibility(db,version);
+    databaseSchemaVersion=Math.max(version,SCHEMA_VERSION);
+    if(schemaCompatibility){
+      const previousReview=db.prepare("SELECT data FROM settings WHERE id='coreSchemaCompatibility'").get();
+      let reviewed;try{reviewed=previousReview&&JSON.parse(previousReview.data).value;}catch{}
+      compatibilityReviewRequired=reviewed?.databaseSchemaVersion!==version||reviewed?.coreSchemaVersion!==SCHEMA_VERSION;
+    }
+    if(existed&&(options.upgradeVersion||compatibilityReviewRequired)){
       const hasSettings=db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'").get();
       const previous=hasSettings?db.prepare("SELECT data FROM settings WHERE id='lastAppUpgradeVersion'").get():null;
       let previousVersion;try{previousVersion=previous&&JSON.parse(previous.data).value;}catch{}
-      if(previousVersion!==options.upgradeVersion){
+      if(compatibilityReviewRequired||previousVersion!==options.upgradeVersion){
         const backupDir=path.join(dir,'backups');fs.mkdirSync(backupDir,{recursive:true,mode:0o700});
-        const target=path.join(backupDir,`antes-atualizacao-${String(options.upgradeVersion).replace(/[^a-zA-Z0-9.-]/g,'')}-${Date.now()}-${randomUUID()}.sqlite`);
+        const target=path.join(backupDir,`antes-atualizacao-${String(options.upgradeVersion||'compatibilidade-8').replace(/[^a-zA-Z0-9.-]/g,'')}-${Date.now()}-${randomUUID()}.sqlite`);
         db.exec('PRAGMA wal_checkpoint(FULL)');db.prepare('VACUUM INTO ?').run(target);fs.chmodSync(target,0o600);
         const check=new DatabaseSync(target,{readOnly:true});try{if(check.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('O backup anterior à atualização não passou na verificação.');}finally{check.close();}
         upgradeBackup={path:target,createdAt:Date.now(),schemaVersion:version,reason:'Antes de atualização do aplicativo; recuperação integral do banco local.'};
@@ -269,12 +276,12 @@ async function createStore(dir,options={}) {
   }
   const entityFilter=(filter,table)=>queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',userId:'userId',actorId:'userId',status:'status',kind:'kind',ids:'id',code:"json_extract(data,'$.code')",stage:"json_extract(data,'$.stage')",traceId:"json_extract(data,'$.traceId')"},table);
   const store={
-    dir,filename,schemaVersion:SCHEMA_VERSION,upgradeBackup,get persistenceFailed(){return persistenceFailed;},transaction,
+    dir,filename,schemaVersion:databaseSchemaVersion,coreSchemaVersion:SCHEMA_VERSION,schemaCompatibility,upgradeBackup,get persistenceFailed(){return persistenceFailed;},transaction,
     createRecoverySnapshot(destination){
       assertWritable();if(typeof destination!=='string'||!path.isAbsolute(destination))throw new Error('Informe um caminho absoluto para o backup.');
       if(path.resolve(destination)===path.resolve(filename)||fs.existsSync(destination))throw new Error('O backup deve usar um arquivo novo, separado do banco ativo.');
       fs.mkdirSync(path.dirname(destination),{recursive:true,mode:0o700});
-      try{db.prepare('VACUUM INTO ?').run(destination);fs.chmodSync(destination,0o600);const saved=new DatabaseSync(destination,{readOnly:true});try{if(saved.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('A cópia de recuperação não passou na verificação.');}finally{saved.close();}return {path:destination,bytes:fs.statSync(destination).size,schemaVersion:SCHEMA_VERSION};}catch(error){try{fs.unlinkSync(destination);}catch{}throw error;}
+      try{db.prepare('VACUUM INTO ?').run(destination);fs.chmodSync(destination,0o600);const saved=new DatabaseSync(destination,{readOnly:true});try{if(saved.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('A cópia de recuperação não passou na verificação.');}finally{saved.close();}return {path:destination,bytes:fs.statSync(destination).size,schemaVersion:databaseSchemaVersion};}catch(error){try{fs.unlinkSync(destination);}catch{}throw error;}
     },
     getSetting,getStorageMode:storageMode,setSetting:(id,value)=>{const key=settingKey(id);return put('settings',{id:key,value});},
     listCampaigns(filter={}){const where=['storageMode=?'],params=[storageMode()];if(filter.ownerId){where.push("json_extract(data,'$.ownerId')=?");params.push(filter.ownerId);}if(filter.ids){if(!filter.ids.length)return [];where.push(`id IN(${filter.ids.map(()=>'?').join(',')})`);params.push(...filter.ids);}return parseRows(prepared(`SELECT data FROM campaigns${where.length?' WHERE '+where.join(' AND '):''} ORDER BY rowid`).all(...params));},
@@ -358,12 +365,28 @@ async function createStore(dir,options={}) {
     listPendingAlerts({at=Date.now(),channel,limit=50}={}){return parseRows(prepared(`SELECT data FROM alerts WHERE storageMode=? AND status='pending' AND COALESCE(json_extract(data,'$.nextAttemptAt'),0)<=?${channel?" AND json_extract(data,'$.channel')=?":''} ORDER BY createdAt ASC,rowid ASC LIMIT ?`).all(storageMode(),at,...(channel?[channel]:[]),clamp(limit,50,500)));},
     findAlertsByMessageId(messageId){return parseRows(prepared("SELECT data FROM alerts WHERE json_extract(data,'$.messageId')=? AND storageMode=? AND status IN('sending','uncertain','confirmed','delivered','failed') LIMIT 10").all(messageId,storageMode()));}
   });
+  try {
   // This one-time migration marker preserves deliberately cleared histories.
   if(!getSetting('historyProjectionInitialized',false))transaction(()=>{for(const row of prepared('SELECT data FROM jobs ORDER BY rowid DESC LIMIT 10000').all()){const j=JSON.parse(row.data);projection('sends',j.id,j);}for(const row of prepared('SELECT data FROM rounds ORDER BY rowid DESC LIMIT 10000').all()){const r=JSON.parse(row.data);projection('campaigns',`round:${r.id}`,{...r,kind:'round'});}putRaw('settings',{id:'historyProjectionInitialized',value:true});retentionRaw();});
   attachSearchStore(store,{db,prepared,transaction});
+  if(compatibilityReviewRequired)transaction(()=>{
+    const at=Date.now(),reason='Banco de uma versão anterior aberto com compatibilidade verificada. Revise as campanhas antes de retomar os envios.';
+    for(const mode of ['whatsapp','simulated']){
+      const id=`mode:${mode}:automationState`,previous=oneRaw('settings',id)?.value||{};
+      putRaw('settings',{id,value:{...previous,stopped:true,stoppedAt:at,source:'database-compatibility',reason}});
+    }
+    for(const row of prepared("SELECT id,data FROM campaigns WHERE json_extract(data,'$.state') IN('active','running')").all()){
+      const campaign=JSON.parse(row.data);
+      prepared('UPDATE campaigns SET data=? WHERE id=?').run(json({...campaign,state:'paused',pausedAt:at,updatedAt:at,pauseReason:reason}),row.id);
+    }
+    putRaw('settings',{id:'coreSchemaCompatibility',value:{...schemaCompatibility,reviewedAt:at,backupPath:upgradeBackup.path}});
+    store.saveNotification({id:'database-compatibility-8',at,event:'database_compatibility',severity:'warning',ownerOnly:true,title:'Banco aberto com segurança',message:reason,code:'DATABASE_SCHEMA_COMPATIBLE'});
+    store.addAudit({id:randomUUID(),at,action:'database.compatibility',actorId:null,details:{...schemaCompatibility,backupPath:upgradeBackup.path,automationsPaused:true}});
+  });
   db.exec("CREATE INDEX IF NOT EXISTS diagnostics_trace_mode_time ON diagnostics(storageMode,json_extract(data,'$.traceId'),createdAt DESC)");
   if(options.upgradeVersion)store.setSetting('lastAppUpgradeVersion',options.upgradeVersion);
   return store;
+  }catch(error){try{db.close();}catch{}closed=true;throw error;}
 }
 function seed(store) {
   if(store.getSetting('initialized',false))return;
