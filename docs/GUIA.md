@@ -1,6 +1,6 @@
 # Instalação e uso rápido
 
-1. Execute **Mega-Disparos-Setup-1.0.1-x64.exe** no Windows 10/11 de 64 bits. Escolha a pasta e, opcionalmente, o atalho da área de trabalho. O aplicativo e o runtime estão incluídos; não precisa instalar Node.js.
+1. Execute **Mega-Disparos-Setup-1.0.2-x64.exe** no Windows 10/11 de 64 bits. Escolha a pasta e, opcionalmente, o atalho da área de trabalho. O aplicativo e o runtime estão incluídos; não precisa instalar Node.js.
 2. Teste primeiro em **Simulação**. A campanha de exemplo tem 15 grupos fictícios, intervalo de 10 minutos e começa desativada.
 3. Abra Campanhas → Editar. Adicione mensagens, importe arquivos, organize a ordem, escolha os destinos e defina dias, janela de horário e limites. Salve, visualize a prévia e só então confirme a ativação.
 4. Para conta real: leia [INTEGRACAO.md](INTEGRACAO.md), escolha WhatsApp em Configurações, reconheça que Baileys é **não oficial** e salve. Abra Conexão; no celular, leia o QR em WhatsApp → Aparelhos conectados. Atualize Grupos e autorize os destinos permitidos.
