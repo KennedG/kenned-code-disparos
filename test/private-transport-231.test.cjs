@@ -110,10 +110,23 @@ test('a contentless live event does not consume the ID before a usable notify ar
 test('delayed and historical messages expose a specific reason and do not replay administrative commands', async t => {
   const f = await fixture(t);
   f.emit(message('old-stop', '!mega parar tudo', { messageTimestamp: Math.floor(Date.now() / 1000) - 300 }));
-  f.emit(message('history-stop', '!mega parar tudo'), { type: 'append' });
+  f.emit(message('history-stop', '!mega parar tudo'), { type: 'append', history: true });
   assert.equal(f.incoming.length, 0);
   assert(f.diagnostics.some(row => row.code === 'WA_MESSAGE_OUTSIDE_LIVE_WINDOW'));
   assert(f.diagnostics.some(row => row.code === 'WA_HISTORY_NOT_COMMAND'));
+});
+
+test('a current append private command is accepted once and preserves its verified requester route', async t => {
+  const f = await fixture(t), command = message('live-append-search');
+  f.emit(command, { type: 'append' });
+  f.emit(command); f.emit(command, { type: 'append' });
+  assert.equal(f.incoming.length, 1);
+  assert.equal(f.incoming[0].senderNumber, OWNER);
+  assert.equal(f.incoming[0].fromMe, false);
+  assert.equal(f.incoming[0].chatId, `${OWNER}@s.whatsapp.net`);
+  assert(f.incoming[0].replyProof);
+  assert.equal((await f.adapter.resolveReplyRecipient(f.incoming[0])).jid, `${OWNER}@s.whatsapp.net`);
+  assert(!f.diagnostics.some(row => row.code === 'WA_HISTORY_NOT_COMMAND'));
 });
 
 test('private document uses managed verified bytes, original requester route and protocol ACK', async t => {

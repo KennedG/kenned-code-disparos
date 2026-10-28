@@ -24,6 +24,7 @@ const technicalDescription = error => {
 const timestampText = (at, timezone = 'America/Sao_Paulo') => {
   try { return new Date(at).toLocaleString('pt-BR', { timeZone: timezone }); } catch { return new Date(at).toISOString(); }
 };
+const computerTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo';
 
 function alertText(incident) {
   const at = timestampText(incident.at, incident.timezone);
@@ -33,7 +34,11 @@ function alertText(incident) {
     const connectivity = incident.connectionAvailable === true ? '✅ Os demais grupos elegíveis continuarão sendo processados.' : '⏸️ A conexão geral está indisponível. Os envios estão suspensos até a reconexão.';
     return `${summary ? '⚠️ Resumo de falhas no grupo' : '⚠️ Não foi possível enviar para um grupo'}\n\n📢 Campanha: ${safeDescription(incident.campaignName || 'Campanha')}\n👥 Grupo: ${safeDescription(incident.groupName || 'Nome indisponível')}\n🆔 ID: ${safeDescription(incident.groupId)}\n📱 Item: ${safeDescription(incident.itemLabel || 'Item não identificado')}\n❗ Motivo: ${reason}\n🔎 Código: ${codeOf(incident.code, 'GROUP_SEND_FAILED')}\n🕒 Ocorrência original: ${at}${summary ? `\n🔁 Recorrências neste período: ${incident.recurrences || 0}\n🕒 Última ocorrência: ${timestampText(incident.lastAt, incident.timezone)}` : ''}\n\n${connectivity}\n🔧 Ação necessária: Revise a conexão ou a permissão do grupo. Verifique novamente o destino no aplicativo antes de reativá-lo. Nenhum envio incerto será repetido automaticamente.`;
   }
-  if (incident.event === 'disconnect') return `🚨 WhatsApp desconectado\n\n🕒 Ocorrência original: ${at}\n⚠️ Motivo: ${reason}\n🔎 Código do erro: ${codeOf(incident.code, 'WHATSAPP_DISCONNECTED')}\n\nOs envios foram pausados com segurança. Este aviso ficou pendente enquanto a conexão estava indisponível. Acesse o Kenned Code Disparos para verificar a conexão.`;
+  if (incident.event === 'disconnect') {
+    const affected = (incident.affectedCampaigns || []).map(c => `📣 ${safeDescription(c.name)} — ${c.pending || 0} mensagens pendentes`).join('\n');
+    return `🚨 WhatsApp desconectado\n\n🕒 Ocorrência original: ${at}\n⚠️ Motivo: ${reason}\n🔎 Código do erro: ${codeOf(incident.code, 'WHATSAPP_DISCONNECTED')}${affected ? `\n\n${affected}` : ''}${incident.recoveredAt ? `\n\n✅ Conexão recuperada: ${timestampText(incident.recoveredAt, incident.timezone)}` : ''}\n\nOs envios da campanha aguardam o próximo horário programado. Este aviso ficou pendente enquanto a conexão estava indisponível. Acesse o Kenned Code Disparos para verificar a conexão.`;
+  }
+  if (incident.event === 'qr-required') return `📲 ${incident.recoveredAt ? 'Aviso da leitura de QR Code necessária durante a falha' : 'Nova leitura de QR Code necessária'} — Kenned Code Disparos\n\n🕒 Ocorrência original: ${at}\n⚠️ ${reason}\n\n${incident.recoveredAt ? `✅ Sessão recuperada: ${timestampText(incident.recoveredAt, incident.timezone)}. A conexão já está pronta; as campanhas aguardam o próximo horário programado.` : 'Abra o aplicativo e leia o QR Code em Aparelhos conectados do WhatsApp. As campanhas permanecem pausadas; este aviso só poderá sair quando houver conexão ou um canal independente autorizado.'}`;
   if (!incident.campaignId && !incident.campaignName) return `${incident.event === 'test' ? '🔔 Teste de alerta' : '🚨 Falha crítica'} — Kenned Code Disparos\n\n🕒 Ocorrência original: ${at}\n⚠️ Motivo: ${reason}\n🔎 Código do erro: ${codeOf(incident.code, 'SYSTEM_ERROR')}\n\nAcesse o sistema para verificar os detalhes. Nenhuma campanha foi ativada por este aviso.`;
   return `🚨 Campanha interrompida por erro\n\n📣 Campanha: ${String(incident.campaignName || 'Campanha').slice(0, 200)}\n🕒 Data e horário: ${at}\n⚠️ Motivo: ${reason}\n✅ Envios confirmados: ${incident.confirmed || 0}\n⏳ Pendentes: ${incident.pending || 0}\n🔎 Código do erro: ${codeOf(incident.code, 'CAMPAIGN_ERROR')}\n\nAcesse o sistema para verificar os detalhes e decidir sobre a retomada.`;
 }
@@ -51,6 +56,7 @@ class AlertService extends EventEmitter {
     this.reconnectTimer = null;
     this.reconnectAttempts = 0;
     this.reconnecting = null;
+    this.reconnectNextAttemptAt = null;
     this.flushing = null;
     this.disconnectOccurrence = null;
     this.previousState = adapter?.status?.state;
@@ -66,11 +72,12 @@ class AlertService extends EventEmitter {
         this.storageAlertShown = true;
         // Persistence cannot be trusted here. Notify immediately, but never
         // pretend that a private warning could be durably queued on this disk.
-        this.emit('localAlert', { id: 'storage-failure', occurrenceId: 'storage-failure', traceId: 'storage-failure', event: 'critical', title: 'Envios bloqueados por falha de armazenamento', body: 'Confira o espaço e as permissões do disco. Reabra o aplicativo após corrigir a falha e revise resultados incertos. O alerta privado não pôde ser salvo.', reason: 'Falha de persistência.', at: this.now(), campaignId: null, integrationMode: this._mode(), simulation: this._mode() === 'simulated' });
+        this.emit('localAlert', { id: 'storage-failure', occurrenceId: 'storage-failure', traceId: 'storage-failure', event: 'critical', title: 'Envios bloqueados por falha de armazenamento', body: 'Confira o espaço e as permissões do disco. Reabra o aplicativo após corrigir a falha e revise resultados incertos. O alerta privado não pôde ser salvo.', reason: 'Falha de persistência.', at: this.now(), campaignId: null, active: true, blocking: true, persistentAlarm: true, bringToFront: true, integrationMode: this._mode(), simulation: this._mode() === 'simulated' });
       }
       if (details?.error && !this.scheduler?.persistenceFailed && !this.store.persistenceFailed) {
         this.criticalOccurrence ||= randomUUID();
-        const incident = { id: details.occurrenceId || this.criticalOccurrence, traceId: details.traceId, at: this.now(), event: 'critical', code: codeOf(details.code, 'SYSTEM_PROCESSING_ERROR'), reason: 'Falha crítica no processamento. Consulte o diagnóstico do sistema.' };
+        const affectedCampaigns = this._affectedCampaigns();
+        const incident = { id: details.occurrenceId || this.criticalOccurrence, traceId: details.traceId, at: this.now(), event: 'critical', code: codeOf(details.code, 'SYSTEM_PROCESSING_ERROR'), reason: 'Falha crítica no processamento. Consulte o diagnóstico do sistema.', affectedCampaigns, blocking: affectedCampaigns.length > 0 };
         try { this.recordSystemIncident(incident); } catch { this.scheduler?.blockOnPersistenceFailure(); }
       }
       if (!details?.error) this.criticalOccurrence = null;
@@ -157,7 +164,7 @@ class AlertService extends EventEmitter {
     if (this.started || this.closed) return;
     this.started = true;
     const previousDisconnect = this.store.getSetting(`alertDisconnectOccurrence:${this._mode()}`, null);
-    if (previousDisconnect?.id && previousDisconnect.integrationMode === this._mode() && this.adapter?.status?.state !== 'connected') this.disconnectOccurrence = previousDisconnect;
+    if (previousDisconnect?.id && previousDisconnect.integrationMode === this._mode()) this.disconnectOccurrence = previousDisconnect;
     for (const alert of this._list('alerts', { status: 'sending' })) this._save('alerts', { ...alert, status: 'uncertain', resultAt: this.now(), error: 'Envio de alerta interrompido; revisão necessária antes de repetir.' });
     this.scheduler?.on('incident', this.incidentListener);
     this.scheduler?.on('change', this.changeListener);
@@ -167,19 +174,24 @@ class AlertService extends EventEmitter {
     // A persisted campaign occurrence may have preceded a process crash before
     // alert records were created. Recipient+occurrence keys prevent duplication.
     for (const c of this.store.listCampaigns()) if (c.lastError?.id) this.recordIncident(c.lastError);
+    for (const notification of this._list('notifications')) if (notification.active === true && notification.blocking === true && !notification.muted && !notification.resolvedAt && (!notification.integrationMode || notification.integrationMode === this._mode()) && !(notification.event === 'disconnect' && this.adapter?.status?.state === 'connected')) this.emit('localAlert', copy(notification));
     this.timer = setInterval(() => { void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure()); }, 1000);
     this.timer.unref?.();
     void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure());
+    if (this.disconnectOccurrence && this.adapter?.status?.state === 'connected') void this._onStatus(this.adapter.status).catch(() => this.scheduler?.blockOnPersistenceFailure());
+    else if (this.adapter?.status?.state === 'disconnected' && !this.store.getSetting(`manualDisconnect:${this._mode()}`, false)) this._scheduleReconnect(this.adapter.status);
   }
 
   setAdapter(adapter) {
     this.adapter?.off('status', this.statusListener);
     this.adapter?.off('receipt', this.receiptListener);
     const oldMode = this._mode();
+    const newMode = adapter.status?.mode === 'simulated' ? 'simulated' : 'whatsapp';
+    if (oldMode !== newMode) for (const notification of this._list('notifications')) if (notification.active === true && notification.integrationMode === oldMode) this.resolveIncident(notification.occurrenceId || notification.id, { reason: 'Monitoramento desse modo encerrado pela troca de integração.' });
     this.adapter = adapter;
     this.integrationMode = adapter.status?.mode === 'simulated' ? 'simulated' : 'whatsapp';
     this.adapterRevision++;
-    if (oldMode !== this._mode()) { this.disconnectOccurrence = null; this.activeBeforeDisconnect.clear(); }
+    if (oldMode !== this._mode()) { this.disconnectOccurrence = null; this.activeBeforeDisconnect.clear(); this.reconnectAttempts = 0; }
     this.criticalOccurrence = null;
     this.previousState = adapter.status?.state;
     this._cancelReconnect();
@@ -187,6 +199,11 @@ class AlertService extends EventEmitter {
       adapter.on('status', this.statusListener);
       adapter.on('receipt', this.receiptListener);
     }
+  }
+
+  prepareModeChange() {
+    this._cancelReconnect();
+    for (const notification of this._list('notifications')) if (notification.active === true && (!notification.integrationMode || notification.integrationMode === this._mode())) this.resolveIncident(notification.occurrenceId || notification.id, { reason: 'Monitoramento desse modo encerrado pela troca de integração.' });
   }
 
   _rememberActive() {
@@ -235,7 +252,8 @@ class AlertService extends EventEmitter {
     const id = `${incident.id}:${event}`;
     const existing = this._get('notifications', id);
     if (existing) return existing;
-    const notification = this._save('notifications', { id, occurrenceId: incident.id, traceId: incident.traceId || incident.id, event, title, body: safeDescription(body), at: incident.at, reason: safeDescription(incident.reason), code: codeOf(incident.code, 'ALERT_ERROR'), campaignId: incident.campaignId || null, recipientSnapshot: incident.recipientSnapshot || null, integrationMode: this._mode(), simulation: this._mode() === 'simulated', automationSuppressed: this._stopped(), muted: false });
+    const blocking = incident.blocking === true || (Boolean(incident.campaignId) && incident.kind !== 'uncertain') || (event === 'disconnect' && incident.affectedCampaigns?.length > 0);
+    const notification = this._save('notifications', { id, occurrenceId: incident.id, traceId: incident.traceId || incident.id, event, title, body: safeDescription(body), at: incident.at, reason: safeDescription(incident.reason), code: codeOf(incident.code, 'ALERT_ERROR'), campaignId: incident.campaignId || null, groupId: incident.groupId || null, groupName: incident.groupName ? safeDescription(incident.groupName) : null, affectedCampaigns: copy(incident.affectedCampaigns || []), pending: incident.pending || 0, active: blocking, blocking, persistentAlarm: blocking, bringToFront: blocking, recipientSnapshot: incident.recipientSnapshot || null, integrationMode: this._mode(), simulation: this._mode() === 'simulated', automationSuppressed: this._stopped(), muted: false });
     this.emit('localAlert', copy(notification));
     this.emit('change');
     return notification;
@@ -260,7 +278,7 @@ class AlertService extends EventEmitter {
         this.store.saveCampaign({ ...latest, lastError: { ...latest.lastError, localNotified: true } });
       }
     }
-    const text = alertText({ ...incident, timezone: this.store.getSetting('timezone', 'America/Sao_Paulo'), campaignName: incident.campaignName || campaign.name });
+    const text = alertText({ ...incident, timezone: computerTimezone(), campaignName: incident.campaignName || campaign.name });
     for (const recipient of recipientSnapshot) this._queue(incident, recipient, 'whatsapp', text);
     if (independentQueued) this._queue(incident, { id: 'independent-webhook' }, 'webhook', text);
     this.emit('change');
@@ -272,10 +290,10 @@ class AlertService extends EventEmitter {
     const value = { ...incident, traceId: incident.traceId || incident.id, event: incident.event || 'critical', at: Number.isFinite(incident.at) ? incident.at : this.now(), integrationMode: this._mode(), simulation: this._mode() === 'simulated' };
     const existing = this._get('notifications', `${value.id}:${value.event}`);
     const recipients = existing?.recipientSnapshot || value.recipientSnapshot || this._recipients(null);
-    const titles = { disconnect: 'WhatsApp desconectado', test: 'Teste de alerta — Kenned Code Disparos', critical: 'Falha crítica — Kenned Code Disparos' };
+    const titles = { 'qr-required': 'Nova leitura de QR Code necessária', disconnect: 'WhatsApp desconectado', test: 'Teste de alerta — Kenned Code Disparos', critical: 'Falha crítica — Kenned Code Disparos' };
     const notification = this._local({ ...value, recipientSnapshot: recipients }, value.event, titles[value.event] || titles.critical, value.event === 'disconnect' ? `${value.reason} Envios pausados com segurança. Use Reconectar WhatsApp.` : value.reason || 'Consulte o diagnóstico do sistema.');
     if (!existing) this._trace(value, 'occurrence', value.code || 'SYSTEM_ERROR', 'Ocorrência registrada e notificação local exibida.', this._stopped() ? 'A automação interrompida bloqueou novos alertas privados.' : recipients.length ? 'Alertas privados serão processados pela fila.' : 'Nenhum destinatário ativo com telefone válido está configurado.');
-    const text = alertText({ ...value, timezone: this.store.getSetting('timezone', 'America/Sao_Paulo') });
+    const text = alertText({ ...value, timezone: computerTimezone() });
     const alerts = recipients.map(recipient => this._queue(value, recipient, 'whatsapp', text)).filter(Boolean);
     const webhook = this.store.getSetting('independentAlertChannel', null);
     if (webhook?.enabled && webhook.url && this.sendWebhook && this.secretGet) { const queued = this._queue(value, { id: 'independent-webhook' }, 'webhook', text); if (queued) alerts.push(queued); }
@@ -308,7 +326,7 @@ class AlertService extends EventEmitter {
     const notification = this._get('notifications', `${incident.id}:critical`);
     this._local(incident, 'critical', incident.summary ? 'Resumo de falhas por grupo' : 'Grupo indisponível para envio', `${incident.campaignName}: ${incident.groupName} — ${incident.reason}`);
     if (!notification) this._trace(incident, 'occurrence', incident.code, 'Falha do destino registrada separadamente do resultado do aviso privado.', incident.connectionAvailable ? 'Demais grupos elegíveis continuam; destino com falha requer revisão.' : 'Conexão geral indisponível; aviso privado permanece pendente.', 0, { groupId: incident.groupId, operationId: incident.operationId || null, recurrences: incident.recurrences || 0 });
-    const text = alertText({ ...incident, timezone: this.store.getSetting('timezone', 'America/Sao_Paulo') });
+    const text = alertText({ ...incident, timezone: computerTimezone() });
     const alerts = (incident.recipientSnapshot || []).map(recipient => this._queue(incident, recipient, 'whatsapp', text)).filter(Boolean);
     this.emit('change');
     return { occurrenceId: incident.id, traceId: incident.traceId, alerts };
@@ -433,6 +451,37 @@ class AlertService extends EventEmitter {
   muteOccurrence(id) {
     for (const notification of this._list('notifications')) if (notification.id === id || notification.occurrenceId === id) this._save('notifications', { ...notification, muted: true });
     this.emit('muted', { id });
+  }
+
+  resolveIncident(id, { reason = 'Problema corrigido.', at = this.now() } = {}) {
+    const notificationIds = [];
+    for (const notification of this._list('notifications')) {
+      if ((notification.id !== id && notification.occurrenceId !== id) || notification.resolvedAt) continue;
+      this._save('notifications', { ...notification, active: false, resolvedAt: at, recoveredAt: at, resolutionReason: safeDescription(reason) });
+      notificationIds.push(notification.id);
+    }
+    if (notificationIds.length) { this.emit('resolved', { id, occurrenceId: id, notificationIds, recoveredAt: at, reason: safeDescription(reason) }); this.emit('change'); }
+    return { notificationIds, resolvedAt: at };
+  }
+
+  resolveDestination(campaignId, groupId, { at = this.now(), reason = 'A integração confirmou a recuperação da permissão do grupo.' } = {}) {
+    // Destination buckets are operational state. Resolve the exact group and
+    // remove its recurrence bucket so polling cannot recreate an old incident.
+    const groups = this._destinationState(), ids = new Set();
+    for (const [key, bucket] of Object.entries(groups)) {
+      if (bucket.first?.campaignId !== campaignId || bucket.first?.groupId !== groupId) continue;
+      if (bucket.first?.id) ids.add(bucket.first.id);
+      if (bucket.pendingSummary?.id) ids.add(bucket.pendingSummary.id);
+      delete groups[key];
+    }
+    for (const notification of this._list('notifications')) if (notification.campaignId === campaignId && notification.groupId === groupId && notification.active && !notification.resolvedAt) ids.add(notification.occurrenceId || notification.id);
+    this._saveDestinationState(groups);
+    for (const id of ids) this.resolveIncident(id, { at, reason });
+    return { resolved: [...ids], recoveredAt: at };
+  }
+
+  getRecoveryState() {
+    return { state: this.adapter?.status?.state || 'disconnected', attempts: this.reconnectAttempts, nextAttemptAt: this.reconnectNextAttemptAt, reconnecting: Boolean(this.reconnecting), incident: this.disconnectOccurrence ? copy(this.disconnectOccurrence) : null, manual: this.store.getSetting(`manualDisconnect:${this._mode()}`, false) === true };
   }
 
   flush() {
@@ -621,55 +670,108 @@ class AlertService extends EventEmitter {
     } finally { release(); }
   }
 
+  _connectionReady(status = this.adapter?.status) {
+    if (status?.state !== 'connected' || status.ready === false) return false;
+    if (typeof this.adapter?.getConnectionReadiness === 'function') return this.adapter.getConnectionReadiness().ready === true;
+    return true;
+  }
+
+  _affectedCampaigns() {
+    return this.store.listCampaigns().filter(c => c.state === 'active' || (c.state === 'paused' && (c.executionRecovery?.kind === 'connection' || (this.activeBeforeDisconnect.has(c.id) && /^Conexão indisponível/.test(c.pauseReason || ''))))).map(c => {
+      const jobs = this.store.listJobs?.({ campaignId: c.id, limit: 1000000 }) || [];
+      return { id: c.id, name: safeDescription(c.name), pending: jobs.filter(job => ['queued', 'sending', 'uncertain', 'pending'].includes(job.status)).length, configRevision: c.configRevision ?? configurationFingerprint(c) };
+    });
+  }
+
+  _recordQrRequired() {
+    if (!this.disconnectOccurrence) return;
+    const incident = { id: `${this.disconnectOccurrence.id}:qr-required`, traceId: this.disconnectOccurrence.traceId || this.disconnectOccurrence.id, event: 'qr-required', at: this.disconnectOccurrence.at, code: 'WA_QR_REQUIRED', reason: 'A sessão precisa ser vinculada novamente. Leia o QR Code exibido no aplicativo.', affectedCampaigns: this.disconnectOccurrence.affectedCampaigns, recipientSnapshot: this.disconnectOccurrence.recipientSnapshot, blocking: false };
+    if (!this._get('notifications', `${incident.id}:qr-required`)) this.recordSystemIncident(incident);
+  }
+
   async _onStatus(status) {
+    if (this.closed || !status) return;
     const previous = this.previousState;
     this.previousState = status.state;
     if (status.state === 'connected') {
+      if (!this._connectionReady(status)) { this.emit('change'); return; }
       this._cancelReconnect();
       this.reconnectAttempts = 0;
+      this.store.setSetting?.(`manualDisconnect:${this._mode()}`, false);
       const occurrence = this.disconnectOccurrence;
+      const recoveredAt = this.now();
+      if (occurrence) {
+        // Add recovery time only to work that has never entered the transport.
+        // An accepted or uncertain notice keeps the exact original payload.
+        const recovered = { ...occurrence, recoveredAt, timezone: computerTimezone() };
+        for (const alert of this._list('alerts', { status: 'pending' })) if (alert.occurrenceId === occurrence.id && (!alert.integrationMode || alert.integrationMode === this._mode())) this._save('alerts', { ...alert, recoveredAt, text: alertText(recovered) });
+        for (const alert of this._list('alerts', { status: 'pending' })) if (alert.occurrenceId === `${occurrence.id}:qr-required` && (!alert.integrationMode || alert.integrationMode === this._mode())) this._save('alerts', { ...alert, recoveredAt, text: alertText({ ...recovered, event: 'qr-required', reason: 'Durante a falha, a sessão precisou ser vinculada novamente.' }) });
+        this.resolveIncident(occurrence.id, { reason: 'Conexão recuperada — aguardando próximo horário de rodada.', at: recoveredAt });
+        this.resolveIncident(`${occurrence.id}:qr-required`, { reason: 'Sessão pronta para envio.', at: recoveredAt });
+        this._trace(occurrence, 'recovery', 'WA_CONNECTION_RECOVERED', 'Sessão autenticada e pronta para envio.', 'Alertas pendentes podem sair agora; campanhas aguardam o próximo horário programado.');
+      }
       this.disconnectOccurrence = null;
-      if (this.store.setSetting) this.store.setSetting(`alertDisconnectOccurrence:${this._mode()}`, null);
-      if (occurrence && !this._stopped() && this.store.getSetting('reconnect', {}).autoResume === true) {
-        for (const [id, revision] of this.activeBeforeDisconnect) {
-          const c = this.store.getCampaign(id);
-          if (c?.state !== 'paused' || (c.configRevision ?? configurationFingerprint(c)) !== revision || !/^Conexão indisponível/.test(c.pauseReason || '')) continue;
-          if (this.store.listJobs({ campaignId: id, status: 'uncertain', limit: 1 }).length) continue;
-          try { await this.scheduler.resume(id); } catch { /* The scheduler validates all safety conditions again. */ }
-        }
+      this.store.setSetting?.(`alertDisconnectOccurrence:${this._mode()}`, null);
+      if (!this._stopped() && this.store.getSetting('reconnect', {}).autoResume !== false && typeof this.scheduler?.recoverAfterConnection === 'function') {
+        try { await this.scheduler.recoverAfterConnection({ reason: 'reconnected' }); }
+        catch (error) { this._diagnostic(error.code || 'CAMPAIGN_RECOVERY_FAILED', safeDescription(error.message), 'Campanhas permanecem pausadas; revise o diagnóstico.', null, 0, { stage: 'reconexao.recuperacao' }); }
       }
       this._rememberActive();
+      this.emit('change');
       await this.flush();
       return;
     }
-    if (status.state === 'connecting' || status.state === 'qr') return;
-    if (status.reasonCode === 'manual' || status.manual) { this._cancelReconnect(); this.activeBeforeDisconnect.clear(); return; }
-    if (!this.disconnectOccurrence && (previous === 'connected' || ['expired', 'session_expired', 'internet', 'unexpected'].includes(status.reasonCode))) {
+    if (status.state === 'connecting') { this._cancelReconnect(); this.emit('change'); return; }
+    if (status.state === 'qr') { this._cancelReconnect(); this._recordQrRequired(); this.emit('change'); return; }
+    if (status.reasonCode === 'manual' || status.manual) {
+      this._cancelReconnect(); this.store.setSetting?.(`manualDisconnect:${this._mode()}`, true); this.activeBeforeDisconnect.clear(); this.emit('change'); return;
+    }
+    if (!this.disconnectOccurrence && (previous === 'connected' || ['expired', 'session_expired', 'internet', 'unexpected', 'restricted'].includes(status.reasonCode))) {
       const reason = { internet: 'Sem conexão com a internet.', expired: 'A sessão do WhatsApp expirou; conecte novamente.', session_expired: 'A sessão do WhatsApp expirou; conecte novamente.', restricted: 'O serviço restringiu os envios. Confira os limites e aguarde a liberação da integração.', unexpected: 'O WhatsApp desconectou inesperadamente.' }[status.reasonCode] || 'A conexão com o WhatsApp foi interrompida.';
       const originalAt = typeof status.at === 'number' ? status.at : Date.parse(status.at);
-      this.disconnectOccurrence = { id: randomUUID(), at: Number.isFinite(originalAt) ? originalAt : this.now(), code: codeOf(status.errorCode || status.code, 'WHATSAPP_DISCONNECTED'), reason, event: 'disconnect', integrationMode: this._mode() };
-      if (this.store.setSetting) this.store.setSetting(`alertDisconnectOccurrence:${this._mode()}`, this.disconnectOccurrence);
+      const affectedCampaigns = this._affectedCampaigns();
+      this.disconnectOccurrence = { id: randomUUID(), at: Number.isFinite(originalAt) ? originalAt : this.now(), code: codeOf(status.errorCode || status.code, 'WHATSAPP_DISCONNECTED'), reason, event: 'disconnect', integrationMode: this._mode(), affectedCampaigns, recipientSnapshot: this._recipients(null), pending: affectedCampaigns.reduce((count, campaign) => count + campaign.pending, 0) };
+      this.store.setSetting?.(`alertDisconnectOccurrence:${this._mode()}`, this.disconnectOccurrence);
       this.recordSystemIncident(this.disconnectOccurrence);
     }
+    if (['expired', 'session_expired'].includes(status.reasonCode)) this._recordQrRequired();
     this._scheduleReconnect(status);
+    this.emit('change');
   }
 
-  _cancelReconnect() { if (this.reconnectTimer) this.clearTimer(this.reconnectTimer); this.reconnectTimer = null; }
+  _cancelReconnect() { if (this.reconnectTimer) this.clearTimer(this.reconnectTimer); this.reconnectTimer = null; this.reconnectNextAttemptAt = null; }
+
+  _canReconnect(status, config = this.store.getSetting('reconnect', {})) {
+    const maximum = Number.isInteger(config.maxAttempts) ? Math.max(0, Math.min(10, config.maxAttempts)) : 5;
+    return !this.closed && !this._stopped() && !this.store.persistenceFailed && !this.scheduler?.persistenceFailed && config.enabled !== false && !this.store.getSetting(`manualDisconnect:${this._mode()}`, false) && !['connecting', 'qr', 'connected'].includes(status.state) && status.retryable !== false && !['manual', 'expired', 'session_expired', 'restricted'].includes(status.reasonCode) && this.reconnectAttempts < maximum;
+  }
 
   _scheduleReconnect(status) {
     const config = this.store.getSetting('reconnect', {});
-    const maximum = Number.isInteger(config.maxAttempts) ? Math.max(0, Math.min(10, config.maxAttempts)) : 3;
-    if (this.closed || !config.enabled || ['connecting', 'qr', 'connected'].includes(status.state) || status.retryable === false || ['manual', 'expired', 'session_expired'].includes(status.reasonCode) || this.reconnectTimer || this.reconnecting || this.reconnectAttempts >= maximum) return;
+    if (!this._canReconnect(status, config) || this.reconnectTimer || this.reconnecting) return;
+    const base = Math.max(3, Math.min(3600, Number(config.delaySeconds) || 5));
+    const maximumDelay = Math.max(base, Math.min(3600, Number(config.maxDelaySeconds) || 120));
+    const delay = Math.min(maximumDelay, base * Math.pow(2, this.reconnectAttempts)) * 1000;
+    const revision = this.adapterRevision, mode = this._mode();
+    this.reconnectNextAttemptAt = this.now() + delay;
     this.reconnectTimer = this.setTimer(() => {
-      this.reconnectTimer = null;
+      this.reconnectTimer = null; this.reconnectNextAttemptAt = null;
+      if (revision !== this.adapterRevision || mode !== this._mode() || !this._canReconnect(this.adapter.status)) return;
       this.reconnectAttempts++;
-      void this.reconnect().catch(() => {}).finally(() => { if (this.adapter.status.state !== 'connected') this._scheduleReconnect(this.adapter.status); });
-    }, Math.max(3, config.delaySeconds || 15) * 1000);
-    this.reconnectTimer.unref?.();
+      this._diagnostic('WA_RECONNECT_ATTEMPT', `Tentativa de reconexão ${this.reconnectAttempts}.`, 'Reutilizando a sessão existente; aguardando confirmação de prontidão.', null, this.reconnectAttempts, { stage: 'reconexao.tentativa' });
+      this.emit('change');
+      void this.reconnect({ automatic: true }).catch(error => this._diagnostic(codeOf(error.code, 'WA_RECONNECT_FAILED'), safeDescription(error.message || 'Falha de reconexão.'), 'Nova tentativa limitada com intervalo progressivo, quando permitida.', null, this.reconnectAttempts, { stage: 'reconexao.falha' })).finally(() => {
+        if (revision !== this.adapterRevision || mode !== this._mode()) return;
+        if (!this._connectionReady()) this._scheduleReconnect(this.adapter.status);
+        this.emit('change');
+      });
+    }, delay);
+    this.reconnectTimer?.unref?.();
   }
 
-  reconnect() {
+  reconnect({ automatic = false } = {}) {
     if (this.reconnecting) return this.reconnecting;
+    if (!automatic) { this.reconnectAttempts = 0; this.store.setSetting?.(`manualDisconnect:${this._mode()}`, false); }
     this._cancelReconnect();
     this.reconnecting = Promise.resolve().then(() => this.adapter.connect({ reconnect: true })).finally(() => { this.reconnecting = null; });
     return this.reconnecting;

@@ -121,3 +121,27 @@ test('source UI does not reload captured pages for unrelated snapshot timestamp 
   await f.ui.maybeLoad(); assert.equal(f.calls.filter(item => item.action === 'sourcePublications').length, 2);
   await f.ui.maybeLoad(); assert.equal(f.calls.filter(item => item.action === 'sourcePublications').length, 2);
 });
+
+test('source capture test requires a confirmed future event and exposes waiting rather than fake success', async () => {
+  const f = fixture();
+  f.handlers.sourceTestCapture = () => { f.data.sources.metrics.testCapture = { id: 'probe-trace', status: 'waiting', startedAt: Date.UTC(2026, 9, 13, 12), expiresAt: Date.UTC(2026, 9, 13, 12, 2), groupId: f.data.sources.config.groupId, instruction: 'Publique uma foto com legenda no grupo autorizado.' }; return f.data.sources.metrics.testCapture; };
+  await f.action('test-capture');
+  assert.deepEqual(f.calls.find(value => value.action === 'sourceTestCapture').payload, {});
+  assert.match(f.toasts.at(-1)[0], /Publique uma foto/);
+  assert.match(f.ui.render(), /Aguardando nova publicação autorizada/); assert.doesNotMatch(f.ui.render(), /Captura confirmada — item salvo/);
+  f.data.sources.metrics.testCapture.status = 'confirmed'; f.data.sources.metrics.testCapture.messageId = 'real-message-id';
+  assert.match(f.ui.render(), /Captura confirmada — item salvo e pronto na campanha/); assert.match(f.ui.render(), /real-message-id/);
+});
+
+test('source synchronization preserves the existing group and communicates that no history or sending was started', async () => {
+  const f = fixture(); f.handlers.sourceSyncNow = () => ({ groupId: f.data.sources.config.groupId, historyImported: false, message: 'Grupos e monitor sincronizados. Nenhum histórico foi importado.' });
+  await f.action('sync-now'); assert.equal(f.calls.filter(value => value.action === 'sourceSyncNow').length, 1); assert.equal(f.data.sources.config.groupId, '12000-source@g.us'); assert.equal(f.calls.filter(value => value.action === 'sourceImportHistory').length, 0); assert.match(f.toasts.at(-1)[0], /Nenhum histórico/);
+  f.data.sources.metrics.lastMessageAt = Date.UTC(2026, 9, 13, 12); f.data.sources.metrics.lastSyncAt = Date.UTC(2026, 9, 13, 12, 1); f.data.sources.metrics.captureStatus = 'waiting_connection';
+  f.data.sources.metrics.lastError = { code: 'SOURCE_GROUP_SYNC_TIMEOUT', message: 'A integração não respondeu no prazo.' };
+  const html = f.ui.render(); assert.match(html, /Aguardando conexão pronta/); assert.match(html, /Última mensagem recebida/); assert.match(html, /Última sincronização/); assert.match(html, /SOURCE_GROUP_SYNC_TIMEOUT/);
+});
+
+test('source test and sync controls cannot use an unsaved or unauthorized configuration', async () => {
+  const f = fixture(); f.ui.onInput({ closest: () => ({}) }); await assert.rejects(f.action('test-capture'), /Salve ou descarte/); await assert.rejects(f.action('sync-now'), /Salve ou descarte/); assert.equal(f.calls.length, 0);
+  const readonly = fixture({ permissions: ['campaign.view'] }); assert.doesNotMatch(readonly.ui.render(), /data-action="source-test-capture"|data-action="source-sync-now"/); await assert.rejects(readonly.action('test-capture'), /Sem permissão/); await assert.rejects(readonly.action('sync-now'), /Sem permissão/); assert.equal(readonly.calls.length, 0);
+});

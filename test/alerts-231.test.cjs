@@ -125,7 +125,7 @@ test('disconnect emits local alert immediately and sends pending private alert o
   await new Promise(resolve => setImmediate(resolve)); await f.service.flush();
   assert.equal(f.submitted.length, 1); alert = f.store.getEntity('alerts', alert.id);
   assert.equal(alert.originalAt, originalAt); assert.equal(alert.status, 'confirmed'); assert.equal(alert.lastAcceptedAt, f.now);
-  assert.match(alert.text, /Ocorrência original: 06\/10\/2026, 13:00:00/);
+  assert(alert.text.includes(`Ocorrência original: ${new Date(originalAt).toLocaleString('pt-BR', {timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone})}`)); assert.match(alert.text,/Conexão recuperada:/);
   await f.service.flush(); assert.equal(f.submitted.length, 1);
 });
 

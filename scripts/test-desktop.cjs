@@ -26,7 +26,7 @@ async function desktopHarness({locked=true,argv=[],settings={},dataOverride=true
   });
   class Window extends EventEmitter {
     constructor(options){super();this.options=options;this.hidden=options.show===false;this.webContents=new EventEmitter();this.webContents.mainFrame={};this.sent=[];this.webContents.send=(channel,payload)=>this.sent.push({channel,payload});this.webContents.setWindowOpenHandler=fn=>{this.windowOpenHandler=fn;};state.windows.push(this);}
-    async loadFile(filename){this.loaded=filename;}isDestroyed(){return !!this.destroyed;}show(){this.hidden=false;}hide(){this.hidden=true;}focus(){this.focused=true;}destroy(){this.destroyed=true;}
+    async loadFile(filename){this.loaded=filename;}isDestroyed(){return !!this.destroyed;}show(){this.hidden=false;}hide(){this.hidden=true;}focus(){this.focusCalls=(this.focusCalls||0)+1;this.focused=!state.focusDenied;}isFocused(){return !!this.focused;}isMinimized(){return !!this.minimized;}restore(){this.minimized=false;this.restored=true;}flashFrame(value){this.flashing=value;}destroy(){this.destroyed=true;}
   }
   class Client extends EventEmitter {
     constructor(worker,{host}){super();state.client=this;state.host=host;this.ready=Promise.resolve(state.prefs);}
@@ -36,9 +36,9 @@ async function desktopHarness({locked=true,argv=[],settings={},dataOverride=true
   }
   class SoundController {
     constructor(){state.sound=this;}
-    handle(payload,prefs){state.lastSound={payload,prefs};return {soundStatus:'disabled'};}
+    handle(payload,prefs,options){state.lastSound={payload,prefs,options};return {soundStatus:'disabled'};}
     async test(prefs){state.testPrefs=prefs;return {soundStatus:prefs.volume===0?'silent':'completed'};}
-    mute(id){state.muted=id;}muteAll(){state.allSoundsMuted=true;}shutdown(){state.soundStopped=true;}
+    mute(id){state.muted=id;(state.mutedIds||= []).push(id);}resolve(id){state.resolvedSound=id;(state.resolvedIds||=[]).push(id);}muteAll(){state.allSoundsMuted=true;}shutdown(){state.soundStopped=true;}
   }
   class TestNotification extends EventEmitter {
     constructor(options){super();this.options=options;state.notifications.push(this);}static isSupported(){return state.nativeSupported;}show(){this.requested=true;}
@@ -46,9 +46,11 @@ async function desktopHarness({locked=true,argv=[],settings={},dataOverride=true
   const powerMonitor=new EventEmitter();
   const electron={app,BrowserWindow:Window,ipcMain:{handle:(name,fn)=>state.handlers.set(name,fn),on:(name,fn)=>state.listeners.set(name,fn)},dialog:{showMessageBox:async(_,payload)=>{state.dialogs.push(payload);return {response:state.dialogResponse??2};},showOpenDialog:async()=>({canceled:true}),showSaveDialog:async()=>({canceled:true}),showErrorBox:(_,message)=>{state.startupError=message;}},Tray:class extends EventEmitter{constructor(){super();state.tray=this;}setToolTip(value){state.trayTooltip=value;}setContextMenu(menu){this.menu=menu;}destroy(){this.destroyed=true;}},Menu:{buildFromTemplate:value=>value,setApplicationMenu(){}},nativeImage:{createFromPath:()=>({})},shell:{openPath:async()=>'',openExternal:async url=>{state.openedExternal=url;}},powerMonitor,safeStorage:{isEncryptionAvailable:()=>true,encryptString:value=>Buffer.from(value),decryptString:buffer=>buffer.toString()},protocol:{registerSchemesAsPrivileged(value){state.schemes=value;},handle:(name,fn)=>state.protocols.set(name,fn)},net:{isOnline:()=>state.online,fetch:async url=>({url})},Notification:TestNotification};
   const filename=path.resolve(__dirname,'../src/main.cjs'),baseRequire=createRequire(filename);
-  const localRequire=name=>name==='electron'?electron:name==='node:worker_threads'?{Worker:class{constructor(filename,options){state.workers++;state.workerData=plain(options.workerData);}}}:name==='./core/worker-client.cjs'?{WorkerClient:Client}:name==='./core/sound.cjs'?{SoundController}:name==='./core/license-client.cjs'?{LicenseClient:class extends EventEmitter{constructor(){super();state.licensing=this;}getStatus(){return state.licenseStatus||{allowed:true,status:'active',plan:'monthly',remainingMs:86400000,offlineRemainingMs:86400000};}async initialize(){return this.getStatus();}async tick(){return this.getStatus();}async shutdown(){}}}:name==='./core/license-host.cjs'?{LicenseIdentityHost:class{}}:baseRequire(name);
+  const localRequire=name=>name==='electron'?electron:name==='node:worker_threads'?{Worker:class{constructor(filename,options){state.workers++;state.workerData=plain(options.workerData);}}}:name==='node:perf_hooks'?{performance:{now:()=>state.monotonicMs||0}}:name==='./core/worker-client.cjs'?{WorkerClient:Client}:name==='./core/sound.cjs'?{SoundController}:name==='./core/license-client.cjs'?{LicenseClient:class extends EventEmitter{constructor(){super();state.licensing=this;}getStatus(){return state.licenseStatus||{allowed:true,status:'active',plan:'monthly',remainingMs:86400000,offlineRemainingMs:86400000};}async initialize(){return this.getStatus();}async tick(){return this.getStatus();}async shutdown(){}}}:name==='./core/license-host.cjs'?{LicenseIdentityHost:class{}}:baseRequire(name);
   const intervals=[];
-  vm.runInNewContext(fs.readFileSync(filename,'utf8'),{require:localRequire,__dirname:path.dirname(filename),process:{env:dataOverride?{MEGA_DATA_DIR:dir}:{},platform:'win32',argv,execPath:'C:\\Kenned Code Disparos.exe'},setTimeout,clearTimeout,setInterval:(fn,delay)=>{const timer={fn,delay,unref(){}};intervals.push(timer);return timer;},clearInterval:timer=>{if(timer)timer.cleared=true;},Response,URL,Promise,Buffer,Date},{filename});
+  class ComputerDate extends Date {static now(){return state.computerAt??Date.now();}getTimezoneOffset(){return state.timeZoneOffsetMinutes??super.getTimezoneOffset();}}
+  const computerIntl={DateTimeFormat:()=>({resolvedOptions:()=>({timeZone:state.computerTimezone||Intl.DateTimeFormat().resolvedOptions().timeZone})})};
+  vm.runInNewContext(fs.readFileSync(filename,'utf8'),{require:localRequire,__dirname:path.dirname(filename),process:{env:dataOverride?{MEGA_DATA_DIR:dir}:{},platform:'win32',argv,execPath:'C:\\Kenned Code Disparos.exe'},setTimeout,clearTimeout,setInterval:(fn,delay)=>{const timer={fn,delay,unref(){}};intervals.push(timer);return timer;},clearInterval:timer=>{if(timer)timer.cleared=true;},Response,URL,Promise,Buffer,Date:ComputerDate,Intl:computerIntl},{filename});
   if(locked)await eventually(()=>state.windows.length===2||state.startupError);
   assert(!state.startupError,state.startupError);
   const win=state.windows.find(w=>w.options.show!==false),audioWindow=state.windows.find(w=>w.options.show===false);
@@ -159,6 +161,28 @@ async function testExpiryAndExplicitSupport(){
    h.state.licenseStatus={allowed:true,status:'offline',reasonCode:'LICENSE_NETWORK'};assert.equal((await h.state.host('localAlert',{id:'valid-grace',event:'critical'})).nativeStatus,'requested');
  }finally{await h.close();}
 }
+
+
+async function testComputerClockRevalidation(){
+ const h=await desktopHarness();try{
+   const timers=h.intervals.filter(t=>t.delay===5000),clockTimer=timers.find(t=>t.fn.toString().includes('readComputerClock'));assert(clockTimer,'Existe monitor do horário local separado da licença.');
+   h.state.computerAt=Date.now()+600000;h.state.monotonicMs=5000;clockTimer.fn();const changed=h.state.systemCalls.findLast(c=>c.action==='clockChanged');assert.equal(changed.payload.reason,'clock_changed');assert(changed.payload.current.at-changed.payload.previous.at>=590000);
+   const count=h.state.systemCalls.filter(c=>c.action==='clockChanged').length;h.state.computerAt+=5000;h.state.monotonicMs+=5000;clockTimer.fn();assert.equal(h.state.systemCalls.filter(c=>c.action==='clockChanged').length,count,'Tempo normal não desloca os horários.');
+   h.state.computerTimezone='America/Sao_Paulo';h.state.timeZoneOffsetMinutes=180;h.state.computerAt+=5000;h.state.monotonicMs+=5000;clockTimer.fn();const zone=h.state.systemCalls.findLast(c=>c.action==='clockChanged');assert.equal(zone.payload.reason,'timezone_changed');assert.equal(zone.payload.current.timezone,'America/Sao_Paulo');
+   h.state.computerAt-=3600000;h.powerMonitor.emit('resume');assert.equal(h.state.systemCalls.findLast(c=>c.action==='clockChanged').payload.reason,'clock_changed');assert.equal(h.state.systemCalls.at(-1).action,'resume');
+ }finally{await h.close();}
+}
+async function testIncidentForegroundAndAlarmResolution(){
+ const h=await desktopHarness({argv:['--autostart']});try{
+   h.win.minimized=true;
+   const payload={id:'incident-a:disconnect',occurrenceId:'incident-a',event:'disconnect',bringToFront:true,persistentAlarm:true,blocking:true,active:true,title:'Campanha interrompida',body:'Conexão indisponível.'};
+   const result=await h.state.host('localAlert',payload);assert.equal(h.win.restored,true);assert.equal(h.win.hidden,false);assert.equal(h.win.focusCalls,1);assert.equal(result.foregroundStatus,'focused');assert.equal(h.state.lastSound.options.persistent,true);
+   await h.state.host('localAlert',payload);assert.equal(h.win.focusCalls,1,'O mesmo incidente não rouba foco repetidamente.');assert.equal(h.state.notifications.length,1);
+   await h.state.host('silenceAlert',{id:'incident-a',occurrenceId:'incident-a'});assert(h.state.mutedIds.includes(payload.id),'Silenciar usa a notificação associada ao incidente.');
+   await h.state.host('resolveAlert',{id:'incident-a',occurrenceId:'incident-a',notificationIds:[payload.id]});assert(h.state.resolvedIds.includes(payload.id));assert.equal(h.win.flashing,false);
+   h.state.focusDenied=true;h.win.minimized=true;const fallback=await h.state.host('localAlert',{...payload,id:'incident-b:disconnect',occurrenceId:'incident-b'});assert.equal(fallback.foregroundStatus,'attention-requested');assert.equal(h.win.flashing,true);assert.equal(h.state.notifications.length,2,'Windows sem foco ainda recebe solicitação de notificação.');
+ }finally{await h.close();}
+}
 function testOwnershipManifest(){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-owned-test-'));
   try{
@@ -173,4 +197,4 @@ function testOwnershipManifest(){
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 }
 
-(async()=>{testOwnershipManifest();await testSingleInstanceAndIpcBoundary();await testNativeNotificationAcknowledgement();await testLifecycleAndNetwork();await testBrandingAndLegacyProfile();await testActualAudioRenderer();await testExpiryAndExplicitSupport();console.log('Desktop: 7 fluxos passaram (instância/IPC/bandeja, notificações, suspensão/rede, manifesto, identidade/perfil preservados, áudio/volume, vencimento e contato explícito com o desenvolvedor). Fachada nativa; exibição e áudio físicos no Windows não verificados.');})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{testOwnershipManifest();await testSingleInstanceAndIpcBoundary();await testNativeNotificationAcknowledgement();await testLifecycleAndNetwork();await testBrandingAndLegacyProfile();await testActualAudioRenderer();await testExpiryAndExplicitSupport();await testIncidentForegroundAndAlarmResolution();await testComputerClockRevalidation();console.log('Desktop: 9 fluxos passaram (instância/IPC/bandeja, notificações, suspensão/rede, manifesto, identidade/perfil preservados, áudio/volume, vencimento e contato explícito com o desenvolvedor, primeiro plano e resolução do alarme, mudança no relógio/fuso do computador). Fachada nativa; exibição e áudio físicos no Windows não verificados.');})().catch(error=>{console.error(error);process.exitCode=1;});

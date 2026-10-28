@@ -107,7 +107,7 @@ test('offline destination warning is local immediately, remains pending and pres
   assert.match(alert.text, /conexão geral está indisponível/); assert.doesNotMatch(alert.text, /demais grupos elegíveis continuarão/);
   f.advance(3600000); f.adapter.status = { state: 'connected', mode: 'whatsapp' }; await f.service.flush();
   alert = f.store.getEntity('alerts', alert.id); assert.equal(f.calls.length, 1); assert.equal(alert.originalAt, f.event.at);
-  assert.match(alert.text, /08\/10\/2026, 11:00:00/); assert.equal(alert.status, 'confirmed');
+  assert(alert.text.includes(new Date(f.event.at).toLocaleString('pt-BR', { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone })), 'O alerta usa o horário original no fuso do computador.'); assert.equal(alert.status, 'confirmed');
 });
 
 test('SQLite restart preserves summary counters, exact operation deduplication and already accepted first notice', async t => {
@@ -229,4 +229,25 @@ test('production Scheduler and SQLite FIFO release other external work after a s
   delayed.resolve({ status: 'confirmed', messageId: first.messageId, confirmationScope: 'whatsapp-server' }); await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.store.getAlert(first.id).status, 'confirmed'); assert.equal(f.calls.length, 1); assert.equal(scheduler.detachedAttempts.size, 0);
   await scheduler.shutdown();
+});
+
+test('verified destination recovery resolves only its own alarms and removes recurring summaries', async t => {
+  const f = await fixture(t, { connected: false, persistent: true, settings: { destinationAlertPolicy: { summaryIntervalSeconds: 60 } } });
+  const first = f.service.destinationFailure(f.event);
+  const other = f.service.destinationFailure({ ...f.event, groupId: '456@g.us', operationId: 'other-group:first' });
+  f.service.destinationFailure({ ...f.event, operationId: 'same-group:repeat' });
+  f.advance(61000); await f.service.flush();
+  const sameGroup = () => f.store.listEntities('notifications').filter(n => n.groupId === f.event.groupId);
+  assert.equal(sameGroup().length, 2, 'first notice and one grouped summary');
+  const result = f.service.resolveDestination(f.event.campaignId, f.event.groupId);
+  assert(result.resolved.includes(first.occurrenceId));
+  assert(sameGroup().every(n => n.active === false && n.resolvedAt));
+  assert.equal(f.store.getEntity('notifications', `${other.occurrenceId}:critical`).active, true, 'another destination remains blocked');
+  f.advance(3600000); await f.service.flush();
+  assert.equal(sameGroup().length, 2, 'periodic polling cannot recreate a resolved summary');
+  assert.equal(Object.values(f.service._destinationState()).some(b => b.first.groupId === f.event.groupId), false);
+  const next = f.service.destinationFailure({ ...f.event, operationId: 'new-failure-after-recovery', at: f.event.at + 3700000 });
+  assert.notEqual(next.occurrenceId, first.occurrenceId);
+  assert.equal(f.store.getEntity('notifications', `${next.occurrenceId}:critical`).active, true, 'a genuinely new incident can alarm again');
+  assert.equal(f.calls.length, 0, 'offline queued alerts are never claimed as sent');
 });

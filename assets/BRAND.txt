@@ -1,0 +1,32 @@
+KENNED CODE DISPAROS — IDENTIDADE VISUAL
+
+Símbolo próprio KC: letras geométricas combinadas com um ponto de conexão,
+representando tecnologia e automação. O nome do aplicativo permanece inalterado.
+
+Paleta
+Azul profundo: #10232D
+Verde: #17BD84
+Branco suave: #F3F8FB
+
+Arquivos vetoriais
+brand-mark.svg: símbolo transparente para fundos claros.
+brand-mark-light.svg: símbolo transparente para fundos escuros.
+brand-transparent.svg: assinatura horizontal transparente para fundo claro.
+brand-on-light.svg: assinatura horizontal em fundo branco.
+brand-on-dark.svg: assinatura horizontal em fundo azul profundo.
+brand.svg: ícone quadrado com cantos arredondados.
+
+Arquivos de imagem
+Os símbolos transparentes PNG têm 1024 × 1024 pixels.
+As assinaturas horizontais PNG têm 1280 × 384 pixels.
+icon.png: 512 × 512 pixels, utilizado na janela e nas notificações.
+tray.png: 32 × 32 pixels, utilizado na bandeja.
+icon.ico: resoluções 16, 24, 32, 48, 64, 128 e 256 pixels.
+
+Uso
+Preservar a proporção. Não esticar, girar ou acrescentar efeitos à marca.
+Usar a versão clara do símbolo sobre fundos escuros.
+A interface utiliza Segoe UI, com alternativa local Inter/system-ui.
+Os vetores não carregam recursos, fontes ou scripts externos.
+
+A nova identidade não altera dados, credenciais ou o identificador da aplicação.

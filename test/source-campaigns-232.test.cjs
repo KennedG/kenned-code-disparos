@@ -111,13 +111,13 @@ test('media failure and timeout do not block later valid items or invent readine
   assert.equal(f.store.getSourcePublication(GROUP, 'VALID').status, 'ready'); assert.equal(f.store.listCampaigns()[0].items.length, 1);
 });
 
-test('photo without caption and nearby text remain separate until explicit review', async t => {
+test('photo without caption requires review and a nearby text is captured independently without association', async t => {
   const f = await fixture(t); const photo = f.service.handlePublication(f.publication('EMPTY_PHOTO', { caption: '', text: '' })).publication;
   const text = f.service.handlePublication(f.publication('SEPARATE_TEXT', { type: 'text', raw: undefined })).publication;
-  await f.service.waitForIdle(); assert.equal(f.store.getSourcePublication(photo.id).status, 'review'); assert.equal(f.store.listCampaigns().length, 0);
-  assert.equal(f.store.getSourcePublication(text.id).status, 'review'); assert.notEqual(photo.id, text.id);
-  f.service.reviewPublication(photo.id, { caption: CAPTION }, 'owner-test'); assert.equal(f.store.listCampaigns()[0].items[0].caption, CAPTION);
-  assert.equal(f.store.getSourcePublication(text.id).status, 'review');
+  await f.service.waitForIdle(); assert.equal(f.store.getSourcePublication(photo.id).status, 'review'); assert.equal(f.store.listCampaigns().length, 1);
+  assert.equal(f.store.getSourcePublication(text.id).status, 'ready'); assert.notEqual(photo.id, text.id); assert.equal(f.store.listCampaigns()[0].items[0].text, CAPTION);
+  f.service.reviewPublication(photo.id, { caption: CAPTION }, 'owner-test'); assert.equal(f.store.listCampaigns()[0].items.find(item => item.type === 'image').caption, CAPTION);
+  assert.equal(f.store.getSourcePublication(text.id).status, 'ready'); assert.equal(f.store.listCampaigns()[0].items.length, 2);
 });
 
 test('persisted pending download recovers with protected protobuf and no publication duplicate', async t => {

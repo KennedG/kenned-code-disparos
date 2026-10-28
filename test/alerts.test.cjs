@@ -128,18 +128,18 @@ test('disconnect notifications deduplicate a failure, omit manual disconnects an
   assert.equal(f.local.length, 2); assert.notEqual(f.local[0].occurrenceId, f.local[1].occurrenceId); await f.service.shutdown();
 });
 
-test('automatic resume is opt-in and only resumes previously active unchanged connection-paused campaigns', async () => {
+test('reconnection never calls the legacy immediate resume even when automatic recovery is enabled', async () => {
   const f = fixture({ settings: { reconnect: { enabled: false, autoResume: true } } });
   f.service.start();
   f.store.saveCampaign({ ...f.store.getCampaign('c1'), state: 'paused', pauseReason: 'Conexão indisponível: disconnected.' });
   f.adapter.status = { state: 'disconnected', reasonCode: 'unexpected' }; f.adapter.emit('status', f.adapter.status);
   await new Promise(resolve => setImmediate(resolve));
   f.adapter.status = { state: 'connected' }; f.adapter.emit('status', f.adapter.status); await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(f.resumes, ['c1']);
+  assert.deepEqual(f.resumes, []);
   f.adapter.status = { state: 'disconnected', reasonCode: 'unexpected' }; f.adapter.emit('status', f.adapter.status);
   f.store.saveCampaign({ ...f.store.getCampaign('c1'), state: 'paused', configRevision: 2, pauseReason: 'Conexão indisponível: disconnected.' });
   f.adapter.status = { state: 'connected' }; f.adapter.emit('status', f.adapter.status); await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(f.resumes, ['c1']); await f.service.shutdown();
+  assert.deepEqual(f.resumes, []); await f.service.shutdown();
 });
 
 test('independent HTTPS channel is marked channel acceptance and works while WhatsApp is disconnected', async () => {
@@ -172,7 +172,7 @@ test('alert message exposes campaign outcome counts without credentials', () => 
 test('automatic reconnection obeys a finite attempt limit and never reconnects an expired or manual session', async () => {
   const timers = new Map(); let sequence = 0;
   const f = fixture({ settings: { reconnect: { enabled: true, maxAttempts: 2, delaySeconds: 4, autoResume: false } }, timerDeps: {
-    setTimer: (callback, delay) => { assert.equal(delay, 4000); const handle = { id: ++sequence, unref() {} }; timers.set(handle, callback); return handle; },
+    setTimer: (callback, delay) => { assert.equal(delay, sequence === 0 ? 4000 : 8000); const handle = { id: ++sequence, unref() {} }; timers.set(handle, callback); return handle; },
     clearTimer: handle => timers.delete(handle)
   } });
   let attempts = 0; f.adapter.connect = async () => { attempts++; throw new Error('Network still unavailable'); };
@@ -186,7 +186,7 @@ test('automatic reconnection obeys a finite attempt limit and never reconnects a
   assert.equal(attempts, 2); assert.equal(timers.size, 0);
   f.adapter.status = { state: 'connected' }; f.adapter.emit('status', f.adapter.status); await new Promise(resolve => setImmediate(resolve));
   f.adapter.status = { state: 'disconnected', reasonCode: 'session_expired', retryable: false }; f.adapter.emit('status', f.adapter.status);
-  assert.equal(timers.size, 0); assert(f.local.at(-1).reason.includes('expirou'));
+  assert.equal(timers.size, 0); assert(f.local.findLast(n=>n.event==='disconnect').reason.includes('expirou')); assert.equal(f.local.filter(n=>n.event==='qr-required').length,1);
   f.adapter.status = { state: 'disconnected', reasonCode: 'manual', manual: true }; f.adapter.emit('status', f.adapter.status);
   assert.equal(timers.size, 0); await f.service.shutdown();
 });

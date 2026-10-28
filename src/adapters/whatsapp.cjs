@@ -222,6 +222,9 @@ class WhatsAppAdapter extends EventEmitter {
     this.networkSubmissions = new Set();
     this.opportunityCapture = { enabled: false, monitoredGroupIds: new Set(), allowOwnMessages: false, activatedAt: 0 };
     this.seenOpportunities = new Map();
+    this.captureHealth = { receivedEvents: 0, lastEventAt: null, lastConnectionAt: null,
+      searches: { received: 0, lastMessageAt: null, lastOriginalAt: null, lastError: null },
+      source: { received: 0, lastMessageAt: null, lastOriginalAt: null, lastError: null } };
   }
 
   _receiveTraceId(key = {}, accountId = this._ownAccount().id) {
@@ -297,7 +300,7 @@ class WhatsAppAdapter extends EventEmitter {
   _status(state, detail, extras = {}) {
     const failure = ['disconnected', 'restricted'].includes(state);
     const own = this._ownAccount();
-    this.status = { state, mode: 'whatsapp', simulation: false, detail, ownNumber: own.phone || '', ownAccountId: own.id || '', ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
+    this.status = { state, ready: state === 'connected', mode: 'whatsapp', simulation: false, detail, ownNumber: own.phone || '', ownAccountId: own.id || '', ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
     this.emit('status', this.status);
   }
 
@@ -311,7 +314,9 @@ class WhatsAppAdapter extends EventEmitter {
     if (this.connectPromise) return this.connectPromise;
     if (this.status.state === 'connected' && !reconnect) return this.status;
     this.connectPromise = (async () => {
-      if (reconnect && this.socket) await this.disconnect();
+      // Replacing a stale transport is not a user-requested disconnect. Keep
+      // its classification separate so recovery cannot revoke scheduling.
+      if (reconnect && this.socket) await this.disconnect({ manual: false, reasonCode: 'reconnecting' });
       this.requestedDisconnect = false;
       this.restartCount = 0;
       return this._connect();
@@ -404,7 +409,10 @@ class WhatsAppAdapter extends EventEmitter {
         if (generation === this.generation && event?.id) this.groupMetadataCache.delete(event.id);
       });
       socket.ev.on('messages.upsert', event => {
-        this._handleUpsert(event, generation);
+        try { this._handleUpsert(event, generation); }
+        catch (error) {
+          if (generation === this.generation) this._captureFailure('WA_CAPTURE_EVENT_ERROR', 'Uma mensagem não pôde ser capturada. Consulte os registros; outros eventos continuam sendo processados.', error);
+        }
       });
       socket.ev.on('messages.update', updates => {
         if (generation !== this.generation) return;
@@ -440,7 +448,7 @@ class WhatsAppAdapter extends EventEmitter {
         if (generation !== this.generation) return;
         this._rememberContacts(event.contacts);
         if (this.searchCapture.enabled && this.searchCapture.importHistory) this._queueCaptureHistory(event.messages, generation, 'messaging-history.set', event);
-        if (this._sourceHistoryEnabled()) this._sourceUpsert({ type: 'append', messages: event.messages }, generation);
+        if (this._sourceHistoryEnabled()) this._sourceUpsert({ type: 'append', history: true, messages: event.messages }, generation);
       });
       socket.ev.on('messaging-history.status', event => {
         if (generation !== this.generation || !this.searchCapture.enabled || !this.searchCapture.importHistory) return;
@@ -481,10 +489,17 @@ class WhatsAppAdapter extends EventEmitter {
     if (generation !== this.generation) return;
     if (update.qr) {
       const qr = await require('qrcode').toDataURL(update.qr, { errorCorrectionLevel: 'M', margin: 2, width: 300 });
-      if (generation === this.generation) this._status('connecting', 'No WhatsApp, abra Aparelhos conectados e leia o QR Code. Integração não oficial.', { qr });
+      if (generation === this.generation && socket === this.socket && !this.requestedDisconnect && this.status.state !== 'connected') this._status('connecting', 'No WhatsApp, abra Aparelhos conectados e leia o QR Code. Integração não oficial.', { qr });
     }
     if (update.connection === 'open') {
+      if (socket !== this.socket || this.requestedDisconnect) return;
+      const readiness = this._transportReadiness(socket);
+      if (!readiness.ready) {
+        this._status('connecting', readiness.detail, { ready: false, reasonCode: readiness.reasonCode, errorCode: readiness.reasonCode });
+        return;
+      }
       this.restartCount = 0;
+      this.captureHealth.lastConnectionAt = Date.now();
       this._status('connected', 'WhatsApp conectado por Baileys, integração não oficial. Use apenas grupos autorizados.');
     }
     if (update.connection !== 'close') return;
@@ -581,8 +596,11 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   async listGroups() {
-    if (this.status.state !== 'connected' || !this.socket) throw definitiveError('Conecte o WhatsApp antes de carregar os grupos.', true);
-    const groups = await this.socket.groupFetchAllParticipating();
+    if (!this.getConnectionReadiness().ready) throw definitiveError('Conecte o WhatsApp antes de carregar os grupos.', true, 'WA_CONNECTION_OFFLINE');
+    const socket = this.socket, generation = this.generation;
+    if (typeof socket.groupFetchAllParticipating !== 'function') throw definitiveError('A integração não disponibiliza a consulta dos grupos da conta.', false, 'WA_GROUP_LIST_UNSUPPORTED');
+    const groups = await this._boundedControl(() => socket.groupFetchAllParticipating());
+    this._assertTransport(socket, generation);
     const result = Object.values(groups || {}).filter(group => typeof group.id === 'string' && group.id.endsWith('@g.us')).map(group => ({
       id: group.id,
       name: group.subject || group.id,
@@ -595,6 +613,70 @@ class WhatsAppAdapter extends EventEmitter {
     }));
     this.knownSearchGroups = new Set(result.map(group => group.id));
     return result;
+  }
+
+  _transportReadiness(socket = this.socket) {
+    const own = this._ownAccount();
+    const transportOpen = typeof socket?.ws?.isOpen === 'boolean' ? socket.ws.isOpen : null;
+    const ready = Boolean(socket && socket === this.socket && own.id && typeof socket.sendMessage === 'function' && transportOpen !== false && !this.requestedDisconnect && this.networkAvailable !== false);
+    const reasonCode = !socket ? 'WA_CONNECTION_OFFLINE' : !own.id ? 'WA_SESSION_IDENTITY_PENDING' : transportOpen === false ? 'WA_TRANSPORT_NOT_OPEN' : this.requestedDisconnect ? 'WA_MANUAL_DISCONNECT' : this.networkAvailable === false ? 'NETWORK_OFFLINE' : typeof socket.sendMessage !== 'function' ? 'WA_SEND_UNSUPPORTED' : 'WA_SESSION_READY';
+    return { ready, accountId: own.id, transportOpen, reasonCode,
+      detail: ready ? 'Sessão autenticada e transporte prontos para envio.' : 'A sessão ainda não está pronta para enviar. Aguarde a conexão ou leia o QR Code, quando solicitado.' };
+  }
+
+  getConnectionReadiness() {
+    const result = this._transportReadiness();
+    return { ...result, ready: result.ready && this.status.state === 'connected', state: this.status.state, mode: 'whatsapp', simulation: false };
+  }
+
+  async testConnection({ signal, timeoutMs } = {}) {
+    const initial = this.getConnectionReadiness(), checkedAt = Date.now();
+    if (!initial.ready) return { ...initial, checkedAt, verified: false, code: initial.reasonCode, serverProbeSupported: false };
+    const socket = this.socket, generation = this.generation;
+    if (typeof socket.fetchBlocklist !== 'function') return { ...initial, checkedAt, verified: false, code: 'WA_SESSION_READY_LOCAL', serverProbeSupported: false,
+      detail: 'Sessão e transporte prontos. A integração não disponibilizou uma consulta de teste; isso não comprova envio ou recebimento.' };
+    try {
+      // Read-only authenticated server query. Its returned personal data is never
+      // exposed, cached or logged, and it does not send a test message.
+      await this._boundedControl(() => socket.fetchBlocklist(), { signal, timeoutMs });
+      this._assertTransport(socket, generation);
+      return { ...this.getConnectionReadiness(), checkedAt, verified: true, serverProbeSupported: true, code: 'WA_CONNECTION_PROBE_OK', detail: 'O servidor respondeu à consulta autenticada. Envio e recebimento de mensagens exigem um teste separado com destinatário autorizado.' };
+    } catch (error) {
+      return { ...this.getConnectionReadiness(), checkedAt, verified: false, serverProbeSupported: true, code: error.code || 'WA_CONNECTION_PROBE_FAILED', detail: 'A consulta de teste não foi confirmada. Verifique a conexão e consulte o código da falha.' };
+    }
+  }
+
+  _captureFailure(code, detail, error) {
+    const failure = { code, detail, at: Date.now(), technicalCode: String(error?.code || 'UNKNOWN').slice(0, 80) };
+    this.captureHealth.searches.lastError = failure;
+    this.captureHealth.source.lastError = failure;
+    this.emit('captureError', failure);
+  }
+
+  _captureObserved(channel, context) {
+    const health = this.captureHealth[channel];
+    if (!health) return;
+    health.received++;
+    health.lastMessageAt = Date.now();
+    health.lastOriginalAt = context.timestamp || null;
+    health.lastError = null;
+  }
+
+  getCaptureHealth() {
+    return { ...structuredClone(this.captureHealth), readiness: this.getConnectionReadiness(),
+      searches: { ...structuredClone(this.captureHealth.searches), enabled: this.searchCapture.enabled, groupIds: [...(this.searchCapture.groupIds || [])] },
+      source: { ...structuredClone(this.captureHealth.source), enabled: this.sourceCapture.enabled, groupIds: [...this.sourceCapture.groupIds] },
+      historyComplete: false, historySupport: 'opportunistic' };
+  }
+
+  _isLiveAppend(message, event, generation = this.generation) {
+    if (event?.type !== 'append' || event.history === true || generation !== this.generation) return false;
+    if (typeof event.requestId === 'string' && event.requestId && !this._isPendingRecovery(message, generation)) return false;
+    const timestamp = messageTimestamp(message?.messageTimestamp), now = Date.now();
+    // Baileys emits append for locally published messages and some recent
+    // offline deliveries. It is not proof of history by itself. Old/recovered
+    // history stays opt-in; only a current, identified publication is live.
+    return Boolean(message?.key?.id && timestamp && timestamp >= Math.max(this.connectStartedAt - 5000, now - 120000) && timestamp <= now + 30000);
   }
 
   _assertSignal(signal) {
@@ -783,7 +865,7 @@ class WhatsAppAdapter extends EventEmitter {
       }
       const timestamp = messageTimestamp(message.messageTimestamp);
       if (!timestamp || timestamp > now + 30000) continue;
-      const history = event.type !== 'notify' || timestamp < this.sourceCapture.activatedAt ||
+      const history = (event.type !== 'notify' && !this._isLiveAppend(message, event, generation)) || timestamp < this.sourceCapture.activatedAt ||
         (typeof event.requestId === 'string' && !this._isPendingRecovery(message, generation));
       if (history && (!this._sourceHistoryEnabled() || timestamp < this.sourceCapture.importFrom || timestamp > this.sourceCapture.importUntil)) continue;
       const context = this._sourceContext(message, { history });
@@ -792,6 +874,7 @@ class WhatsAppAdapter extends EventEmitter {
       if (this.seenPublications.has(dedupeId)) continue;
       this.seenPublications.set(dedupeId, now);
       while (this.seenPublications.size > 5000) this.seenPublications.delete(this.seenPublications.keys().next().value);
+      this._captureObserved('source', context);
       this.emit('publication', context);
     }
   }
@@ -925,7 +1008,9 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   _handleUpsert(event, generation) {
-    if (generation !== this.generation) return;
+    if (generation !== this.generation || !this.socket || this.requestedDisconnect || this.networkAvailable === false) return;
+    this.captureHealth.receivedEvents++;
+    this.captureHealth.lastEventAt = Date.now();
     // Most events are processed synchronously. Some Baileys private events
     // carry only a LID; read the authenticated mapping repository before
     // authorization instead of inventing a telephone from the internal ID.
@@ -937,7 +1022,7 @@ class WhatsAppAdapter extends EventEmitter {
       const jid = accountJid(isGroup ? key.participant : key.remoteJid);
       const alternate = isGroup ? key.participantAlt : key.remoteJidAlt;
       const lookup = this.socket?.signalRepository?.lidMapping?.getPNForLID;
-      if (event.type !== 'notify' || key.fromMe || !jid.endsWith('@lid') || phoneFromJid(alternate) || this.contacts.get(jid)?.phoneNumber || typeof lookup !== 'function') {
+      if ((event.type !== 'notify' && !this._isLiveAppend(message, event, generation)) || key.fromMe || !jid.endsWith('@lid') || phoneFromJid(alternate) || this.contacts.get(jid)?.phoneNumber || typeof lookup !== 'function') {
         ready.push(message); continue;
       }
       const hydrationId = `${generation}:${jid}:${key.id || ''}`;
@@ -1143,8 +1228,11 @@ class WhatsAppAdapter extends EventEmitter {
   _captureUpsert(event, generation) {
     if (generation !== this.generation || !this.searchCapture.enabled) return;
     if (event?.type === 'append') {
-      if (this.searchCapture.importHistory) this._queueCaptureHistory(event.messages, generation, 'messages.upsert.append');
-      return;
+      const live = [], historical = [];
+      for (const message of event.messages || []) (this._isLiveAppend(message, event, generation) ? live : historical).push(message);
+      if (this.searchCapture.importHistory && historical.length) this._queueCaptureHistory(historical, generation, 'messages.upsert.append');
+      if (!live.length) return;
+      event = { ...event, type: 'notify', messages: live };
     }
     if (event?.type !== 'notify') return;
     const now = Date.now();
@@ -1164,7 +1252,7 @@ class WhatsAppAdapter extends EventEmitter {
       this.seenOffers.set(dedupeId, now);
       while (this.seenOffers.size > 4000) this.seenOffers.delete(this.seenOffers.keys().next().value);
       if (history) this.emit('offerHistory', { messages: [context], source: recovered ? 'phone-recovered-notify' : 'delayed-notify', complete: false, at: now });
-      else this.emit('offerMessage', context);
+      else { this._captureObserved('searches', context); this.emit('offerMessage', context); }
     }
   }
 
@@ -1337,7 +1425,7 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   _assertTransport(socket, generation) {
-    if (socket !== this.socket || generation !== this.generation || this.status.state !== 'connected') throw definitiveError('A conexão mudou antes da submissão. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_CONNECTION_CHANGED');
+    if (socket !== this.socket || generation !== this.generation || !this.getConnectionReadiness().ready) throw definitiveError('A conexão mudou antes da submissão. Nenhuma mensagem foi enviada.', true, 'WA_RECIPIENT_CONNECTION_CHANGED');
   }
 
   async send(groupId, item, media, { beforeSubmit, traceId, signal, timeoutMs } = {}) {
@@ -1601,7 +1689,7 @@ class WhatsAppAdapter extends EventEmitter {
     for (const message of event.messages || []) {
       const key = message.key || {};
       const recovered = typeof event.requestId === 'string' && event.requestId.length > 0;
-      if (event?.type !== 'notify' || (recovered && !this._isPendingRecovery(message, generation))) {
+      if ((event?.type !== 'notify' && !this._isLiveAppend(message, event, generation)) || (recovered && !this._isPendingRecovery(message, generation))) {
         this._transportDiagnostic(message, 'transport.ignored', recovered ? 'WA_RECOVERY_NOT_LIVE' : 'WA_HISTORY_NOT_COMMAND', recovered ? 'Recuperação sem mensagem privada recente observada; não executada como comando.' : 'Evento de histórico não executado como comando.', { eventType: event.type || 'unknown' });
         continue;
       }

@@ -1,8 +1,8 @@
 {
-  "tag": "v2.3.2-reformulado",
-  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Reformulado-x64.exe",
-  "installerSha256": "cc055f5b747e0d24e5681c53479f064151731dcb1be929cd1ecb8028b648507f",
+  "tag": "v2.3.2-r2",
+  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Recuperacao-x64.exe",
+  "installerSha256": "d493020a809c21712d58cdb66784c25247fd0d8c786fac0c7ed45020bda7f038",
   "sourceRecoveredFromInstaller": false,
-  "packagedSourceFilesAudited": 98,
+  "packagedSourceFilesAudited": 114,
   "latestRecommended": false
 }

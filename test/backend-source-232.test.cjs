@@ -89,11 +89,26 @@ test('destination recheck requires permission and truthful current metadata; cle
  f.adapter.setGroupPublishingStatus('sim-02@simulation',{available:false,canSend:false,code:'WA_GROUP_NOT_PARTICIPANT',reason:'Conta removida',confirmed:true});const blocked=await f.service.call('destinationRecheck',{campaignId:campaign.id,groupId:'sim-02@simulation'});assert.equal(blocked.state,'suspended');assert.equal(blocked.code,'WA_GROUP_NOT_PARTICIPANT');assert.equal(f.store.getCampaign(campaign.id).state,'draft');
 });
 
-test('backend source scheduling preserves explicit timezone and indexed daily limits follow Brasília rather than Windows midnight',async t=>{
+test('backend executes on computer timezone while preserving source date and legacy timezone metadata',async t=>{
+ const previousTZ=process.env.TZ;process.env.TZ='UTC';t.after(()=>{if(previousTZ===undefined)delete process.env.TZ;else process.env.TZ=previousTZ;});
  const f=await fixture(t);f.clock.now=Date.parse('2026-10-08T00:30:00Z');await f.config({configTemplate:{groupIds:['sim-02@simulation'],schedule:{timezone:'America/Sao_Paulo',days:[0,1,2,3,4,5,6],startTime:'00:00',endTime:'00:00'},messageSpacingSeconds:3,spacingSeconds:3,sendTimeoutSeconds:30}});
  const publication=await f.record();assert.equal(publication.dateKey,'2026-10-07');let campaign=await f.service.call('sourceApplyConfigTemplate',{campaignId:publication.campaignId});
  campaign=await f.service.call('saveCampaign',{campaign:{...campaign,dailyRoundLimit:1}});assert.equal(campaign.sourceTimezone,'America/Sao_Paulo');assert.equal(campaign.schedule.timezone,'America/Sao_Paulo');
  f.store.insertRound({id:randomUUID(),campaignId:campaign.id,startedAt:Date.parse('2026-10-07T23:00:00Z'),finishedAt:Date.parse('2026-10-07T23:00:00Z'),status:'completed'});
  assert.equal(f.store.getCampaignCounts(campaign.id,f.clock.now,{timezone:'America/Sao_Paulo'}).rounds,1);
- const activated=await f.service.call('activateCampaign',{id:campaign.id,configRevision:campaign.configRevision,summaryState:campaign.state});assert.equal(activated.state,'active');assert.equal(activated.nextRunAt,Date.parse('2026-10-08T03:00:00Z'));assert.equal(f.adapter.sent.length,0);
+ const activated=await f.service.call('activateCampaign',{id:campaign.id,configRevision:campaign.configRevision,summaryState:campaign.state});assert.equal(activated.state,'active');assert.equal(activated.nextRunAt,f.clock.now);assert.equal(activated.executionAuthorization.dateKey,'2026-10-08');assert.equal(f.service.snapshot().clock.timezone,'UTC');assert.equal(f.store.getCampaignCounts(campaign.id,f.clock.now).rounds,0);assert.equal(f.adapter.sent.length,0);
+});
+
+test('capture-test and synchronization RPCs require owner permissions and arm an actual source event without sending',async t=>{
+ const f=await fixture(t);await f.config();const before=f.store.listCampaigns().map(c=>c.id);const probe=await f.service.call('sourceTestCapture',{});assert.equal(probe.status,'waiting');assert.equal(probe.checks.groupAccessConfirmed,true);assert.deepEqual(f.store.listCampaigns().map(c=>c.id),before,'Arming a probe never creates campaigns');assert.equal(f.adapter.sent.length,0);
+ const publication=await f.record('PROBE-OWNER');const state=await f.service.call('sourceConfigGet');assert.equal(state.metrics.testCapture.status,'confirmed');assert.equal(state.metrics.testCapture.messageId,'PROBE-OWNER');assert.equal(f.store.getCampaign(publication.campaignId).state,'draft');assert.equal(f.adapter.sent.length,0);
+ const synced=await f.service.call('sourceSyncNow',{});assert.equal(synced.historyImported,false);assert.equal(synced.completeHistory,false);assert.equal((await f.service.call('sourceConfigGet')).config.groupId,'sim-01@simulation');
+ await f.service.call('logout');await assert.rejects(f.service.call('sourceTestCapture',{}),/login/i);await assert.rejects(f.service.call('sourceSyncNow',{}),/login/i);
+});
+
+test('capture test and sync remain blocked after licence expiry and never enable deleted source bindings',async t=>{
+ const f=await fixture(t);await f.config();const before=f.store.listCampaigns().map(c=>c.id);const publication=await f.record('DELETE-BEFORE-PROBE');const config=await f.service.call('sourceConfigGet');
+ f.store.transaction(()=>{f.store.pauseSourceForCampaign(publication.campaignId,{at:f.clock.now});f.store.deleteCampaign(publication.campaignId);});await assert.rejects(f.service.call('sourceTestCapture',{}),/origem|pausad|captura/i);
+ await f.service.call('sourceSyncNow',{});assert.equal((await f.service.call('sourceConfigGet')).config.capturePaused,true);assert.deepEqual(f.store.listCampaigns().map(c=>c.id),before,'Synchronization never recreates the deleted campaign');
+ f.license.set({allowed:false,status:'expired',reasonCode:'LICENSE_EXPIRED',expiresAt:f.clock.now-1});await f.service.call('licenseRefresh');await assert.rejects(f.service.call('sourceTestCapture',{}),/licen|expir/i);await assert.rejects(f.service.call('sourceSyncNow',{}),/licen|expir/i);assert.equal(f.store.getSourceConfig().groupId,config.config.groupId);
 });

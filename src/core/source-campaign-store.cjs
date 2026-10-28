@@ -193,6 +193,8 @@ function attachSourceStore(store, { db, prepared, transaction }) {
     getLatestSourceDay(groupId) { return decode(prepared('SELECT data FROM source_days WHERE storageMode=? AND groupId=? ORDER BY createdAt DESC,rowid DESC LIMIT 1').get(mode(), key(groupId))); },
     getSourceConfig() { return decode(prepared('SELECT data FROM settings WHERE id=?').get(`mode:${mode()}:sourceCampaignConfig`))?.value || {}; },
     setSourceConfig(value) { return transaction(() => { const id = `mode:${mode()}:sourceCampaignConfig`; prepared('INSERT INTO settings(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(id, JSON.stringify({ id, value })); return value; }); },
+    getSourceCaptureHealth() { return decode(prepared('SELECT data FROM settings WHERE id=?').get(`mode:${mode()}:sourceCaptureHealth`))?.value || {}; },
+    setSourceCaptureHealth(value) { return transaction(() => { const id = `mode:${mode()}:sourceCaptureHealth`; prepared('INSERT INTO settings(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(id, JSON.stringify({ id, value })); return value; }); },
     getSourcePublication(id, messageId) { return messageId === undefined ? get(id) : byMessage(id, messageId); },
     insertSourcePublication: value => transaction(() => save(value, { insertOnly: true })),
     saveSourcePublication: value => transaction(() => save(value)),

@@ -285,7 +285,9 @@ test('identidade vem do protocolo, LID sem número é rejeitado e histórico/rep
     key: { id, remoteJid, remoteJidAlt, fromMe: false }, messageTimestamp: timestamp,
     pushName: '5511999999999', message: body
   });
-  f.socket.ev.emit('messages.upsert', { type: 'append', messages: [message('history', '5511888888888@s.whatsapp.net')] });
+  // APPEND is also used by Baileys for fresh deliveries. Mark this fixture as
+  // actual history, preserving its prohibition against replaying old commands.
+  f.socket.ev.emit('messages.upsert', { type: 'append', history: true, messages: [message('history', '5511888888888@s.whatsapp.net')] });
   f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [message('old', '5511888888888@s.whatsapp.net', null, recent - 300)] });
   f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [message('lid-unresolved', '123456@lid')] });
   assert.equal(incoming.at(-1).verified, false);

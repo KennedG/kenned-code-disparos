@@ -262,8 +262,27 @@ test('actual WhatsApp notify duplicates, group messages and historical append do
   await adapter._incoming({ type: 'notify', messages: [{ ...privateMessage,
     key: { remoteJid: '1203630123@g.us', participant: '5562999992222@s.whatsapp.net', fromMe: false, id: 'PROTOCOL-GROUP' }
   }] }, adapter.generation);
-  await adapter._incoming({ type: 'append', messages: [{ ...privateMessage,
+  await adapter._incoming({ type: 'append', history: true, messages: [{ ...privateMessage,
     key: { remoteJid: '5562999993333@s.whatsapp.net', fromMe: false, id: 'PROTOCOL-HISTORY' }
   }] }, adapter.generation);
   assert.equal(store.listEntities('contact_pending').length, 1); assert.equal(notices, 1);
+});
+
+test('a current private append creates one intake record without being confused with imported history', async t => {
+  const { dir, store, auth } = await fixture(t);
+  const intake = new ContactIntake({ store, auth });
+  const adapter = new WhatsAppAdapter({ store, credentialsDir: path.join(dir, 'credentials') });
+  adapter.on('incoming', ctx => intake.handleIncoming(ctx));
+  let notices = 0; intake.on('localAlert', () => notices++);
+  const publication = {
+    key: { remoteJid: `${PHONE}@s.whatsapp.net`, id: 'PROTOCOL-LIVE-APPEND', fromMe: false },
+    messageTimestamp: Math.floor(Date.now() / 1000), pushName: 'Contato privado recente',
+    message: { conversation: 'Olá, gostaria de consultar um aparelho' }
+  };
+  await adapter._incoming({ type: 'append', messages: [publication] }, adapter.generation);
+  await adapter._incoming({ type: 'notify', messages: [publication] }, adapter.generation);
+  const pending = store.listEntities('contact_pending');
+  assert.equal(pending.length, 1); assert.equal(notices, 1);
+  assert.equal(pending[0].phone, PHONE);
+  assert.equal(pending[0].firstMessageId, 'PROTOCOL-LIVE-APPEND');
 });

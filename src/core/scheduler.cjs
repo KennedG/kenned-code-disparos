@@ -1,10 +1,19 @@
 'use strict';
 
 const { EventEmitter } = require('node:events');
-const { randomUUID, randomBytes } = require('node:crypto');
+const { randomUUID, randomBytes, createHash } = require('node:crypto');
 const { assertCampaignSchemaCompatible } = require('./campaign-schema-compat.cjs');
 const { localParts, localEpoch } = require('./reminders.cjs');
+const { computerClockStatus, computerDateKey, localSchedule, nextComputerRoundSlot } = require('./computer-schedule.cjs');
 const ITEM_TYPES = new Set(['text', 'image', 'video', 'document']);
+
+function executionPolicyFingerprint(campaign) {
+  const normalize = v => Array.isArray(v) ? v.map(normalize) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, normalize(v[k])])) : v;
+  const fields = ['mode', 'intervalMinutes', 'spacingSeconds', 'messageSpacingSeconds', 'groupSpacingSeconds', 'schedule', 'dailyRoundLimit', 'dailySendLimit', 'groupIds', 'maxRounds', 'endAt'];
+  const value = Object.fromEntries(fields.map(k => [k, campaign[k]]));
+  value.groupOverrides = Object.fromEntries(Object.entries(campaign.groupOverrides || {}).map(([id, g]) => [id, { enabled: g.enabled, intervalMinutes: g.intervalMinutes, schedule: g.schedule }]));
+  return createHash('sha256').update(JSON.stringify(normalize(value))).digest('hex');
+}
 
 function dateKey(value, timezone) {
   if (timezone) { const p = localParts(Number(new Date(value)), timezone); return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`; }
@@ -110,7 +119,7 @@ function defaultSleep(ms, signal) {
 }
 
 class Scheduler extends EventEmitter {
-  constructor({ store, adapter, now = () => Date.now(), sleep = defaultSleep, licenseGuard = () => {}, attemptTimeoutMs }) {
+  constructor({ store, adapter, now = () => Date.now(), sleep = defaultSleep, licenseGuard = () => {}, attemptTimeoutMs, monotonicNow }) {
     super();
     this.store = store;
     this.now = now;
@@ -133,21 +142,10 @@ class Scheduler extends EventEmitter {
     this.attemptTimeoutMs = attemptTimeoutMs;
     this.detachedAttempts = new Set();
     this.manualRetries = new Map();
-    // Defense in depth: constructing a worker never replays an old queue.
-    const interrupted = new Set();
-    for (const job of [...store.listJobs({ status: 'sending', limit: 1000000 }), ...store.listJobs({ status: 'queued', limit: 1000000 })]) {
-      if (job.status === 'sending' || job.status === 'queued') {
-        this._persist('updateJob', job.id, {
-          status: job.status === 'sending' ? 'uncertain' : 'cancelled',
-          resultAt: now(), error: 'Execução anterior interrompida; nenhum reenvio automático.'
-        });
-        interrupted.add(job.campaignId);
-      }
-    }
-    for (const id of interrupted) {
-      const campaign = store.getCampaign(id);
-      if (campaign?.state === 'active') this._persist('saveCampaign', { ...campaign, state: 'paused', nextRunAt: null });
-    }
+    this.monotonicNow = monotonicNow || (() => performance.now());
+    this.observeWallClock = Boolean(monotonicNow) || Math.abs(now() - Date.now()) < 5000;
+    this.clockObservation = { ...computerClockStatus(now()), monotonicAt: this.monotonicNow() };
+    this._prepareRestart();
     this.setAdapter(adapter);
   }
 
@@ -155,14 +153,18 @@ class Scheduler extends EventEmitter {
     if (this.adapter) {
       this.adapter.off('status', this.statusListener);
       this.adapter.off('receipt', this.receiptListener);
-      this._pauseActive('Integração alterada; retome após conferir a conexão.');
+      this._pauseActive('Integração alterada; retome após conferir a conexão.', { includeRecovery: true });
     }
     this.adapter = adapter;
     this.setAutomationBlocked(this.store.getSetting?.('automationState', {})?.stopped === true);
     this.receipts.clear();
     this.lastSubmissionAt=null;
     this.statusListener = status => {
-      if (status.state !== 'connected') this._pauseActive(`Conexão indisponível: ${status.state}.`);
+      if (status.state !== 'connected') {
+        if (status.manual || status.reasonCode === 'manual') this._pauseActive('WhatsApp desconectado pelo administrador.', { includeRecovery: true });
+        else if (status.state === 'restricted') this._pauseActive('Restrição informada pela integração; confira antes de retomar.', { includeRecovery: true });
+        else this._interruptActive(`Conexão indisponível: ${status.state}.`, 'connection');
+      }
       this.emit('change');
     };
     this.receiptListener = receipt => {
@@ -197,7 +199,7 @@ class Scheduler extends EventEmitter {
     this.timer.unref?.();
   }
 
-  _connected() { return !this.store.persistenceFailed && this.adapter?.status?.state === 'connected'; }
+  _connected() { return !this.store.persistenceFailed && this.adapter?.status?.state === 'connected' && this.adapter.status.ready !== false; }
 
   blockOnPersistenceFailure() { this._failClosed(); }
 
@@ -209,7 +211,7 @@ class Scheduler extends EventEmitter {
     if (this.persistenceFailed) return;
     this.persistenceFailed = true;
     if (!this.store.persistenceFailed) {
-      try { this._pauseActive('Falha de persistência; reinicie e confira o histórico.'); }
+      try { this._pauseActive('Falha de persistência; reinicie e confira o histórico.', { includeRecovery: true }); }
       catch { /* The queue is already blocked even if storage cannot be read. */ }
     }
     this.emit('change', { error: 'Falha de persistência; envios bloqueados até reiniciar o aplicativo.' });
@@ -220,14 +222,142 @@ class Scheduler extends EventEmitter {
     catch (error) { this._failClosed(); throw error; }
   }
 
+  getClockStatus() { return computerClockStatus(this.now()); }
+
+  getCampaignTiming(id) {
+    const c = this.store.getCampaign(id);
+    if (!c) throw new Error('Campanha não encontrada.');
+    return { computerClock: this.getClockStatus(), nextRoundAt: c.nextRunAt ?? null, lastRoundAt: c.lastRoundAt ?? null, lastRoundScheduledAt: c.lastRoundScheduledAt ?? null, state: c.state, recoveryStatus: c.executionRecovery?.status || null, pendingRoundId: c.executionPendingRoundId || null };
+  }
+
+  _authorizedOnIncidentDay(campaign, at) {
+    const authorization = campaign.executionAuthorization;
+    return authorization?.manual === true && (authorization.dateKey === computerDateKey(at) || campaign.lastExecutionDayKey === computerDateKey(at));
+  }
+
+  _recoveryMetadata(campaign, reason, kind) {
+    const at = this.now(), previous = campaign.executionRecovery;
+    const pending = this.store.listJobs({ campaignId: campaign.id, status: 'queued', limit: 1 })[0];
+    return {
+      kind, interruptedAt: previous?.eligible ? previous.interruptedAt : at,
+      authorizedDate: campaign.executionAuthorization?.dateKey || null,
+      incidentDate: previous?.eligible ? previous.incidentDate : computerDateKey(at),
+      timezone: this.getClockStatus().timezone,
+      roundId: campaign.executionPendingRoundId || pending?.roundId || null,
+      eligible: previous?.eligible === true || this._authorizedOnIncidentDay(campaign, at) || kind === 'clock' && campaign.executionAuthorization?.manual === true,
+      configRevision: campaign.configRevision ?? null, policyFingerprint: executionPolicyFingerprint(campaign), reason, status: 'Interrompida por erro — aguardando recuperação da conexão'
+    };
+  }
+
+  _prepareRestart() {
+    // Construction only classifies interrupted work. It never submits it.
+    // Unsubmitted queued items retain their exact frozen round, while a sending
+    // item becomes uncertain and cannot be resent without reliable evidence.
+    const affected = new Set();
+    const write = () => {
+      for (const job of [...this.store.listJobs({ status: 'sending', limit: 1000000 }), ...this.store.listJobs({ status: 'queued', limit: 1000000 })]) {
+        const c = this.store.getCampaign(job.campaignId);
+        const retained = c?.executionAuthorization?.manual === true && (c.state === 'active' || c.state === 'paused' && c.executionRecovery?.eligible === true);
+        if (job.status === 'sending') this._persist('updateJob', job.id, { status: 'uncertain', resultAt: this.now(), errorCode: 'PROCESS_INTERRUPTED', error: 'Aplicativo interrompido durante a submissão; confirme antes de repetir.' });
+        else if (!retained) this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Fila anterior sem autorização de recuperação; confira antes de retomar.' });
+        affected.add(job.campaignId);
+      }
+      for (const c of this.store.listCampaigns()) {
+        if (c.state !== 'active') continue;
+        const recovery = this._recoveryMetadata(c, 'Aplicativo reaberto; aguardando a sessão e o próximo horário programado.', 'restart');
+        this._persist('saveCampaign', { ...c, state: 'paused', nextRunAt: null, pauseReason: recovery.reason, pausedAt: this.now(), executionRecovery: recovery, executionPendingRoundId: recovery.roundId });
+        affected.add(c.id);
+      }
+      for (const id of affected) for (const round of this.store.listRounds(id)) if (!round.finishedAt && round.status === 'running') this._persist('updateRound', round.id, { status: 'interrupted', interruptedAt: this.now(), finishedAt: this.now() });
+    };
+    if (typeof this.store.transaction === 'function') this.store.transaction(write); else write();
+  }
+
+  _interruptActive(reason, kind = 'connection') {
+    if (this.store.persistenceFailed) { this.blockOnPersistenceFailure(); return; }
+    this.currentRound?.controller.abort();
+    for (const c of this.store.listCampaigns()) {
+      if (c.state !== 'active') continue;
+      const recovery = this._recoveryMetadata(c, reason, kind);
+      this._persist('saveCampaign', { ...c, state: 'paused', nextRunAt: null, pauseReason: reason, pausedAt: this.now(), executionRecovery: recovery, executionPendingRoundId: recovery.roundId });
+      if (this.store.addDiagnostic) this._persist('addDiagnostic', { id: randomUUID(), at: this.now(), campaignId: c.id, stage: 'campaign.interrupted', code: 'CAMPAIGN_TECHNICAL_INTERRUPTION', description: reason, action: recovery.eligible ? 'Itens pendentes preservados. A recuperação aguardará o próximo horário da grade.' : 'Sem autorização de início neste dia; a campanha exige retomada manual.', details: { kind, roundId: recovery.roundId, authorizationDate: recovery.authorizedDate } });
+    }
+    this.emit('change');
+  }
+
+  _pendingRound(campaign) {
+    const queued = this.store.listJobs({ campaignId: campaign.id, status: 'queued', limit: 1000000 });
+    if (!queued.length) return null;
+    const id = campaign.executionPendingRoundId || queued[0].roundId;
+    const round = this.store.listRounds(campaign.id).find(r => r.id === id);
+    return round ? { round, jobs: queued.filter(j => j.roundId === id) } : null;
+  }
+
+  async _recoverScheduling({ reason = 'reconnected', kind = 'connection', activeClockIds = [] } = {}) {
+    this.licenseGuard();
+    const result = { recovered: [], skipped: [], at: this.now() };
+    if (this.closed || this.persistenceFailed || this.store.persistenceFailed || this._automationStopped() || !this._connected()) return result;
+    // Settle the old worker first. No new round can race its finally block.
+    await this.waitForIdle();
+    this.licenseGuard();
+    if (this._automationStopped() || !this._connected() || this.closed) return result;
+    for (const c of this.store.listCampaigns()) {
+      const recovery = c.executionRecovery;
+      if (c.state !== 'paused' || !recovery) continue;
+      if (this.store.getSetting?.('reconnect', {})?.autoResume === false && !activeClockIds.includes(c.id)) {
+        result.skipped.push({ campaignId: c.id, reason: 'A retomada automática está desativada nas configurações.' });
+        continue;
+      }
+      const policyChanged = recovery.policyFingerprint ? recovery.policyFingerprint !== executionPolicyFingerprint(c) : recovery.configRevision !== null && recovery.configRevision !== undefined && c.configRevision !== recovery.configRevision;
+      if (!recovery.eligible || c.executionAuthorization?.manual !== true || policyChanged) {
+        result.skipped.push({ campaignId: c.id, reason: 'A campanha não possui autorização preservada para recuperação automática.' });
+        continue;
+      }
+      try { this._validateCampaign(c); }
+      catch (error) { result.skipped.push({ campaignId: c.id, reason: error.message }); continue; }
+      const next = this._nextEligibleAt(c, this.now(), { strictlyFuture: true, includePending: true });
+      if (!Number.isFinite(next)) { result.skipped.push({ campaignId: c.id, reason: 'Não há próximo horário elegível na programação.' }); continue; }
+      const status = 'Conexão recuperada — aguardando próximo horário de rodada';
+      const saved = this._persist('saveCampaign', { ...c, state: 'active', nextRunAt: next, pauseReason: null, pausedAt: null, executionRecovery: { ...recovery, recoveredAt: this.now(), recoveredBy: kind, recoveryReason: reason, status }, scheduleClock: this.getClockStatus() });
+      const pending = this.store.listJobs({ campaignId: c.id, status: 'queued', limit: 1000000 }).length;
+      result.recovered.push({ campaignId: c.id, nextRunAt: saved.nextRunAt, pending, roundId: c.executionPendingRoundId || null, status });
+      this._reconcileRecoveryEvidence(c);
+    }
+    this.emit('change');
+    return result;
+  }
+
+  _reconcileRecoveryEvidence(campaign) {
+    if (typeof this.adapter?.reconcile !== 'function') return;
+    const uncertain = this.store.listJobs({ campaignId: campaign.id, status: 'uncertain', limit: 10 });
+    // Evidence lookup is bounded and detached from scheduling. It never sends.
+    void Promise.allSettled(uncertain.map(job => this.runBoundedAttempt(context => this.adapter.reconcile(job.messageId, context), { timeoutMs: 3000, onLateResult: proof => this._recordProof(job, proof, { reconciled: true }) }).then(proof => this._recordProof(job, proof, { reconciled: true }))));
+  }
+
+  recoverAfterConnection(options = {}) { return this._recoverScheduling({ ...options, kind: 'connection' }); }
+  recoverAfterRestart(options = {}) { return this._recoverScheduling({ ...options, reason: options.reason || 'restarted', kind: 'restart' }); }
+
+  async handleSuspend({ reason = 'Computador suspenso; itens pendentes preservados para o próximo horário.' } = {}) {
+    this._interruptActive(reason, 'suspend');
+    if (this.worker) await this.worker;
+    return { paused: this.store.listCampaigns().filter(c => c.executionRecovery?.kind === 'suspend' && c.state === 'paused').map(c => c.id) };
+  }
+
+  async handleClockChange({ reason = 'Relógio ou fuso do computador alterado; programação recalculada.' } = {}) {
+    const activeClockIds = this.store.listCampaigns().filter(c => c.state === 'active').map(c => c.id);
+    this._interruptActive(reason, 'clock');
+    if (this.worker) await this.worker;
+    this.clockObservation = { ...this.getClockStatus(), monotonicAt: this.monotonicNow() };
+    return this._recoverScheduling({ reason, kind: 'clock', activeClockIds });
+  }
+
   _groupConfig(campaign, groupId) {
     const override = campaign.groupOverrides?.[groupId];
-    const timezone = campaign.schedule?.timezone || (campaign.sourceManaged ? campaign.sourceTimezone || 'America/Sao_Paulo' : null);
-    const schedule = { ...(campaign.schedule || {}), ...(timezone ? { timezone } : {}) };
+    const schedule = localSchedule(campaign.schedule || {});
     if (!override?.enabled) return { intervalMinutes: campaign.intervalMinutes, schedule, items: campaign.items || [] };
     return {
       intervalMinutes: override.intervalMinutes ?? campaign.intervalMinutes,
-      schedule: { ...schedule, ...(override.schedule || {}) },
+      schedule: localSchedule({ ...schedule, ...(override.schedule || {}) }),
       items: Array.isArray(override.items) && override.items.length ? override.items : campaign.items || []
     };
   }
@@ -261,7 +391,7 @@ class Scheduler extends EventEmitter {
     const maxGroups = Number(this.store.getSetting('maxSelectedGroups', 15));
     if (!Array.isArray(campaign.groupIds) || !campaign.groupIds.length || campaign.groupIds.length > maxGroups) throw new Error(`Selecione entre 1 e ${maxGroups} grupos.`);
     if (new Set(campaign.groupIds).size !== campaign.groupIds.length) throw new Error('A seleção contém grupos repetidos.');
-    this._validateSchedule(campaign.schedule);
+    this._validateSchedule(localSchedule(campaign.schedule));
     for (const field of ['dailyRoundLimit', 'dailySendLimit']) {
       if (campaign[field] !== undefined && (!Number.isInteger(campaign[field]) || campaign[field] < 0)) throw new Error('Os limites diários devem ser inteiros iguais ou maiores que zero.');
     }
@@ -298,7 +428,7 @@ class Scheduler extends EventEmitter {
   }
 
   _counts(campaignId, at) {
-    const campaign = this.store.getCampaign(campaignId), timezone = campaign?.schedule?.timezone || (campaign?.sourceManaged ? campaign.sourceTimezone || 'America/Sao_Paulo' : null);
+    const timezone = this.getClockStatus().timezone === 'local' ? null : this.getClockStatus().timezone;
     if (this.store.getCampaignCounts) return this.store.getCampaignCounts(campaignId, at, { timezone });
     const key = dateKey(at, timezone);
     const rounds = this.store.listRounds(campaignId).filter(r => dateKey(r.startedAt, timezone) === key).length;
@@ -325,20 +455,23 @@ class Scheduler extends EventEmitter {
     return byGroup;
   }
 
-  _nextEligibleAt(campaign, at, { afterRound = false } = {}) {
-    if ((campaign.maxRounds && (campaign.roundIndex || 0) >= campaign.maxRounds) || (campaign.endAt && at >= campaign.endAt)) return Infinity;
+  _nextEligibleAt(campaign, at, { afterRound = false, strictlyFuture = false, includePending = false, tickToleranceMs = 0 } = {}) {
+    const pending = includePending ? this._pendingRound(campaign) : null;
+    if ((!pending && campaign.maxRounds && (campaign.roundIndex || 0) >= campaign.maxRounds) || (campaign.endAt && at >= campaign.endAt)) return Infinity;
     const counts = this._counts(campaign.id, at);
-    let lower = at;
-    if ((campaign.dailyRoundLimit && counts.rounds >= campaign.dailyRoundLimit) || (campaign.dailySendLimit && counts.sends >= campaign.dailySendLimit)) lower = nextLocalDay(at, campaign.schedule?.timezone || (campaign.sourceManaged ? campaign.sourceTimezone || 'America/Sao_Paulo' : null));
+    let lower = at - tickToleranceMs;
+    if ((!pending && campaign.dailyRoundLimit && counts.rounds >= campaign.dailyRoundLimit) || (campaign.dailySendLimit && counts.sends >= campaign.dailySendLimit)) lower = nextLocalDay(at);
     const history = this._history(campaign);
     let next = Infinity;
     for (const groupId of campaign.groupIds) {
       if (campaign.destinationHealth?.[groupId]?.suspended || !this._eligibleItems(campaign, groupId).length) continue;
+      if (pending && !pending.jobs.some(j => j.groupId === groupId && this._itemStillConfigured(j))) continue;
       const config = this._groupConfig(campaign, groupId);
-      const last = history.get(groupId)?.lastAt;
+      const last = campaign.groupLastScheduledSlots?.[groupId] ?? history.get(groupId)?.lastAt;
       const interval = config.intervalMinutes * 60000;
-      const due = last === undefined || last === null ? lower : afterRound ? nextRoundSlot(last, at, interval) : last + interval;
-      const scheduled = nextScheduledAt(Math.max(lower, due), config.schedule);
+      const pendingDue = pending ? Math.min(...pending.jobs.filter(j => j.groupId === groupId).map(j => j.nextAttemptAt || lower)) : lower;
+      const due = pending ? Math.max(lower, pendingDue) : last === undefined || last === null ? lower : last + interval;
+      const scheduled = nextComputerRoundSlot(Math.max(lower, due), config.schedule, config.intervalMinutes, { strictlyFuture: strictlyFuture && lower <= at && due <= at });
       if (!campaign.endAt || scheduled < campaign.endAt) next = Math.min(next, scheduled);
     }
     return next;
@@ -354,9 +487,10 @@ class Scheduler extends EventEmitter {
     this._validateCampaign(campaign);
     if (!this._connected()) throw new Error('Conecte o WhatsApp ou o modo simulado antes de ativar.');
     if (campaign.state === 'active') return campaign;
-    const next = this._nextEligibleAt(campaign, this.now());
+    const next = this._nextEligibleAt(campaign, this.now(), { includePending: true });
     if (!Number.isFinite(next)) throw new Error('Não há horário futuro disponível na programação.');
-    this._persist('saveCampaign', { ...campaign, state: 'active', nextRunAt: next, pauseReason: null, pausedAt: null });
+    const at = this.now();
+    this._persist('saveCampaign', { ...campaign, state: 'active', nextRunAt: next, pauseReason: null, pausedAt: null, executionAuthorization: { at, dateKey: computerDateKey(at), timezone: this.getClockStatus().timezone, manual: true }, executionRecovery: null, scheduleClock: this.getClockStatus() });
     this.emit('change');
     return this.store.getCampaign(id);
   }
@@ -371,15 +505,15 @@ class Scheduler extends EventEmitter {
     if (this.currentRound?.campaignId === id) this.currentRound.controller.abort();
     const campaign = this.store.getCampaign(id);
     if (!campaign) throw new Error('Campanha não encontrada.');
-    if (['active', 'paused'].includes(campaign.state)) this._persist('saveCampaign', { ...campaign, state: 'paused', nextRunAt: null, pauseReason: reason, pausedAt: this.now() });
+    if (['active', 'paused'].includes(campaign.state)) this._persist('saveCampaign', { ...campaign, state: 'paused', nextRunAt: null, pauseReason: reason, pausedAt: this.now(), executionRecovery: null, executionPendingRoundId: null });
     this._cancelQueued(id, reason);
     this.emit('change');
   }
 
-  _pauseActive(reason) {
+  _pauseActive(reason, { includeRecovery = false } = {}) {
     if (this.store.persistenceFailed) { this.blockOnPersistenceFailure(); return; }
     for (const campaign of this.store.listCampaigns()) {
-      if (campaign.state === 'active') {
+      if (campaign.state === 'active' || includeRecovery && campaign.state === 'paused' && campaign.executionRecovery) {
         // An event listener must not create an unhandled rejection if the disk
         // is unavailable. _persist already aborts and latches the runtime gate.
         void this.pause(campaign.id, reason).catch(() => {});
@@ -393,7 +527,7 @@ class Scheduler extends EventEmitter {
     this.currentRound?.controller.abort();
     let campaigns = 0, jobs = 0;
     for (const campaign of this.store.listCampaigns()) {
-      if (['active', 'paused'].includes(campaign.state)) { this._persist('saveCampaign', { ...campaign, state: 'stopped', nextRunAt: null }); campaigns++; }
+      if (['active', 'paused'].includes(campaign.state)) { this._persist('saveCampaign', { ...campaign, state: 'stopped', nextRunAt: null, executionRecovery: null, executionPendingRoundId: null }); campaigns++; }
       jobs += this.store.listJobs({ campaignId: campaign.id, status: 'queued', limit: 1000000 }).length;
       this._cancelQueued(campaign.id, 'Todos os envios foram interrompidos.');
     }
@@ -515,10 +649,21 @@ class Scheduler extends EventEmitter {
   tick() {
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
     try{this.licenseGuard();}catch{return Promise.resolve();}
-    if (this.closed || this.persistenceFailed || this.submissionHolds || this._automationStopped()) return Promise.resolve();
+    if (this.closed || this.closing || this.persistenceFailed || this.submissionHolds || this._automationStopped()) return Promise.resolve();
     // Lock before invoking _tick: an adapter may synchronously emit an event
     // that calls tick again, before the worker promise has been assigned.
     if (this.busy) return this.worker || Promise.resolve();
+    if (this.clockRecoveryOperation) return this.clockRecoveryOperation;
+    const clock = { ...this.getClockStatus(), monotonicAt: this.monotonicNow() };
+    const previousClock = this.clockObservation;
+    this.clockObservation = clock;
+    const timezoneChanged = clock.timezone !== previousClock.timezone || clock.timeZoneOffsetMinutes !== previousClock.timeZoneOffsetMinutes;
+    const wallJump = this.observeWallClock && Math.abs((clock.at - previousClock.at) - (clock.monotonicAt - previousClock.monotonicAt)) > 5000;
+    if (timezoneChanged || wallJump) {
+      const operation = this.handleClockChange();
+      this.clockRecoveryOperation = operation.finally(() => { this.clockRecoveryOperation = null; });
+      return this.clockRecoveryOperation;
+    }
     this.busy = true;
     this.worker = this._tick().catch(error => {
       this._failClosed();
@@ -533,7 +678,7 @@ class Scheduler extends EventEmitter {
   }
 
   async _tick() {
-    if (!this._connected()) { this._pauseActive('Conexão indisponível.'); return; }
+    if (!this._connected()) { this._interruptActive('Conexão indisponível.', 'connection'); return; }
     const candidates = this.store.listCampaigns().filter(c => c.state === 'active' && (c.nextRunAt ?? 0) <= this.now()).sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
     for (const snapshot of candidates) {
       if (this.closed || this._automationStopped() || !this._connected()) break;
@@ -541,13 +686,20 @@ class Scheduler extends EventEmitter {
       if (campaign?.state !== 'active') continue;
       try { this._validateCampaign(campaign); }
       catch (error) { await this.pause(campaign.id, error.message); continue; }
-      const due = this._nextEligibleAt(campaign, this.now());
-      if (due > this.now()) {
+      const currentAt = this.now(), slot = campaign.nextRunAt;
+      const tolerance = Math.max(1000, Math.min(10000, Number(this.store.getSetting?.('roundSlotToleranceMilliseconds', 5000)) || 5000));
+      const slotValid = Number.isFinite(slot) && currentAt >= slot && currentAt - slot <= tolerance && campaign.groupIds.some(id => {
+        const config = this._groupConfig(campaign, id);
+        return nextComputerRoundSlot(slot, config.schedule, config.intervalMinutes) === slot && isWithinSchedule(currentAt, config.schedule);
+      });
+      const pending = this._pendingRound(campaign);
+      const due = slotValid ? slot : this._nextEligibleAt(campaign, currentAt, { includePending: Boolean(pending), tickToleranceMs: tolerance });
+      if (due > currentAt || !Number.isFinite(due)) {
         this._persist('saveCampaign', { ...campaign, state: Number.isFinite(due) ? 'active' : 'stopped', nextRunAt: Number.isFinite(due) ? due : null });
         this.emit('change');
         continue;
       }
-      await this._runRound(campaign);
+      await this._runRound(campaign, { scheduledAt: due, pending });
     }
   }
 
@@ -556,7 +708,7 @@ class Scheduler extends EventEmitter {
     if (this.store.persistenceFailed) { this.blockOnPersistenceFailure(); return false; }
     const campaign = this.store.getCampaign(campaignId);
     const group = this.store.getGroup(groupId);
-    return !this.closed && !this.persistenceFailed && !this._automationStopped() && this._connected() && (campaign?.state === 'active' || (manual && campaign?.state === 'paused')) && campaign.groupIds.includes(groupId) && !campaign.destinationHealth?.[groupId]?.suspended && group?.authorized && Boolean(group.simulation) === (this.adapter.status.mode === 'simulated');
+    return !this.closed && !this.persistenceFailed && !this._automationStopped() && this._connected() && (campaign?.state === 'active' || (manual && campaign?.state === 'paused')) && campaign.groupIds.includes(groupId) && !campaign.destinationHealth?.[groupId]?.suspended && group?.authorized && Boolean(group.simulation) === (this.adapter.status.mode === 'simulated') && isWithinSchedule(this.now(), this._groupConfig(campaign, groupId).schedule) && (!campaign.endAt || this.now() < campaign.endAt);
   }
 
   async _wait(ms, signal) {
@@ -580,6 +732,7 @@ class Scheduler extends EventEmitter {
       status, messageId, clientMessageId: live.clientMessageId || job.messageId,
       acceptedAt: live.acceptedAt || proof.acceptedAt || this.now(), resultAt: this.now(),
       proofAccepted: true, reconciled, error: null, errorCode: null,
+      nextAttemptAt: null,
       confirmationScope: proof.confirmationScope || live.confirmationScope || (proof.simulation ? 'simulation-only' : 'integration-accepted')
     };
     if (delivered) patch.deliveredAt = live.deliveredAt || proof.deliveredAt || this.now();
@@ -630,11 +783,21 @@ class Scheduler extends EventEmitter {
     try { assertCampaignSchemaCompatible(campaign, job.itemSnapshot); }
     catch (error) { if (error.code === 'CAMPAIGN_VERSION_REVIEW') return this._cancelVersionReviewJob(job, error); throw error; }
     const maySend = () => this._maySend(job.campaignId, job.groupId, { manual: job.manualResend === true }) && this._itemStillConfigured(job);
-    for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
-      if (signal.aborted || !maySend()) return 'cancelled';
+    const preservePending = () => {
+      const c = this.store.getCampaign(job.campaignId);
+      return !this._automationStopped() && !this.persistenceFailed && c && this._itemStillConfigured(job) && !(c.endAt && this.now() >= c.endAt) && (c.executionRecovery || c.state === 'active' && (!this._connected() || !isWithinSchedule(this.now(), this._groupConfig(c, job.groupId).schedule)));
+    };
+    const attemptsAlreadyUsed = Number(this.store.getJob(job.id)?.attempts) || 0;
+    if (attemptsAlreadyUsed >= policy.maxAttempts) {
+      this._persist('updateJob', job.id, { status: 'failed', resultAt: this.now(), errorCode: 'SEND_RETRY_LIMIT', error: 'Limite persistido de tentativas atingido; nenhum novo envio foi realizado.' });
+      this._diagnostic(job, 'SEND_RETRY_LIMIT', 'As tentativas confirmadas anteriores já consumiram o limite configurado.', attemptsAlreadyUsed, 'Revise a falha; reiniciar ou reconectar não reinicia o limite.');
+      return 'failed';
+    }
+    for (let attempt = attemptsAlreadyUsed + 1; attempt <= policy.maxAttempts; attempt++) {
+      if (signal.aborted || !maySend()) return preservePending() ? 'queued' : 'cancelled';
       const at = this.now();
       const live = this.store.getCampaign(job.campaignId);
-      if (!isWithinSchedule(at, this._groupConfig(live, job.groupId).schedule)) return 'cancelled';
+      if (!isWithinSchedule(at, this._groupConfig(live, job.groupId).schedule)) return preservePending() ? 'queued' : 'cancelled';
       const persisted = this.store.getJob(job.id);
       // Accepted, ambiguous and terminal tasks are never submitted a second time.
       if (persisted && !['queued'].includes(persisted.status)) return persisted.status;
@@ -643,7 +806,11 @@ class Scheduler extends EventEmitter {
       this.lastSubmissionAt = at;
       this.lastSubmissionGroupId = job.groupId;
       this.emit('change');
-      if (signal.aborted || !maySend()) return 'cancelled';
+      if (signal.aborted || !maySend()) {
+        const status = preservePending() ? 'queued' : 'cancelled';
+        this._persist('updateJob', job.id, { status, resultAt: status === 'queued' ? null : this.now(), error: 'Tentativa interrompida antes de submeter a mensagem.' });
+        return status;
+      }
       try {
         this.campaignInFlight++;
         let result;
@@ -690,6 +857,13 @@ class Scheduler extends EventEmitter {
         if (error?.code === 'CAMPAIGN_VERSION_REVIEW' && error.submitted === false) return this._cancelVersionReviewJob(job, error);
         if (['accepted', 'delivered', 'confirmed'].includes(this.store.getJob(job.id)?.status)) return this.store.getJob(job.id).status;
         if (this.store.getJob(job.id)?.status === 'failed') return 'failed';
+        const retainedCampaign = this.store.getCampaign(job.campaignId);
+        const technicalPause = retainedCampaign?.executionRecovery || retainedCampaign?.state === 'active' && (!this._connected() || !isWithinSchedule(this.now(), this._groupConfig(retainedCampaign, job.groupId).schedule));
+        if (error?.submitted === false && technicalPause && this._itemStillConfigured(job) && !this._automationStopped() && !(error.safeToRetry === true && attempt >= policy.maxAttempts)) {
+          const nextAttemptAt = error.safeToRetry === true ? this.now() + Math.max(Math.min(3600000, policy.delaySeconds * 1000 * (policy.backoffFactor ?? 2) ** (attempt - 1)), (this.adapter.minimumSpacingSeconds ?? 3) * 1000) : this.now();
+          this._persist('updateJob', job.id, { status: 'queued', resultAt: null, nextAttemptAt, errorCode: error.code || 'CAMPAIGN_WAITING_NEXT_SLOT', error: 'Submissão não ocorreu; item pendente aguardando conexão e o próximo horário autorizado.' });
+          return 'queued';
+        }
         if (error?.submitted === false && (signal.aborted || !this._itemStillConfigured(job))) {
           this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), errorCode: error.code || 'CAMPAIGN_SUBMISSION_BLOCKED', error: 'Campanha interrompida ou item retirado antes da submissão.' });
           this.emit('change');
@@ -700,9 +874,10 @@ class Scheduler extends EventEmitter {
         const restricted = this.adapter.status.state === 'restricted' || error?.restricted === true;
         const code = /^[A-Z0-9_]{1,80}$/.test(error?.code || '') ? error.code : definitive ? 'SEND_FAILED' : 'SEND_UNCERTAIN';
         if (safeRetry && attempt < policy.maxAttempts && !restricted && !signal.aborted && this._connected()) {
-          this._persist('updateJob', job.id, { status: 'queued', error: 'Falha confirmada anterior à submissão; tentativa limitada pendente.' });
+          const retryDelayMs = Math.max(Math.min(3600000, policy.delaySeconds * 1000 * (policy.backoffFactor ?? 2) ** (attempt - 1)), (this.adapter.minimumSpacingSeconds ?? 3) * 1000);
+          this._persist('updateJob', job.id, { status: 'queued', nextAttemptAt: this.now() + retryDelayMs, error: 'Falha confirmada anterior à submissão; tentativa limitada pendente.' });
           this._diagnostic(job, code, 'Falha temporária anterior à submissão.', attempt, 'Nova tentativa limitada, com intervalo progressivo.');
-          await this._wait(Math.max(Math.min(3600000, policy.delaySeconds * 1000 * (policy.backoffFactor ?? 2) ** (attempt - 1)), (this.adapter.minimumSpacingSeconds ?? 3) * 1000), signal);
+          await this._wait(retryDelayMs, signal);
           continue;
         }
         const status = definitive ? 'failed' : 'uncertain';
@@ -715,7 +890,7 @@ class Scheduler extends EventEmitter {
           if (this.store.getCampaign(job.campaignId)?.destinationHealth?.[job.groupId]?.lastJobId !== job.id) this._destinationFailure(job, { ...error, code });
         }
         if (restricted) this._pauseActive('Restrição informada pela integração.');
-        if (!this._connected()) this._pauseActive('Conexão indisponível; a fila permanece pausada até revisão e reconexão.');
+        if (!this._connected()) this._interruptActive('Conexão indisponível; itens pendentes preservados até o próximo horário após recuperar.', 'connection');
         this.emit('change');
         return status;
       }
@@ -831,22 +1006,23 @@ class Scheduler extends EventEmitter {
     this.emit('change');
   }
 
-  async _runRound(campaign) {
+  async _runRound(campaign, { scheduledAt = campaign.nextRunAt, pending = null } = {}) {
     const at = this.now();
     const history = this._history(campaign);
     const groups = campaign.groupIds.filter(groupId => {
       if (campaign.destinationHealth?.[groupId]?.suspended || !this._eligibleItems(campaign, groupId).length) return false;
       const config = this._groupConfig(campaign, groupId);
-      const last = history.get(groupId)?.lastAt;
-      return (last === undefined || last === null || last + config.intervalMinutes * 60000 <= at) && isWithinSchedule(at, config.schedule);
+      const last = campaign.groupLastScheduledSlots?.[groupId] ?? history.get(groupId)?.lastAt;
+      const onGrid = nextComputerRoundSlot(scheduledAt, config.schedule, config.intervalMinutes) === scheduledAt;
+      return onGrid && (pending ? pending.jobs.some(j => j.groupId === groupId && (!j.nextAttemptAt || j.nextAttemptAt <= at)) : last === undefined || last === null || last + config.intervalMinutes * 60000 <= scheduledAt) && isWithinSchedule(at, config.schedule);
     });
     if (!groups.length) return;
-    const round = { id: randomUUID(), campaignId: campaign.id, startedAt: at, finishedAt: null, status: 'running', sequence: campaign.roundIndex || 0 };
+    const round = pending ? { ...pending.round, status: 'running', finishedAt: null, resumedAt: at, resumeSlotAt: scheduledAt, resumeCount: (pending.round.resumeCount || 0) + 1 } : { id: randomUUID(), campaignId: campaign.id, startedAt: at, scheduledAt, computerTimezone: this.getClockStatus().timezone, finishedAt: null, status: 'running', sequence: campaign.roundIndex || 0 };
     const controller = new AbortController();
     this.currentRound = { ...round, controller };
-    this._persist('insertRound', round);
-    const jobs = [];
-    for (const groupId of groups) {
+    if (pending) this._persist('updateRound', round.id, round); else this._persist('insertRound', round);
+    const jobs = pending ? pending.jobs.filter(j => groups.includes(j.groupId) && (!j.nextAttemptAt || j.nextAttemptAt <= at)) : [];
+    for (const groupId of pending ? [] : groups) {
       const config = this._groupConfig(campaign, groupId);
       const past = history.get(groupId);
       const index = past?.roundCount ?? past?.rounds?.size ?? 0;
@@ -859,29 +1035,32 @@ class Scheduler extends EventEmitter {
         jobs.push(saved || job);
       }
     }
-    this._persist('saveCampaign', { ...campaign, roundIndex: (campaign.roundIndex || 0) + 1, nextRunAt: null });
+    this._persist('saveCampaign', { ...campaign, roundIndex: (campaign.roundIndex || 0) + (pending ? 0 : 1), nextRunAt: null, lastRoundAt: at, lastRoundScheduledAt: scheduledAt, lastExecutionDayKey: computerDateKey(at), executionPendingRoundId: round.id, executionRecovery: null, scheduleClock: this.getClockStatus(), groupLastScheduledSlots: { ...(campaign.groupLastScheduledSlots || {}), ...Object.fromEntries(groups.map(id => [id, scheduledAt])) } });
     this.emit('change');
     let roundStatus = 'completed';
     try {
       for (const job of jobs) {
         const current = this.store.getCampaign(campaign.id);
-        if (controller.signal.aborted || current?.state !== 'active' || !this._connected() || this._automationStopped()) { roundStatus = 'cancelled'; break; }
+        if (controller.signal.aborted || current?.state !== 'active' || !this._connected() || this._automationStopped()) { roundStatus = current?.executionRecovery || !this._connected() ? 'interrupted' : 'cancelled'; break; }
         const currentItems = this._groupConfig(current, job.groupId).items;
+        let config = this._groupConfig(current, job.groupId);
+        if (!isWithinSchedule(this.now(), config.schedule)) { roundStatus = 'interrupted'; break; }
         if (!this._maySend(campaign.id, job.groupId) || !currentItems.some(item => item.id === job.itemId && !item.captureDeleted && item.ready !== false)) {
           this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Destino suspenso, removido ou item retirado antes do envio.' });
           continue;
         }
-        let config = this._groupConfig(this.store.getCampaign(campaign.id), job.groupId);
-        if (!isWithinSchedule(this.now(), config.schedule)) { this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Fora do horário autorizado.' }); continue; }
+        config = this._groupConfig(this.store.getCampaign(campaign.id), job.groupId);
         const spacing = this.lastSubmissionGroupId === job.groupId ? campaign.messageSpacingSeconds ?? campaign.spacingSeconds : campaign.groupSpacingSeconds ?? campaign.spacingSeconds;
         if (this.lastSubmissionAt !== null) await this._wait(Math.max(0, spacing * 1000 - (this.now() - this.lastSubmissionAt)), controller.signal);
-        if (controller.signal.aborted || !this._connected() || this.store.getCampaign(campaign.id)?.state !== 'active') { roundStatus = 'cancelled'; break; }
+        if (controller.signal.aborted || !this._connected() || this.store.getCampaign(campaign.id)?.state !== 'active') { roundStatus = this.store.getCampaign(campaign.id)?.executionRecovery || !this._connected() ? 'interrupted' : 'cancelled'; break; }
+        config = this._groupConfig(this.store.getCampaign(campaign.id), job.groupId);
+        if (!isWithinSchedule(this.now(), config.schedule)) { roundStatus = 'interrupted'; break; }
         if (!this._maySend(campaign.id, job.groupId)) { this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Destino suspenso ou removido durante o intervalo.' }); continue; }
         config = this._groupConfig(this.store.getCampaign(campaign.id), job.groupId);
-        if (!isWithinSchedule(this.now(), config.schedule)) { this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Janela de horário encerrada.' }); continue; }
+        if (!isWithinSchedule(this.now(), config.schedule)) { roundStatus = 'interrupted'; break; }
         const live = this.store.getCampaign(campaign.id);
         if (live.endAt && this.now() >= live.endAt) { roundStatus = 'limited'; break; }
-        if (live.dailySendLimit && this._counts(campaign.id, this.now()).sends >= live.dailySendLimit) { roundStatus = 'limited'; break; }
+        if (live.dailySendLimit && this._counts(campaign.id, this.now()).sends >= live.dailySendLimit) { roundStatus = 'interrupted'; break; }
         const result = await this._sendJob(job, controller.signal);
         if (result === 'cancelled') this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Envio cancelado antes da submissão.' });
       }
@@ -891,14 +1070,30 @@ class Scheduler extends EventEmitter {
       for (const job of this.store.listJobs({ roundId: round.id, status: 'sending', limit: 1000000 })) this._persist('updateJob', job.id, { status: 'uncertain', resultAt: this.now(), error: 'Execução interrompida; revisão manual obrigatória.' });
       await this.pause(campaign.id, 'A rodada foi interrompida.');
     } finally {
-      for (const job of this.store.listJobs({ roundId: round.id, status: 'queued', limit: 1000000 })) this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Rodada encerrada; fila não será repetida.' });
-      this._persist('updateRound', round.id, { status: roundStatus, finishedAt: this.now() });
+      const liveBeforeFinish = this.store.getCampaign(campaign.id);
+      const remaining = this.store.listJobs({ roundId: round.id, status: 'queued', limit: 1000000 }).filter(job => {
+        if (!liveBeforeFinish) return true;
+        const config = this._groupConfig(liveBeforeFinish, job.groupId);
+        const nextSlot = nextComputerRoundSlot(this.now(), config.schedule, config.intervalMinutes, { strictlyFuture: true });
+        if (Number.isFinite(nextSlot) && (!liveBeforeFinish.endAt || nextSlot < liveBeforeFinish.endAt)) return true;
+        // Preserve technical interruptions only when this destination can
+        // actually run again. A definitive end date must not leave dangling
+        // queued work or hold eligible destinations in an interrupted round.
+        this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), errorCode: 'CAMPAIGN_SCHEDULE_ENDED', error: 'Programação encerrada para este destino; não há próximo horário autorizado.' });
+        return false;
+      });
+      const preserve = remaining.length > 0 && !this.closed && !this._automationStopped() && liveBeforeFinish && (liveBeforeFinish.executionRecovery || liveBeforeFinish.state === 'active') && !(liveBeforeFinish.endAt && this.now() >= liveBeforeFinish.endAt);
+      if (!preserve) for (const job of remaining) this._persist('updateJob', job.id, { status: 'cancelled', resultAt: this.now(), error: 'Rodada encerrada por ação manual ou término definitivo; nenhum reenvio.' });
+      if (preserve) roundStatus = 'interrupted';
+      this._persist('updateRound', round.id, { status: roundStatus, finishedAt: this.now(), ...(preserve ? { interruptedAt: this.now() } : {}) });
       this.currentRound = null;
       const live = this.store.getCampaign(campaign.id);
       if (live?.state === 'active') {
-        const next = this._nextEligibleAt(live, this.now(), { afterRound: true });
+        const next = this._nextEligibleAt(live, this.now(), { afterRound: true, includePending: preserve });
         const finished = (live.maxRounds && (live.roundIndex || 0) >= live.maxRounds) || (live.endAt && this.now() >= live.endAt) || !live.groupIds.some(id => Number.isFinite(nextScheduledAt(this.now(), this._groupConfig(live, id).schedule)));
-        this._persist('saveCampaign', { ...live, state: Number.isFinite(next) ? 'active' : finished ? 'stopped' : 'paused', nextRunAt: Number.isFinite(next) ? next : null, ...(Number.isFinite(next) || finished ? {} : { pauseReason: 'Nenhum item ou destino está elegível. Revise os envios incertos e os grupos suspensos.', pausedAt: this.now() }) });
+        this._persist('saveCampaign', { ...live, state: Number.isFinite(next) ? 'active' : finished ? 'stopped' : 'paused', nextRunAt: Number.isFinite(next) ? next : null, executionPendingRoundId: preserve ? round.id : null, ...(Number.isFinite(next) || finished ? {} : { pauseReason: 'Nenhum item ou destino está elegível. Revise os envios incertos e os grupos suspensos.', pausedAt: this.now() }) });
+      } else if (live && !preserve && live.executionPendingRoundId === round.id) {
+        this._persist('saveCampaign', { ...live, executionPendingRoundId: null });
       }
       this.emit('change');
     }
@@ -935,6 +1130,7 @@ class Scheduler extends EventEmitter {
       `Intervalo entre inícios: ${c.intervalMinutes} min. Espaçamento entre envios: ${c.spacingSeconds} s. Entre mensagens no mesmo grupo: ${c.messageSpacingSeconds ?? c.spacingSeconds} s; entre grupos: ${c.groupSpacingSeconds ?? c.spacingSeconds} s.`,
       `Tempo limite por tentativa: ${this._timeoutMs(c) / 1000} s. Limite total: ${c.maxRounds || 'sem limite'} rodada(s)${c.endAt ? `; encerramento: ${new Date(c.endAt).toLocaleString('pt-BR')}` : ''}.`,
       `Dias: ${p.days.map(d => days[d]).join(', ')}. Horário: ${c.schedule?.startTime || '00:00'}–${c.schedule?.endTime || '00:00'} (${duration / 60} h).`,
+      `Referência de execução: relógio e fuso do computador (${this.getClockStatus().timezone}). As rodadas seguem a grade a partir da abertura da janela, sem deslocar os horários por atrasos.`,
       `Datas: ${p.startDate || 'sem início fixo'} a ${p.endDate || 'sem encerramento fixo'}.`,
       `Limites diários: ${c.dailyRoundLimit || 'sem limite'} rodada(s); ${c.dailySendLimit || 'sem limite'} envio(s).`,
       ...(overrides.length ? ['Configuração individual:', ...overrides] : []),
@@ -944,17 +1140,19 @@ class Scheduler extends EventEmitter {
     ].join('\n');
   }
 
-  async shutdown() {
-    this.closed = true;
+  async shutdown({ preserveRecovery = true } = {}) {
+    this.closing = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    this._pauseActive('Aplicativo encerrado.');
+    if (preserveRecovery) this._interruptActive('Aplicativo encerrado; a recuperação aguardará a conexão e o próximo horário programado.', 'restart');
+    else this._pauseActive('Aplicativo encerrado pelo administrador.', { includeRecovery: true });
     this.currentRound?.controller.abort();
     if (this.worker) await this.worker;
+    this.closed = true;
     await this.externalSubmissions;
     this.adapter.off('status', this.statusListener);
     this.adapter.off('receipt', this.receiptListener);
   }
 }
 
-module.exports = { Scheduler, isWithinSchedule, nextScheduledAt, nextRoundSlot, dateKey };
+module.exports = { Scheduler, isWithinSchedule, nextScheduledAt, nextRoundSlot, dateKey, nextComputerRoundSlot, computerClockStatus };

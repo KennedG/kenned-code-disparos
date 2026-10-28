@@ -248,5 +248,5 @@ test('private resume allows the eligible destination without requeueing a differ
  await controller.handle(f.adapter.injectIncoming({senderNumber:f.owner.phone,timestamp:f.clock.now,text:`!mega retomar ${f.campaign.id}`}));
  const token=f.adapter.sent.at(-1).text.match(/!mega confirmar ([a-f0-9]{8})/);assert(token,'a retomada continua exigindo a confirmação do resumo');
  await controller.handle(f.adapter.injectIncoming({senderNumber:f.owner.phone,timestamp:f.clock.now,text:`!mega confirmar ${token[1]}`}));
- assert.equal(f.store.getCampaign(f.campaign.id).state,'active');await f.scheduler.tick();assert.equal(f.store.listJobs({status:'accepted'}).length,2);assert.equal(f.store.getJob(uncertain.id).status,'uncertain');assert.equal(f.store.getJob(uncertain.id).attempts,1);
+ const resumed=f.store.getCampaign(f.campaign.id);assert.equal(resumed.state,'active');assert(resumed.nextRunAt>f.clock.now,'confirmed manual resume waits for the next aligned round');await f.scheduler.tick();assert.equal(f.store.listJobs({status:'accepted'}).length,1,'the private confirmation does not start an immediate off-grid round');f.clock.now=resumed.nextRunAt;await f.scheduler.tick();assert.equal(f.store.listJobs({status:'accepted'}).length,2);assert.equal(f.store.getJob(uncertain.id).status,'uncertain');assert.equal(f.store.getJob(uncertain.id).attempts,1);
 });

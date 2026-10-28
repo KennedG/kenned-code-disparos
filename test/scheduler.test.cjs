@@ -145,7 +145,7 @@ test('a durable queue write failure blocks submissions and further activation', 
   await f.scheduler.tick(); assert.equal(f.calls.length, 0);
 });
 
-test('pause cancels pending destinations, allows the in-flight result to settle, and resume avoids recent duplicates', async () => {
+test('manual pause cancels pending destinations; resume waits for the next aligned round without replaying its old accepted task', async () => {
   let release;
   const f = fixture({ sender: async ({ item }) => {
     await new Promise(resolve => { release = resolve; });
@@ -159,7 +159,11 @@ test('pause cancels pending destinations, allows the in-flight result to settle,
   assert.equal(f.calls.length, 1); assert.equal(f.store.listJobs({ status: 'accepted' }).length, 1);
   f.adapter.send = async (groupId, item) => { f.calls.push({ groupId, item }); return { status: 'confirmed', messageId: item.clientMessageId }; };
   await f.scheduler.resume('c1'); await f.scheduler.tick();
-  assert.deepEqual(f.calls.map(c => c.groupId), ['g1', 'g2']);
+  assert.deepEqual(f.calls.map(c => c.groupId), ['g1']);
+  assert.equal(f.store.getCampaign('c1').nextRunAt, at(5, 9, 10));
+  f.clock.value = at(5, 9, 10); await f.scheduler.tick();
+  assert.deepEqual(f.calls.map(c => c.groupId), ['g1', 'g1', 'g2']);
+  assert.equal(f.store.listRounds('c1').length, 2, 'This is the next authorised repeat round, not a replay of the old cancelled queue');
 });
 
 test('stop all interrupts a wait immediately and does not leave active campaigns', async () => {
@@ -344,8 +348,8 @@ test('only definitive pre-submission failures get bounded retries using the same
 test('a retry never submits after the group operating window has closed', async () => {
   const f = fixture({ count: 1, changes: {
     schedule: { days: [1], startTime: '09:00', endTime: '10:00', endDate: '2026-01-05' }
-  }, sender: () => { throw Object.assign(new Error('before submission'), { safeToRetry: true }); } });
-  f.clock.value = at(5, 9, 59) + 59000;
+  }, sender: ({ clock }) => { clock.value = at(5, 9, 59) + 59000; throw Object.assign(new Error('before submission'), { safeToRetry: true }); } });
+  f.clock.value = at(5, 9, 50);
   await f.scheduler.activate('c1'); await f.scheduler.tick();
   assert.equal(f.calls.length, 1);
   assert.equal(f.store.listJobs()[0].attempts, 1);
@@ -356,8 +360,8 @@ test('a retry never submits after the group operating window has closed', async 
 test('a retry rechecks the individual group end date before another network request', async () => {
   const f = fixture({ count: 1, changes: {
     groupOverrides: { g1: { enabled: true, schedule: { endDate: '2026-01-05' } } }
-  }, sender: () => { throw Object.assign(new Error('before submission'), { safeToRetry: true }); } });
-  f.clock.value = at(5, 23, 59) + 59000;
+  }, sender: ({ clock }) => { clock.value = at(5, 23, 59) + 59000; throw Object.assign(new Error('before submission'), { safeToRetry: true }); } });
+  f.clock.value = at(5, 23, 50);
   await f.scheduler.activate('c1'); await f.scheduler.tick();
   assert.equal(f.calls.length, 1);
   assert.equal(f.store.listJobs()[0].attempts, 1);

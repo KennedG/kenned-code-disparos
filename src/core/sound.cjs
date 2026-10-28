@@ -3,7 +3,7 @@
 function soundPreferences(value={}){
   const volume=Number(value.volume??60),interval=Number(value.intervalSeconds??30),count=Number(value.maxRepeats??3);
   const duration=Number(value.durationSeconds);
-  return {enabled:value.enabled!==false,volume:Number.isFinite(volume)?Math.max(0,Math.min(100,volume)):60,sound:['soft','urgent','custom'].includes(value.sound)?value.sound:'soft',customAudioId:value.customAudioId||null,events:Array.isArray(value.events)?value.events.filter(v=>['disconnect','critical','opportunity'].includes(v)):['disconnect','critical'],repeat:!!value.repeat,intervalSeconds:Number.isFinite(interval)?Math.max(3,Math.min(3600,interval)):30,maxRepeats:Number.isFinite(count)?Math.max(1,Math.min(20,Math.floor(count))):3,...(Number.isFinite(duration)&&duration>=0.2&&duration<=30?{durationSeconds:duration}:{}),quiet:{enabled:!!value.quiet?.enabled,start:value.quiet?.start||'22:00',end:value.quiet?.end||'07:00',...(typeof value.quiet?.timezone==='string'?{timezone:value.quiet.timezone}:{})}};
+  return {enabled:value.enabled!==false,volume:Number.isFinite(volume)?Math.max(0,Math.min(100,volume)):60,sound:['soft','urgent','custom'].includes(value.sound)?value.sound:'soft',customAudioId:value.customAudioId||null,events:Array.isArray(value.events)?value.events.filter(v=>['disconnect','critical','opportunity'].includes(v)):['disconnect','critical'],repeat:!!value.repeat,persistentAlarm:value.persistentAlarm!==false,intervalSeconds:Number.isFinite(interval)?Math.max(3,Math.min(3600,interval)):30,maxRepeats:Number.isFinite(count)?Math.max(1,Math.min(20,Math.floor(count))):3,...(Number.isFinite(duration)&&duration>=0.2&&duration<=30?{durationSeconds:duration}:{}),quiet:{enabled:!!value.quiet?.enabled,start:value.quiet?.start||'22:00',end:value.quiet?.end||'07:00',...(typeof value.quiet?.timezone==='string'?{timezone:value.quiet.timezone}:{})}};
 }
 function isQuiet(at,quiet){
   if(!quiet?.enabled)return false;
@@ -23,12 +23,13 @@ const prefs=soundPreferences(value),id=String(event.id||'');
     if(this.closed||!id)return {soundStatus:'disabled'};
     if(this.occurrences.has(id))return {soundStatus:'suppressed'};
     if(!options.force&&(!prefs.enabled||!prefs.events.includes(event.event)))return {soundStatus:'disabled'};
-    if(!options.force&&isQuiet(this.now(),prefs.quiet))return {soundStatus:'quiet'};
+    if(!options.force&&isQuiet(this.now(),prefs.quiet)&&!(prefs.persistentAlarm&&(options.persistent===true||event.persistentAlarm===true)))return {soundStatus:'quiet'};
     if(prefs.volume===0)return {soundStatus:'silent',volume:0};
-    const entry={id,event:event.event,prefs,audioUrl:options.audioUrl,played:0,muted:false,timer:null,force:!!options.force};
+    const entry={id,event:event.event,prefs,audioUrl:options.audioUrl,played:0,muted:false,timer:null,force:!!options.force,persistent:!options.force&&prefs.persistentAlarm&&(options.persistent===true||event.persistentAlarm===true)};
     this.occurrences.set(id,entry);
-    if(this.occurrences.size>512){for(const [key,old]of this.occurrences){if(old!==this.current&&!old.timer&&!this.queue.includes(old)){this.occurrences.delete(key);break;}}}
-    this._enqueue(entry);return {soundStatus:'scheduled',volume:prefs.volume};
+    if(this.occurrences.size>512){for(const [key,old]of this.occurrences){if(!old.persistent&&old!==this.current&&!old.timer&&!this.queue.includes(old)){this.occurrences.delete(key);break;}}}
+    if(!entry.force&&isQuiet(this.now(),prefs.quiet)){this._repeat(entry);return {soundStatus:'quiet',volume:prefs.volume,persistent:entry.persistent};}
+    this._enqueue(entry);return {soundStatus:'scheduled',volume:prefs.volume,...(entry.persistent?{persistent:true}:{})};
   }
   test(value,options={}){
     const prefs=soundPreferences(value);
@@ -40,20 +41,25 @@ const prefs=soundPreferences(value),id=String(event.id||'');
       this.occurrences.set(id,entry);this._enqueue(entry);
     });
   }
+  _repeat(entry){
+    if(this.closed||entry.muted||entry.force||(!entry.persistent&&(!entry.prefs.repeat||entry.played>=entry.prefs.maxRepeats)))return;
+    entry.timer=this.setTimer(()=>{entry.timer=null;this._enqueue(entry);},entry.prefs.intervalSeconds*1000);entry.timer?.unref?.();
+  }
   _enqueue(entry){if(this.closed||entry.muted||this.queue.includes(entry)||this.current===entry)return;if(this.queue.length>=50){const dropped=this.queue.shift();dropped.muted=true;dropped.onDone?.(false);this.occurrences.delete(dropped.id);}this.queue.push(entry);void this._pump();}
   async _pump(){
     if(this.current||this.closed)return;const entry=this.queue.shift();if(!entry)return;
-    if(entry.muted||(!entry.force&&isQuiet(this.now(),entry.prefs.quiet))){void this._pump();return;}
+    if(entry.muted||(!entry.force&&isQuiet(this.now(),entry.prefs.quiet))){if(!entry.muted)this._repeat(entry);void this._pump();return;}
     this.current=entry;
-    try{await this.play({id:entry.id,sound:entry.prefs.sound,volume:entry.prefs.volume/100,audioUrl:entry.audioUrl,...(entry.prefs.durationSeconds?{durationSeconds:entry.prefs.durationSeconds}:{})});entry.played++;entry.onDone?.(true);}
-    catch{entry.muted=true;entry.onDone?.(false);}
+    try{await this.play({id:entry.id,sound:entry.prefs.sound,volume:entry.prefs.volume/100,audioUrl:entry.audioUrl,isCancelled:()=>entry.muted||this.closed,...(entry.prefs.durationSeconds?{durationSeconds:entry.prefs.durationSeconds}:{})});entry.played++;entry.onDone?.(true);}
+    catch{if(!entry.persistent)entry.muted=true;entry.onDone?.(false);}
     finally{
       this.current=null;
-      if(!entry.muted&&!this.closed&&entry.prefs.repeat&&!entry.force&&entry.played<entry.prefs.maxRepeats){entry.timer=this.setTimer(()=>{entry.timer=null;this._enqueue(entry);},entry.prefs.intervalSeconds*1000);entry.timer.unref?.();}
+      this._repeat(entry);
       void this._pump();
     }
   }
   mute(id){const entry=this.occurrences.get(id);if(!entry)return false;entry.muted=true;entry.onDone?.(false);if(entry.timer)this.clearTimer(entry.timer);entry.timer=null;this.queue=this.queue.filter(v=>v!==entry);if(this.current===entry)this.stop(id);return true;}
+  resolve(id){return this.mute(id);}
   muteAll(){for(const id of this.occurrences.keys())this.mute(id);this.queue=[];}
   shutdown(){this.closed=true;for(const entry of this.occurrences.values()){entry.muted=true;entry.onDone?.(false);if(entry.timer)this.clearTimer(entry.timer);}this.queue=[];if(this.current)this.stop(this.current.id);this.occurrences.clear();}
 }

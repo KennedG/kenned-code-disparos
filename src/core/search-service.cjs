@@ -118,6 +118,7 @@ class SearchService extends EventEmitter {
       offerMessageUpdate: ctx => { this._enqueue(ctx, 'update'); },
       offerMessageDelete: ctx => { this._enqueue(ctx, 'delete'); },
       offerHistory: batch => { this._captureHistory(batch); },
+      captureError: error => { this._captureFailure(error); },
       status: status => { this._onStatus(status); },
       receipt: receipt => { this._receipt(receipt); }
     };
@@ -147,6 +148,11 @@ class SearchService extends EventEmitter {
     return messages[error?.code] || 'Não foi possível concluir a busca ou confirmar sua entrega';
   }
   _persistMonitor() { this.store.setSetting('buscasMonitor', this.monitor); }
+  _captureFailure(error = {}) {
+    this.monitor.lastError = { at: error.at || this.now(), code: String(error.code || 'SEARCH_CAPTURE_ERROR').slice(0, 80),
+      message: typeof error.detail === 'string' ? error.detail.slice(0, 512) : 'Falha na captura. Verifique a conexão, os grupos e os registros.' };
+    this._persistMonitor(); this._diagnostic(this.monitor.lastError.code, this.monitor.lastError.message); this.emit('change');
+  }
   _openGap(reason, at = this.now()) { if (!this.monitor.openGap) this.monitor.openGap = { id: randomUUID(), startedAt: at, reason }; this._persistMonitor(); }
   _closeGap(at = this.now()) { if (!this.monitor.openGap) return; this.store.recordSearchGap?.({ ...this.monitor.openGap, endedAt: at, complete: false }); this.monitor.openGap = null; this._persistMonitor(); }
   _attach(adapter) { for (const [name, listener] of Object.entries(this.listeners)) adapter?.on(name, listener); }
@@ -168,7 +174,7 @@ class SearchService extends EventEmitter {
   resumeCapture() { this.paused = false; this._configure(); this._onStatus(this.adapter?.status || { state: 'disconnected' }); this._drain(); }
   async _waitCaptureIdle() { while (!this.closed && !this.paused) { const running = this._drain(); if (running) await running; if (!page(this.store.listSearchInbox({ status: 'queued', limit: 1 })).length) break; } }
   async waitForIdle() { await this._waitCaptureIdle(); await this.commandTail; await this._waitCaptureIdle(); do { await this.deliveryPump; if (this.closed || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected' || !page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length) break; await this.flushDeliveries(); } while (!this.closed); }
-  _onStatus(status) { if (this.closed || !this._settings().enabled) return; if (status?.state === 'connected' && !this.paused) { this._closeGap(); this._flushInBackground(); } else this._openGap(status?.reasonCode || 'disconnected'); this.emit('change'); }
+  _onStatus(status) { if (this.closed || !this._settings().enabled) return; if (status?.state === 'connected' && status.ready !== false && !this.paused) { this._configure(); this._closeGap(); this._drain(); this._flushInBackground(); } else this._openGap(status?.reasonCode || 'disconnected'); this.emit('change'); }
   getState(actorId) {
     this.groups = new Map(this.store.listGroups().map(group => [group.id, group]));
     const permissions = Object.fromEntries(Object.keys(PERMISSIONS).map(p => [p, this._can(actorId, p)]));
@@ -176,7 +182,8 @@ class SearchService extends EventEmitter {
     if (!Object.values(permissions).some(Boolean)) return { authorized: false, permissions, enabled: false };
     const settings = this._settings(), stats = this.store.getSearchMonitorStats?.() || {};
     const publicSettings = permissions.manage ? settings : { ...settings, commandPrivateNumbers: [], ownerRecipientUserId: null, responsibleRecipientIds: [], blockedSupplierIds: [] };
-    return { authorized: true, permissions, settings: publicSettings, enabled: settings.enabled, monitor: { ...this.monitor, status: !settings.enabled ? 'disabled' : this.paused ? 'paused' : this.adapter?.status?.state === 'connected' ? 'monitoring' : 'disconnected', connection: this.adapter?.status?.state || 'disconnected', complete: false, gaps: page(this.store.listSearchGaps?.({ limit: 20 })), queueSize: stats.inbox || stats.queued || 0 }, stats,
+    const health = this.adapter?.getCaptureHealth?.(), ready = this.adapter?.status?.state === 'connected' && this.adapter?.status?.ready !== false && health?.readiness?.ready !== false;
+    return { authorized: true, permissions, settings: publicSettings, enabled: settings.enabled, monitor: { ...this.monitor, status: !settings.enabled ? 'disabled' : this.paused ? 'paused' : ready ? 'monitoring' : 'disconnected', connection: this.adapter?.status?.state || 'disconnected', ready, complete: false, monitoredGroups: settings.monitoredGroupIds.length, adapterHealth: health?.searches || null, gaps: page(this.store.listSearchGaps?.({ limit: 20 })), queueSize: stats.queued ?? stats.inbox ?? 0, failedCaptures: stats.failedInbox || 0 }, stats,
       history: permissions.history ? this._historyPage({ limit: 20 }) : { items: [], total: 0 },
       offers: permissions.view ? this.store.querySearchOffers({ limit: 20, includeReview: true, includeUnavailable: true }) : { items: [], total: 0 },
       authorizations: permissions.manage ? this.listAuthorizations(actorId) : { items: [], total: 0 },
@@ -236,7 +243,7 @@ class SearchService extends EventEmitter {
         if (this.closed || this.paused) break;
         const ctx = entry.context || entry.payload || entry.message;
         try { this._capture(ctx, entry.kind || 'message'); this.store.deleteSearchInbox(entry.id); }
-        catch (e) { if (this.store.persistenceFailed) throw e; this.store.updateSearchInbox(entry.id, { status: 'failed', code: e.code || 'SEARCH_PARSE_ERROR' }); this._diagnostic('SEARCH_PARSE_ERROR', 'Uma mensagem não pôde ser interpretada. O anúncio não entrou no ranking.', e); }
+        catch (e) { if (this.store.persistenceFailed) throw e; this.store.updateSearchInbox(entry.id, { status: 'failed', code: e.code || 'SEARCH_PARSE_ERROR' }); this._captureFailure({ code: e.code || 'SEARCH_PARSE_ERROR', detail: 'Uma mensagem não pôde ser interpretada. O anúncio não entrou no ranking; outras mensagens continuam sendo processadas.' }); }
       }
       await new Promise(resolve => setImmediate(resolve));
     }
@@ -261,8 +268,13 @@ class SearchService extends EventEmitter {
     const { parseOffers } = require('./search-parser.cjs');
     const parsed = parseOffers(message.text, { aliases: this._settings().aliases });
     const offers = (Array.isArray(parsed) ? parsed : parsed.offers || []).map((offer, index) => ({ ...offer, ...offerContact(offer.originalExcerpt || message.text), id: `${hash(`${message.chatId}:${message.messageId}`)}:${index}`, messageKey: message.id, chatId: message.chatId, messageId: message.messageId, groupId: message.groupId, groupName: message.groupName, supplierKey, senderId, supplierPhone: message.senderNumber, savedName: message.savedName, supplierName: message.displayName || message.savedName || 'Fornecedor sem nome disponível', displayName: message.displayName, forwarded: message.forwarded, originalSupplierKnown: !message.forwarded, messageAt: originalAt, originalAt, revisionAt: message.revisionAt, capturedAt: message.capturedAt, originalText: message.text, snippet: offer.originalExcerpt || offer.snippet || offer.originalText || message.text, fingerprint: offer.fingerprint || hash(`${offer.productKey}|${offer.priceCents}|${offer.originalExcerpt || message.text}`) }));
-    this.store.upsertSearchMessage(message, offers);
-    this.monitor.lastCaptureAt = this.now(); this.monitor.lastSyncAt = this.now(); this._persistMonitor();
+    const persisted = this.store.upsertSearchMessage(message, offers);
+    this.monitor.lastCaptureAt = this.now(); this.monitor.lastOriginalAt = originalAt; this.monitor.lastSyncAt = this.now(); this.monitor.lastError = null;
+    const probe = this.monitor.captureProbe;
+    if (probe && kind === 'message' && ctx.history !== true && persisted?.inserted === true && probe.expiresAt >= this.now() && originalAt >= probe.startedAt - 1000 && probe.groupIds.includes(ctx.chatId)) {
+      this.monitor.captureProbe = { ...probe, status: 'captured', messageId: ctx.messageId, groupId: ctx.chatId, capturedAt: this.now() };
+    }
+    this._persistMonitor();
   }
   _trustedSelf(ctx) {
     if (ctx?.fromMe !== true || ctx.trustedSelf !== true || ctx.machineGenerated === true || ctx.automaticMessage === true) return false;
@@ -329,7 +341,7 @@ class SearchService extends EventEmitter {
     const ageFrom = ageMinutes === null ? null : this.now() - ageMinutes * 60_000;
     const customFrom = settings.customFrom ? parseZonedTime(settings.customFrom, settings.timezone) : null;
     const period = { from: customFrom === null ? ageFrom : ageFrom === null ? customFrom : Math.max(customFrom, ageFrom), to: settings.customTo ? parseZonedTime(settings.customTo, settings.timezone) : this.now(), maxAgeMinutes: ageMinutes }; 
-    const stale = this.adapter?.status?.state !== 'connected' || !!this.monitor.openGap;
+    const stale = this.adapter?.status?.state !== 'connected' || this.adapter?.getConnectionReadiness?.().ready === false || !!this.monitor.openGap || !!this.monitor.lastError || !settings.monitoredGroupIds.length;
     let results = [], allResults = [], parsedFilters = {}, effectiveFilters = {}, persistedQueryFilters = null, guidance = null;
     if (!query) guidance = `Use ${settings.prefix} iPhone 18 Pro Max 256GB Silver para buscar ofertas capturadas.\nPara Excel: ${settings.prefix} --excel iPhone 15 Pro Max 256GB\nPara texto e Excel: ${settings.prefix} --ambos iPhone 15 Pro Max 256GB`; 
     else {
@@ -350,6 +362,8 @@ class SearchService extends EventEmitter {
       }
     }
     const warnings = ['A base inclui somente mensagens capturadas; o histórico pode conter lacunas.']; if (stale) warnings.unshift('⚠️ Captura desatualizada ou interrompida. Valores podem não refletir anúncios recentes.');
+    if (!settings.monitoredGroupIds.length) warnings.push('⚠️ Nenhum grupo monitorado configurado. Selecione os grupos em BUSCAS → Configurações para capturar novas ofertas.');
+    if (this.monitor.lastError) warnings.push(`⚠️ Captura: ${this.monitor.lastError.message} (${this.monitor.lastError.code}).`);
     if (results.some(o => o.forwarded)) warnings.push('Encaminhamentos: o remetente é quem republicou; o fornecedor original pode ser desconhecido.');
     const answer = { runId: run.id, traceId: run.traceId || run.id, query, results, count: results.length, totalCount: allResults.length, period, order: settings.sort, timezone: settings.timezone, stale, warnings, guidance, filters: effectiveFilters.modelKey ? effectiveFilters : parsedFilters, delivery: [] };
     this.store.saveSearchRun({ ...run, query, status: 'completed', resultCount: results.length, totalCount: allResults.length, resultOfferIds: results.map(o => o.id), filters: effectiveFilters.modelKey ? effectiveFilters : parsedFilters, queryFilters: persistedQueryFilters, resultSettings: { sort: settings.sort, maxResults: settings.maxResults, priceCriterion: settings.priceCriterion, onePerSupplier: settings.onePerSupplier, blockedSupplierIds: settings.blockedSupplierIds, blockedGroupIds: settings.blockedGroupIds, timezone: settings.timezone }, period, warnings, completedAt: this.now() });
@@ -701,6 +715,43 @@ class SearchService extends EventEmitter {
   cleanupPreview(payload, actorId) { this._assert(actorId, 'manage'); const scope = payload?.scope; if (!['history', 'base'].includes(scope)) fail('Selecione histórico de buscas ou base de ofertas.'); const stats = this.store.getSearchMonitorStats(); const token = randomUUID(); this.cleanupTokens.set(token, { actorId, scope, expiresAt: this.now() + 300_000 }); if (this.cleanupTokens.size > 100) this.cleanupTokens.delete(this.cleanupTokens.keys().next().value); return { scope, token, stats, effect: scope === 'history' ? 'Remove apenas o histórico de consultas. Ofertas, mensagens e controles de entrega permanecem.' : 'Remove mensagens capturadas e ofertas. Campanhas, usuários, configurações, histórico de consultas e controles de entrega permanecem.' }; }
   async clearData(payload, actorId) { this._assert(actorId, 'manage'); const token = this.cleanupTokens.get(payload.token); if (!token || token.actorId !== actorId || token.scope !== payload.scope || token.expiresAt < this.now()) fail('Visualize novamente o que será removido antes de apagar.'); if (payload.confirmation !== 'APAGAR') fail('Digite APAGAR para confirmar.'); this.cleanupTokens.delete(payload.token); if (payload.scope === 'base') { await this.suspendCapture('offers_base_cleared'); try { this.store.deleteSearchBase({ actor: actorId }); this.monitor.lastSyncAt = null; this.monitor.lastCaptureAt = null; } finally { this.resumeCapture(); } } else this.store.deleteSearchHistory({ actor: actorId }); this._audit(`search.${payload.scope}_cleared`, actorId); this.emit('change'); return { cleared: true, scope: payload.scope }; }
   importHistory(actorId) { this._assert(actorId, 'manage'); if (!this._settings().enabled || !this._settings().importHistory) fail('Ative BUSCAS e a importação parcial de histórico.'); if (typeof this.adapter?.requestSearchHistory !== 'function') return { supported: false, complete: false, detail: 'A integração entrega somente o histórico parcial disponibilizado durante a sincronização. Não há importação completa sob demanda.' }; return this.adapter.requestSearchHistory({ groupIds: this._settings().monitoredGroupIds }); }
+
+  async synchronizeNow(actorId) {
+    this._assert(actorId, 'manage');
+    const settings = this._settings();
+    if (!settings.enabled || this.paused || !this._automationAllowed()) fail('Ative BUSCAS e libere o monitoramento antes de sincronizar.', 'SEARCH_DISABLED');
+    if (this.adapter?.status?.state !== 'connected' || this.adapter?.getConnectionReadiness?.().ready === false) fail('Conecte uma sessão pronta do WhatsApp antes de sincronizar.', 'DISCONNECTED');
+    const adapter = this.adapter, mode = this._mode();
+    try {
+      const groups = await adapter.listGroups();
+      this._assert(actorId, 'manage');
+      if (adapter !== this.adapter || mode !== this._mode()) fail('O modo de operação mudou durante a sincronização.', 'SEARCH_MODE_CHANGED');
+      if (!this._settings().enabled || this.paused || !this._automationAllowed()) fail('O monitoramento foi pausado durante a sincronização.', 'SEARCH_DISABLED');
+      const available = new Set(groups.map(group => group.id));
+      const missing = settings.monitoredGroupIds.filter(id => !available.has(id));
+      this._configure();
+      this.monitor.lastGroupCheckAt = this.now();
+      this.monitor.unavailableGroupIds = missing;
+      this.monitor.lastError = missing.length ? { at: this.now(), code: 'SEARCH_GROUPS_UNAVAILABLE', message: `${missing.length} grupo(s) monitorado(s) não constam entre os grupos acessíveis da sessão. Confira os identificadores e a participação da conta.` } : null;
+      this._persistMonitor(); this.emit('change');
+      return { synchronized: true, checkedAt: this.now(), monitoredGroupIds: settings.monitoredGroupIds,
+        availableGroupIds: settings.monitoredGroupIds.filter(id => available.has(id)), unavailableGroupIds: missing,
+        complete: false, historyImported: false, detail: 'Seleção e assinatura do monitoramento reaplicadas. Esta ação não importa mensagens antigas nem comprova o histórico completo.' };
+    } catch (error) { if (adapter === this.adapter && mode === this._mode()) this._captureFailure({ code: error.code || 'SEARCH_SYNC_ERROR', detail: 'Não foi possível verificar os grupos da sessão. A tela não foi preenchida com grupos fictícios.' }); throw error; }
+  }
+
+  async testCapture(actorId) {
+    this._assert(actorId, 'manage');
+    const settings = this._settings();
+    if (!settings.monitoredGroupIds.length) fail('Selecione ao menos um grupo real para monitorar.', 'SEARCH_GROUP_REQUIRED');
+    const synchronization = await this.synchronizeNow(actorId);
+    if (!synchronization.availableGroupIds.length) fail('Nenhum grupo selecionado está disponível na sessão conectada.', 'SEARCH_GROUPS_UNAVAILABLE');
+    const captureProbe = { id: randomUUID(), startedAt: this.now(), expiresAt: this.now() + 120000,
+      status: 'waiting', groupIds: synchronization.availableGroupIds };
+    this.monitor.captureProbe = captureProbe; this._persistMonitor(); this.emit('change');
+    return { ...captureProbe, verified: false, simulated: this._mode() === 'simulated',
+      detail: 'Monitoramento preparado. Publique um texto com aparelho e preço em um grupo selecionado dentro de 2 minutos; a captura será confirmada somente quando o evento real for salvo.' };
+  }
 }
 
 function parseSearchCommand(text) {

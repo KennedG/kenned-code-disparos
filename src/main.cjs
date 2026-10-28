@@ -2,6 +2,7 @@
 const {app,BrowserWindow,ipcMain,dialog,Tray,Menu,nativeImage,shell,powerMonitor,safeStorage,protocol,net,Notification}=require('electron');
 const {Worker}=require('node:worker_threads');
 const {pathToFileURL}=require('node:url');
+const {performance}=require('node:perf_hooks');
 const fs=require('node:fs'),path=require('node:path'),{randomUUID}=require('node:crypto');
 const {WorkerClient}=require('./core/worker-client.cjs');
 const {SoundController}=require('./core/sound.cjs');
@@ -25,18 +26,33 @@ fs.mkdirSync(profileDir,{recursive:true});
 app.setPath('userData',profileDir);
 const locked=app.requestSingleInstanceLock();
 if(!locked)app.quit();
-let win,tray,audioWindow,client,sounds,licensing,licenseTimer,quitting=false,quitStarted=false,networkTimer,settings={},lastSnapshot=null,resolveAudio;
+let win,tray,audioWindow,client,sounds,licensing,licenseTimer,quitting=false,quitStarted=false,networkTimer,clockTimer,settings={},lastSnapshot=null,resolveAudio;
 const audioReady=new Promise(resolve=>{resolveAudio=resolve;});
-const nativeOccurrences=new Set(),audioFiles=new Map(),audioRequests=new Map();
+const nativeOccurrences=new Set(),foregroundOccurrences=new Set(),pendingForeground=new Map(),incidentNotifications=new Map(),audioFiles=new Map(),audioRequests=new Map();
 const uiPath=path.join(__dirname,'ui/index.html'),audioPath=path.join(__dirname,'ui/audio-player.html');
 const dataDir=()=>app.getPath('userData');
 const nativeActions=new Set(['windowMinimize','windowQuit']);
-function showWindow(){if(win&&!win.isDestroyed()){win.show();win.focus();}}
+function showWindow(){if(win&&!win.isDestroyed()){if(win.isMinimized?.())win.restore?.();win.show();win.focus();}}
+function foregroundIncident(payload){
+  const key=payload.occurrenceId||payload.id;
+  if(payload.bringToFront!==true||!key||foregroundOccurrences.has(key))return 'not-requested';
+  if(!win||win.isDestroyed()){pendingForeground.set(key,payload);if(pendingForeground.size>512)pendingForeground.delete(pendingForeground.keys().next().value);return 'unavailable';}
+  foregroundOccurrences.add(key);
+  if(foregroundOccurrences.size>512)foregroundOccurrences.delete(foregroundOccurrences.values().next().value);
+  try{showWindow();if(win.isFocused?.()!==true){win.flashFrame?.(true);return 'attention-requested';}return 'focused';}catch{try{win.flashFrame?.(true);}catch{}return 'attention-requested';}
+}
+function stopIncidentSound(payload={},resolve=false){
+  const key=payload.occurrenceId||payload.id,ids=new Set([payload.id,...(payload.notificationIds||[]),...(incidentNotifications.get(key)||[])].filter(Boolean));
+  for(const id of ids){if(resolve&&sounds.resolve)sounds.resolve(id);else sounds.mute(id);}
+  if(resolve){incidentNotifications.delete(key);pendingForeground.delete(key);win?.flashFrame?.(false);}
+  return {stopped:[...ids]};
+}
 function publish(snapshot){
   lastSnapshot=snapshot;
   if(snapshot?.settings)settings={...settings,...snapshot.settings};
   if(win&&!win.isDestroyed())win.webContents.send('mega:update',snapshot);
 }
+function readComputerClock(){const at=Date.now();return {at,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||'America/Sao_Paulo',timeZoneOffsetMinutes:new Date(at).getTimezoneOffset()};}
 function registerAudio(filename){
   if(!filename)return undefined;
   const root=path.join(dataDir(),'audio'),real=fs.realpathSync(filename),base=fs.realpathSync(root);
@@ -53,21 +69,27 @@ async function createAudioWindow(){
   await audioWindow.loadFile(audioPath);resolveAudio();
 }
 async function playAudio(payload){
+  if(payload.isCancelled?.())throw new Error('Alarme cancelado antes da reprodução.');
   if(confirmedLicenseExpiry(licensing?.getStatus?.()))throw new Error('Licença expirada; alertas sonoros interrompidos.');
   await audioReady;
+  if(payload.isCancelled?.())throw new Error('Alarme cancelado antes da reprodução.');
   if(confirmedLicenseExpiry(licensing?.getStatus?.()))throw new Error('Licença expirada; alertas sonoros interrompidos.');
   if(!audioWindow||audioWindow.isDestroyed())throw new Error('O reprodutor de alertas não está disponível.');
   return new Promise((resolve,reject)=>{
     const duration=Number(payload.durationSeconds),timeoutMs=Number.isFinite(duration)&&duration>=0.2&&duration<=30?Math.ceil(duration*1000)+2000:17000;
     const timer=setTimeout(()=>{audioRequests.delete(payload.id);audioWindow.webContents.send('mega:audioStop',{id:payload.id});reject(new Error('O áudio não pôde ser concluído.'));},timeoutMs);
-    audioRequests.set(payload.id,{resolve,reject,timer});audioWindow.webContents.send('mega:audioPlay',payload);
+    const {isCancelled,...audioPayload}=payload;
+    audioRequests.set(payload.id,{resolve,reject,timer});audioWindow.webContents.send('mega:audioPlay',audioPayload);
   });
 }
 async function nativeAlert(payload){
   if(confirmedLicenseExpiry(licensing?.getStatus?.()))return {soundStatus:'disabled',nativeStatus:'suppressed',reason:'license_expired'};
   const preferences=payload.soundPreferences||payload.sound||settings.sound||{};
   let audioUrl;try{audioUrl=registerAudio(payload.audioPath);}catch{}
-  const audio=sounds.handle(payload,preferences,{audioUrl});
+  const key=payload.occurrenceId||payload.id;
+  if(key){const ids=incidentNotifications.get(key)||new Set();ids.add(payload.id);incidentNotifications.set(key,ids);if(incidentNotifications.size>512)incidentNotifications.delete(incidentNotifications.keys().next().value);}
+  const audio=payload.muted||payload.resolvedAt?{soundStatus:payload.muted?'muted':'resolved'}:sounds.handle(payload,preferences,{audioUrl,persistent:payload.persistentAlarm===true});
+  const foregroundStatus=foregroundIncident(payload);
   if(nativeOccurrences.has(payload.id))return {...audio,nativeStatus:'suppressed'};
   nativeOccurrences.add(payload.id);
   if(nativeOccurrences.size>512)nativeOccurrences.delete(nativeOccurrences.values().next().value);
@@ -78,7 +100,7 @@ async function nativeAlert(payload){
     notification.on('click',showWindow);
     notification.on('show',()=>{void client?.systemCall('nativeNotificationResult',{id:payload.id,status:'shown'}).catch(()=>{});});
     notification.on('failed',()=>{void client?.systemCall('nativeNotificationResult',{id:payload.id,status:'failed',error:'O Windows não aceitou a notificação; confira as permissões de notificações.'}).catch(()=>{});});
-    notification.show();return {...audio,nativeStatus:'requested'};
+    notification.show();return {...audio,nativeStatus:'requested',foregroundStatus};
   }catch{return {...audio,nativeStatus:'failed'};}
 }
 function secureFile(){return path.join(dataDir(),'credentials','channels.dpapi');}
@@ -105,7 +127,8 @@ async function nativeHost(action,payload={}){
     case 'setLoginItemSettings':if(process.platform==='win32')app.setLoginItemSettings({name:APP_NAME,openAtLogin:!!payload.openAtLogin,path:process.execPath,args:['--autostart']});return true;
     case 'localAlert':return nativeAlert(payload);
     case 'testSound':return sounds.test(payload.preferences||payload.soundPreferences||payload.sound||settings.sound,{audioUrl:registerAudio(payload.audioPath)});
-    case 'silenceAlert':sounds.mute(payload.id);return true;
+    case 'silenceAlert':stopIncidentSound(payload);return true;
+    case 'resolveAlert':return stopIncidentSound(payload,true);
     case 'secretGet':return readSecrets()[payload.key]??null;
     case 'secretSet':{
       if(!safeStorage.isEncryptionAvailable())throw new Error('Proteção do Windows indisponível.');
@@ -137,6 +160,7 @@ function createWindow(){
     {type:'separator'},{label:'Sobre '+APP_NAME,click:()=>{void dialog.showMessageBox(win,{type:'info',title:'Sobre '+APP_NAME,message:APP_NAME+' '+app.getVersion(),detail:'Aplicativo local para Windows. Campanhas e buscas autorizadas pelo WhatsApp.\nIntegração Baileys não oficial. Os dados da instalação anterior foram preservados.',buttons:['OK']});}},{label:'Encerrar',click:()=>app.quit()}
   ]));
   tray.on('double-click',showWindow);Menu.setApplicationMenu(null);
+  for(const payload of pendingForeground.values())foregroundIncident(payload);pendingForeground.clear();
 }
 if(locked){
   app.on('second-instance',showWindow);
@@ -163,7 +187,7 @@ if(locked){
       if(quitting||quitStarted)return;
       const message='O processamento de campanhas foi interrompido. Reabra o aplicativo e revise os resultados incertos.';
       publish({...lastSnapshot,backendError:message,storageError:message,connection:{state:'disconnected',detail:message}});
-      void nativeAlert({id:'backend-failure',event:'critical',title:APP_NAME+': processamento interrompido',body:message,at:Date.now(),soundPreferences:settings.sound,nativeEnabled:settings.notifications?.nativeEnabled});
+      void nativeAlert({id:'backend-failure',event:'critical',title:APP_NAME+': processamento interrompido',body:message,at:Date.now(),active:true,blocking:true,persistentAlarm:true,bringToFront:true,soundPreferences:settings.sound,nativeEnabled:settings.notifications?.nativeEnabled});
     });
     settings=await client.ready;
     ipcMain.handle('mega:call',async(event,action,payload={})=>{
@@ -180,15 +204,23 @@ if(locked){
       if(payload.success)request.resolve({success:true});else request.reject(new Error('Não foi possível reproduzir o áudio. Confira o arquivo e as configurações de som.'));
     });
     createWindow();await createAudioWindow();
+    let previousClock=readComputerClock(),previousMonotonic=performance.now();
+    const checkComputerClock=()=>{
+      const current=readComputerClock(),monotonic=performance.now(),zoneChanged=current.timezone!==previousClock.timezone||current.timeZoneOffsetMinutes!==previousClock.timeZoneOffsetMinutes;
+      const clockChanged=Math.abs((current.at-previousClock.at)-(monotonic-previousMonotonic))>2000;
+      if(zoneChanged||clockChanged)void client.systemCall('clockChanged',{reason:zoneChanged?'timezone_changed':'clock_changed',previous:previousClock,current}).catch(()=>{});
+      previousClock=current;previousMonotonic=monotonic;
+    };
     powerMonitor.on('suspend',()=>{void client.systemCall('suspend').catch(()=>{});});
-    powerMonitor.on('resume',()=>{void client.systemCall('resume').catch(()=>{});});
+    powerMonitor.on('resume',()=>{checkComputerClock();void client.systemCall('resume').catch(()=>{});});
+    clockTimer=setInterval(checkComputerClock,5000);clockTimer.unref();
     let online=net.isOnline();void client.systemCall('networkState',{online,at:Date.now()}).catch(()=>{});
     networkTimer=setInterval(()=>{const value=net.isOnline();if(value!==online){online=value;void client.systemCall('networkState',{online,at:Date.now()}).catch(()=>{});}},15000);networkTimer.unref();
-    if(process.argv.includes('--autostart'))win.hide();
+    if(process.argv.includes('--autostart')&&!foregroundOccurrences.size)win.hide();
   }).catch(error=>{dialog.showErrorBox(APP_NAME,'Não foi possível abrir o aplicativo: '+error.message);quitting=true;app.quit();});
   app.on('before-quit',event=>{
     if(quitting)return;event.preventDefault();if(quitStarted)return;
-    quitStarted=true;clearInterval(networkTimer);clearInterval(licenseTimer);sounds?.shutdown();
+    quitStarted=true;clearInterval(networkTimer);clearInterval(clockTimer);clearInterval(licenseTimer);sounds?.shutdown();
     (async()=>{try{await Promise.allSettled([client?.shutdown(),licensing?.shutdown()]);}catch{/* Interrupted durable dispatches require review on reopen. */}finally{quitting=true;for(const request of audioRequests.values()){clearTimeout(request.timer);request.reject(new Error('Aplicativo encerrado.'));}audioRequests.clear();tray?.destroy();audioWindow?.destroy();app.quit();}})();
   });
 }

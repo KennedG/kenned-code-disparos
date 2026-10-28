@@ -30,7 +30,7 @@ test('uncertain item does not block remaining items/groups; same ambiguous item 
  const f=fixture({items:[{id:'i1',type:'text',text:'1'},{id:'i2',type:'text',text:'2'}],sender:({groupId,item})=>({status:groupId==='g1'&&item.id==='i1'?'uncertain':'confirmed',messageId:item.clientMessageId})});
  await f.scheduler.activate('c1');await f.scheduler.tick();
  assert.equal(f.calls.length,4);assert.equal(f.store.getCampaign('c1').state,'active');assert.equal(f.store.listJobs({status:'uncertain'}).length,1);assert.equal(f.store.listJobs({status:'accepted'}).length,3);assert.equal(f.store.listRounds('c1')[0].status,'completed');
- f.clock.now+=600000;await f.scheduler.tick();assert.equal(f.calls.length,7);assert.deepEqual(f.calls.slice(4).map(x=>`${x.groupId}:${x.item.id}`),['g1:i2','g2:i1','g2:i2']);assert.equal(f.store.listJobs({status:'uncertain'})[0].attempts,1);
+ const next=f.store.getCampaign('c1').nextRunAt;assert.equal(next,Date.UTC(2026,9,8,12,10));f.clock.now=next-1;await f.scheduler.tick();assert.equal(f.calls.length,4,'uncertainty does not grant an off-grid extra round');f.clock.now=next;await f.scheduler.tick();assert.equal(f.calls.length,7);assert.deepEqual(f.calls.slice(4).map(x=>`${x.groupId}:${x.item.id}`),['g1:i2','g2:i1','g2:i2']);assert.equal(f.store.listJobs({status:'uncertain'})[0].attempts,1);
 });
 
 test('stalled campaign attempt releases worker on deadline; late accepted proof updates same job without resubmission',async()=>{
@@ -59,7 +59,7 @@ test('late server acceptance and later delivery are separate evidence; old proof
 test('confirmed group restriction suspends only named destination, cancels its other items and processes the others',async()=>{
  const f=fixture({items:[{id:'i1',type:'text',text:'1'},{id:'i2',type:'text',text:'2'}]});f.adapter.getGroupPublishingStatus=async id=>id==='g1'?{available:false,canSend:false,code:'GROUP_ADMIN_ONLY',confirmed:true,temporary:false}:{available:true,canSend:true,confirmed:true};const events=[];f.scheduler.on('destinationFailure',e=>events.push(e));
  await f.scheduler.activate('c1');await f.scheduler.tick();assert.deepEqual(f.calls.map(x=>x.groupId),['g2','g2']);assert.equal(f.store.listJobs({status:'failed'}).length,1);assert.equal(f.store.listJobs({status:'cancelled'}).length,1);assert.equal(f.store.getCampaign('c1').state,'active');const health=f.store.getCampaign('c1').destinationHealth.g1;assert.equal(health.suspended,true);assert.equal(health.code,'GROUP_ADMIN_ONLY');assert.equal(events.length,1);assert.equal(events[0].groupId,'g1');assert.equal(events[0].connectionAvailable,true);
- f.clock.now+=600000;await f.scheduler.tick();assert.equal(f.calls.length,4);f.adapter.getGroupPublishingStatus=async()=>({available:true,canSend:true,confirmed:true});const checked=await f.scheduler.recheckDestination('c1','g1');assert.equal(checked.suspended,false);assert.equal(checked.code,'GROUP_AVAILABLE');assert.equal(checked.lastError.code,'GROUP_ADMIN_ONLY');assert(checked.lastError.reason.includes('administradores'));
+ const next=f.store.getCampaign('c1').nextRunAt;assert.equal(next,Date.UTC(2026,9,8,12,10));f.clock.now=next-1;await f.scheduler.tick();assert.equal(f.calls.length,2);f.clock.now=next;await f.scheduler.tick();assert.equal(f.calls.length,4);assert(f.calls.every(call=>call.groupId==='g2'));f.adapter.getGroupPublishingStatus=async()=>({available:true,canSend:true,confirmed:true});const checked=await f.scheduler.recheckDestination('c1','g1');assert.equal(checked.suspended,false);assert.equal(checked.code,'GROUP_AVAILABLE');assert.equal(checked.lastError.code,'GROUP_ADMIN_ONLY');assert(checked.lastError.reason.includes('administradores'));
 });
 
 test('confirmed temporary failures use bounded progressive delays and keep one durable message ID; other groups continue',async()=>{
@@ -72,7 +72,14 @@ test('configured backoff factor controls progressive pre-submit retries and reje
 });
 
 test('connection-wide failure pauses all campaigns and stops unstarted network requests',async()=>{
- const f=fixture({sender:({adapter,item})=>{adapter.status={...adapter.status,state:'disconnected'};adapter.emit('status',adapter.status);return{status:'uncertain',messageId:item.clientMessageId};}});await f.scheduler.activate('c1');await f.scheduler.tick();assert.equal(f.calls.length,1);assert.equal(f.store.getCampaign('c1').state,'paused');assert.equal(f.store.listJobs({status:'uncertain'}).length,1);assert.equal(f.store.listJobs({status:'cancelled'}).length,1);assert.equal(f.store.getCampaign('c1').destinationHealth,undefined);
+ const f=fixture({sender:({adapter,item})=>{adapter.status={...adapter.status,state:'disconnected'};adapter.emit('status',adapter.status);return{status:'uncertain',messageId:item.clientMessageId};}});await f.scheduler.activate('c1');await f.scheduler.tick();assert.equal(f.calls.length,1);assert.equal(f.store.getCampaign('c1').state,'paused');assert.equal(f.store.listJobs({status:'uncertain'}).length,1);assert.equal(f.store.listJobs({status:'queued'}).length,1,'unsubmitted work remains pending for safe recovery of its frozen round');assert.equal(f.store.listJobs({status:'cancelled'}).length,0);assert.equal(f.store.listJobs({status:'queued'})[0].attempts,0);assert.equal(f.store.listRounds('c1')[0].status,'interrupted');assert.equal(f.store.getCampaign('c1').destinationHealth,undefined);
+});
+
+test('a definitive group end date cancels only its unsent pending work and keeps another destination eligible',async()=>{
+ const previous=process.env.TZ;process.env.TZ='UTC';try{
+ const f=fixture({changes:{groupOverrides:{g1:{enabled:true,schedule:{startTime:'12:00',endTime:'13:00',endDate:'2026-10-08'}}}},sender:({groupId,item,clock})=>{if(groupId==='g1'){clock.now=Date.UTC(2026,9,8,12,59,59);throw Object.assign(new Error('temporary pre-submission failure'),{safeToRetry:true,submitted:false,code:'GROUP_METADATA_TEMPORARY',groupScoped:true});}return{status:'accepted',messageId:item.clientMessageId};}});f.clock.now=Date.UTC(2026,9,8,12,50);
+ await f.scheduler.activate('c1');await f.scheduler.tick();assert.deepEqual(f.calls.map(call=>call.groupId),['g1','g2']);assert.equal(f.store.listJobs({status:'accepted'}).length,1);assert.equal(f.store.listJobs({status:'queued'}).length,0);const cancelled=f.store.listJobs({status:'cancelled'});assert.equal(cancelled.length,1);assert.equal(cancelled[0].groupId,'g1');assert.equal(cancelled[0].attempts,1);assert.equal(cancelled[0].errorCode,'CAMPAIGN_SCHEDULE_ENDED');assert.equal(f.store.getCampaign('c1').state,'active');assert.equal(f.store.getCampaign('c1').executionPendingRoundId,null);assert.equal(f.store.getCampaign('c1').nextRunAt,Date.UTC(2026,9,8,13,10));f.clock.now=f.store.getCampaign('c1').nextRunAt;await f.scheduler.tick();assert.deepEqual(f.calls.map(call=>call.groupId),['g1','g2','g2']);
+ }finally{if(previous===undefined)delete process.env.TZ;else process.env.TZ=previous;}
 });
 
 test('round freezes edited content; newly captured item enters only next round; removed unstarted item is excluded',async()=>{
@@ -145,12 +152,16 @@ test('zoned overnight weekday and date windows belong to the Brasília day on wh
  assert.equal(isWithinSchedule(Date.parse('2026-10-09T04:00:00Z'),schedule),true);assert.equal(isWithinSchedule(Date.parse('2026-10-09T09:00:00Z'),schedule),false);assert.equal(nextScheduledAt(Date.parse('2026-10-08T20:00:00Z'),schedule),Date.parse('2026-10-09T01:00:00Z'));
 });
 
-test('source-managed campaigns inherit configured Brasília schedule even when the operating system is UTC',async()=>{
- const f=fixture({changes:{sourceManaged:true,sourceTimezone:'America/Sao_Paulo',schedule:{days:[0,1,2,3,4,5,6],startTime:'08:00',endTime:'18:00'}}});f.clock.now=Date.parse('2026-10-08T19:00:00Z');await f.scheduler.activate('c1');await f.scheduler.tick();assert.equal(f.calls.length,2);assert.equal(f.scheduler._groupConfig(f.store.getCampaign('c1'),'g1').schedule.timezone,'America/Sao_Paulo');
- f.clock.now=Date.parse('2026-10-08T22:00:00Z');await f.scheduler.tick();assert.equal(f.calls.length,2);assert.equal(f.store.getCampaign('c1').nextRunAt,Date.parse('2026-10-09T11:00:00Z'));
+test('source-managed campaigns execute in the computer timezone while retaining Brasília capture metadata',async()=>{
+ const previous=process.env.TZ;process.env.TZ='UTC';try{
+ const f=fixture({changes:{sourceManaged:true,sourceTimezone:'America/Sao_Paulo',schedule:{timezone:'America/Sao_Paulo',days:[0,1,2,3,4,5,6],startTime:'08:00',endTime:'18:00'}}});f.clock.now=Date.parse('2026-10-08T16:00:00Z');await f.scheduler.activate('c1');await f.scheduler.tick();assert.equal(f.calls.length,2);assert.equal(f.scheduler._groupConfig(f.store.getCampaign('c1'),'g1').schedule.timezone,undefined);assert.equal(f.store.getCampaign('c1').sourceTimezone,'America/Sao_Paulo');assert.equal(f.store.getCampaign('c1').schedule.timezone,'America/Sao_Paulo');assert.equal(f.store.getCampaign('c1').executionAuthorization.timezone,'UTC');
+ f.clock.now=Date.parse('2026-10-08T19:00:00Z');await f.scheduler.tick();assert.equal(f.calls.length,2,'19:00 is outside the computer window even though it is 16:00 in Brasília');assert.equal(f.store.getCampaign('c1').nextRunAt,Date.parse('2026-10-09T08:00:00Z'));
+ }finally{if(previous===undefined)delete process.env.TZ;else process.env.TZ=previous;}
 });
 
-test('source daily limits reset at Brasília midnight rather than midnight in the Windows timezone',async()=>{
+test('source daily execution limits reset at computer midnight without changing original source dates',async()=>{
+ const previous=process.env.TZ;process.env.TZ='UTC';try{
  const f=fixture({changes:{sourceManaged:true,sourceTimezone:'America/Sao_Paulo',dailyRoundLimit:1}});f.clock.now=Date.parse('2026-10-08T00:30:00Z');f.store.insertRound({id:'earlier-local-day',campaignId:'c1',startedAt:Date.parse('2026-10-07T23:00:00Z'),finishedAt:Date.parse('2026-10-07T23:00:00Z'),status:'completed'});
- await f.scheduler.activate('c1');await f.scheduler.tick();assert.equal(f.calls.length,0);assert.equal(f.store.getCampaign('c1').nextRunAt,Date.parse('2026-10-08T03:00:00Z'));
+ await f.scheduler.activate('c1');await f.scheduler.tick();assert.equal(f.calls.length,2,'the previous UTC day does not consume the new computer day allowance');assert.equal(f.store.getCampaign('c1').sourceTimezone,'America/Sao_Paulo');assert.equal(f.store.getCampaign('c1').nextRunAt,Date.parse('2026-10-09T00:00:00Z'));f.clock.now=Date.parse('2026-10-08T00:40:00Z');await f.scheduler.tick();assert.equal(f.calls.length,2,'daily limit still prevents another round within the same computer day');f.clock.now=Date.parse('2026-10-09T00:00:00Z');await f.scheduler.tick();assert.equal(f.calls.length,4);
+ }finally{if(previous===undefined)delete process.env.TZ;else process.env.TZ=previous;}
 });

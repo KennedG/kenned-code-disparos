@@ -1,0 +1,22 @@
+/* Kenned Code: a single scalable mark, with an explicit contrast variant. */
+.kc-brand-mark{display:block;object-fit:contain;object-position:center;aspect-ratio:1;flex-shrink:0;image-rendering:auto}
+.sidebar-brand-row .kc-brand-mark{width:44px;height:44px;min-width:44px;margin:-3px 0}
+.sidebar-brand-row .brand{font-family:"Segoe UI",Inter,system-ui,sans-serif;font-weight:650;letter-spacing:-.35px}
+.sidebar-brand-row .brand>span:last-child{font-size:17px;line-height:1.2}
+.sidebar-brand-row .brand-second{font-size:11px;font-weight:500;letter-spacing:2.1px;text-transform:uppercase;line-height:1.5;margin-top:4px}
+.kc-header-brand{display:flex;align-items:center;gap:9px;min-width:0;margin-bottom:4px}
+.kc-header-brand .kc-brand-mark{width:29px;height:29px}
+.kc-header-name{font-size:13px;font-weight:650;letter-spacing:-.1px;color:var(--text);white-space:nowrap}
+.kc-header-name span{font-weight:400;color:var(--muted)}
+.kc-brand-dark-theme{display:none}
+body[data-theme=dark] .kc-brand-light-theme{display:none}
+body[data-theme=dark] .kc-brand-dark-theme{display:block}
+.auth-art .kc-brand-login{width:108px;height:108px;max-width:100%;margin:0 0 30px -13px}
+.auth-art .kc-brand-wordmark{width:235px;max-width:100%;height:auto;margin:0 0 25px}
+.kc-license-brand{display:flex;gap:9px;align-items:center;margin-bottom:12px}
+.kc-license-brand .kc-brand-mark{width:38px;height:38px}
+.kc-license-brand strong{font-size:15px;font-weight:650;letter-spacing:-.2px}
+body[data-sidebar-collapsed=true] .sidebar-brand-row .kc-brand-mark{width:45px;height:45px;min-width:45px}
+@media(max-width:1200px){.kc-header-name{font-size:12px}.kc-header-name span{display:none}}
+@media(max-width:1100px){.kc-header-name{display:none}}
+@media(prefers-reduced-motion:reduce){.kc-brand-mark{transition:none}}

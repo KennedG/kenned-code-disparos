@@ -1,1 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><rect width="256" height="256" rx="60" fill="#50d4ac"/><path d="M69 51h29v64l58-64h37l-68 74 72 80h-39l-60-68v68H69z" fill="#0b3530"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Kenned Code Disparos</title>
+  <rect width="256" height="256" rx="54" fill="#10232d"/>
+  <g transform="translate(-5 -4) scale(1.24)">
+    <path d="M147 82a47 47 0 1 0 0 63" fill="none" stroke="#17bd84" stroke-width="24" stroke-linecap="round"/>
+    <path d="m145 76 19-20" fill="none" stroke="#17bd84" stroke-width="12" stroke-linecap="round"/>
+    <circle cx="167" cy="51" r="11" fill="#17bd84"/>
+    <path d="M37 61q0-8 8-8h8q12 0 12 14v33l33-33h32l-46 46 48 48h-32l-44-44v36q0 9-9 9h-2q-8 0-8-8Z" fill="#f3f8fb"/>
+  </g>
+</svg>

@@ -50,7 +50,7 @@
       ],
       "icon": "assets/icon.ico",
       "signExecutable": false,
-      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Reformulado-${arch}.exe"
+      "artifactName": "Kenned-Code-Disparos-Setup-2.3.2-Recuperacao-${arch}.exe"
     },
     "nsis": {
       "script": "scripts/installer.nsi",
@@ -72,5 +72,5 @@
       "en-US"
     ]
   },
-  "releaseRevision": "reformulado-r1"
+  "releaseRevision": "recuperacao-r2"
 }
