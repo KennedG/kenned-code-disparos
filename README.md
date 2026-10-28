@@ -21,3 +21,7 @@ Os resultados históricos de testes não significam validação atual com WhatsA
 ## Automação Comunidade
 
 Aplicativo independente, com código em `automacao-comunidade/`, banco e sessão próprios. Versão atual: **1.0.1**. Releases identificadas por `comunidade-v...`. A presença no mesmo repositório não compartilha credenciais nem altera os aplicativos.
+
+## Índice completo
+
+[Consultar as 22 versões e os instaladores no Google Drive](VERSOES.md). O código está público; o acesso aos instaladores segue as permissões do Drive.
