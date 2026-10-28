@@ -24,7 +24,7 @@ Var LegacyExecutableOwned
 !define MUI_FINISHPAGE_RUN "$INSTDIR\Kenned Code Disparos.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Abrir Kenned Code Disparos"
 !define MUI_WELCOMEPAGE_TITLE "Bem-vindo ao Kenned Code Disparos"
-!define MUI_WELCOMEPAGE_TEXT "Este assistente instala o Kenned Code Disparos neste computador.$\r$\n$\r$\nFeche uma instalação anterior antes de continuar. Os seus dados locais serão preservados.$\r$\n$\r$\nO aplicativo começa em simulação, com a campanha de exemplo desativada."
+!define MUI_WELCOMEPAGE_TEXT "Este assistente instala o Kenned Code Disparos neste computador.$\r$\n$\r$\nFeche uma instalação anterior antes de continuar. Os seus dados locais serão preservados.$\r$\n$\r$\nO teste gratuito de 72 horas começa no primeiro acesso conectado à internet. Após o teste, ative uma licença mensal ou anual. Os dados serão preservados ao vencer.$\r$\n$\r$\nO modo de simulação não envia mensagens reais."
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${PROJECT_DIR}/LICENSE"
 !insertmacro MUI_PAGE_COMPONENTS

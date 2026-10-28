@@ -5,6 +5,8 @@ const {pathToFileURL}=require('node:url');
 const fs=require('node:fs'),path=require('node:path'),{randomUUID}=require('node:crypto');
 const {WorkerClient}=require('./core/worker-client.cjs');
 const {SoundController}=require('./core/sound.cjs');
+const {LicenseClient}=require('./core/license-client.cjs');
+const {LicenseIdentityHost}=require('./core/license-host.cjs');
 
 const APP_NAME='Kenned Code Disparos';
 // Keep the existing profile and the OS mutex during the identity update.
@@ -22,7 +24,7 @@ fs.mkdirSync(profileDir,{recursive:true});
 app.setPath('userData',profileDir);
 const locked=app.requestSingleInstanceLock();
 if(!locked)app.quit();
-let win,tray,audioWindow,client,sounds,quitting=false,quitStarted=false,networkTimer,settings={},lastSnapshot=null,resolveAudio;
+let win,tray,audioWindow,client,sounds,licensing,licenseTimer,quitting=false,quitStarted=false,networkTimer,settings={},lastSnapshot=null,resolveAudio;
 const audioReady=new Promise(resolve=>{resolveAudio=resolve;});
 const nativeOccurrences=new Set(),audioFiles=new Map(),audioRequests=new Map();
 const uiPath=path.join(__dirname,'ui/index.html'),audioPath=path.join(__dirname,'ui/audio-player.html');
@@ -82,6 +84,11 @@ function readSecrets(){
 }
 async function nativeHost(action,payload={}){
   switch(action){
+    case 'licenseStatus':return licensing.getStatus();
+    case 'licenseInitialize':return licensing.initialize();
+    case 'licenseActivate':return licensing.activate(payload.key);
+    case 'licenseValidate':return licensing.validate();
+    case 'licenseTick':return licensing.tick();
     case 'encryptionAvailable':return safeStorage.isEncryptionAvailable();
     case 'encryptString':if(!safeStorage.isEncryptionAvailable())throw new Error('Proteção do Windows indisponível.');return safeStorage.encryptString(String(payload.value));
     case 'decryptString':if(!safeStorage.isEncryptionAvailable())throw new Error('Proteção do Windows indisponível.');return safeStorage.decryptString(Buffer.from(payload.value));
@@ -128,6 +135,12 @@ function createWindow(){
 if(locked){
   app.on('second-instance',showWindow);
   app.whenReady().then(async()=>{
+    licensing=new LicenseClient({identityProvider:new LicenseIdentityHost({safeStorage}),fetchImpl:(url,options)=>net.fetch(url,options)});
+    licensing.on('change',status=>{if(client&&!client.closed)client.worker?.postMessage({type:'licenseChanged',status});});
+    // Start on the first execution, even before the owner registers. The UI is
+    // allowed to open while the hosted, authoritative trial request runs.
+    void licensing.initialize();
+    licenseTimer=setInterval(()=>{void licensing.tick().catch(()=>{});},5000);licenseTimer.unref();
     sounds=new SoundController({play:playAudio,stop:id=>audioWindow?.webContents.send('mega:audioStop',{id})});
     protocol.handle('mega-audio',request=>{
       try{const url=new URL(request.url);if(url.hostname!=='asset')throw new Error();const file=audioFiles.get(url.pathname.slice(1));if(!file)throw new Error();return net.fetch(pathToFileURL(file).href,{headers:request.headers});}catch{return new Response('Áudio indisponível',{status:404});}
@@ -168,7 +181,7 @@ if(locked){
   }).catch(error=>{dialog.showErrorBox(APP_NAME,'Não foi possível abrir o aplicativo: '+error.message);quitting=true;app.quit();});
   app.on('before-quit',event=>{
     if(quitting)return;event.preventDefault();if(quitStarted)return;
-    quitStarted=true;clearInterval(networkTimer);sounds?.shutdown();
-    (async()=>{try{await client?.shutdown();}catch{/* Interrupted durable dispatches require review on reopen. */}finally{quitting=true;for(const request of audioRequests.values()){clearTimeout(request.timer);request.reject(new Error('Aplicativo encerrado.'));}audioRequests.clear();tray?.destroy();audioWindow?.destroy();app.quit();}})();
+    quitStarted=true;clearInterval(networkTimer);clearInterval(licenseTimer);sounds?.shutdown();
+    (async()=>{try{await Promise.allSettled([client?.shutdown(),licensing?.shutdown()]);}catch{/* Interrupted durable dispatches require review on reopen. */}finally{quitting=true;for(const request of audioRequests.values()){clearTimeout(request.timer);request.reject(new Error('Aplicativo encerrado.'));}audioRequests.clear();tray?.destroy();audioWindow?.destroy();app.quit();}})();
   });
 }

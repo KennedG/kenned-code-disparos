@@ -1,0 +1,12 @@
+{
+  "endpoint": "https://kenned-code-licencas.guilhermekenned.chatgpt.site",
+  "issuer": "kenned-code-disparos-licensing",
+  "audience": "kenned-code-disparos",
+  "kid": "kcd-2026-01",
+  "publicKeyJwk": {
+    "kty": "EC",
+    "x": "DFDVewAVl3WuntJOfXUYjFdnEl9uj9YMHfIkHcghpSA",
+    "y": "9mJ5B9ugZ8KCvCgG9ICiFiBRoYSadfB2CU1MgwxhWYE",
+    "crv": "P-256"
+  }
+}

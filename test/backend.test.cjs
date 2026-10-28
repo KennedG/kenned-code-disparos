@@ -1,4 +1,5 @@
 'use strict';
+const {createLicenseFixture}=require('./fixtures/license.cjs');
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {randomUUID}=require('node:crypto');
@@ -11,7 +12,7 @@ const OWNER={name:'Dono de teste',username:'dono',password:PASSWORD,phone:'55119
 async function fixture(t,{prepare,host}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-backend-'));let service;
   if(prepare){const store=await createStore(dir);seed(store);await prepare(store);store.close();}
-  const native=[];service=await createAppService({dir,runtimePlatform:'linux',host:async(action,payload)=>{native.push({action,payload});return host?host(action,payload):{canceled:true,nativeStatus:'unsupported',soundStatus:'disabled'};}});
+  const native=[];service=await createAppService({licenseService:createLicenseFixture(),dir,runtimePlatform:'linux',host:async(action,payload)=>{native.push({action,payload});return host?host(action,payload):{canceled:true,nativeStatus:'unsupported',soundStatus:'disabled'};}});
   t.after(async()=>{await service.shutdown();fs.rmSync(dir,{recursive:true,force:true});});
   return {service,dir,native};
 }

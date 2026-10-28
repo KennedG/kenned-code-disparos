@@ -53,7 +53,7 @@
   const empty = (ico,title,desc,action='',label='') => `<div class="empty-state"><div class="empty-icon">${icon(ico)}</div><h3>${e(title)}</h3><p>${e(desc)}</p>${action ? button(action,label,'primary','','plus') : ''}</div>`;
   const pageTitle = (eyebrow,title,desc,action='') => `<div class="page-heading"><div><div class="eyebrow">${e(eyebrow)}</div><h1>${e(title)}</h1><p class="subtitle">${e(desc)}</p></div>${action}</div>`;
   const state = {page:'dashboard',data:null,search:'',filter:'all',libraryTab:'media',modal:null,draft:null,pending:false,refreshing:false,settingsDirty:false,authScreen:null,authKey:null,history:null,diagnostics:null,users:[],roles:[],contacts:[],recipients:[],alerts:null,audit:null,pageOffset:0,pageLimit:50,pageFilters:{},pageLoading:false,pageRequest:0};
-  let buscasUI,libraryUI,remindersUI,contactIntakeUI;
+  let buscasUI,libraryUI,remindersUI,contactIntakeUI,licenseUI;
 
   function toast(message,error=false) {
     const div = document.createElement('div');
@@ -66,7 +66,7 @@
   async function call(action,payload) {
     if (!window.mega) throw new Error('A interface precisa ser aberta pelo aplicativo Kenned Code Disparos.');
     const result = await window.mega.call(action,payload);
-    if (result && result.error) throw new Error(typeof result.error === 'string' ? result.error : result.error.message || 'Não foi possível executar esta ação.');
+    if (result && result.error) throw Object.assign(new Error(typeof result.error === 'string' ? result.error : result.error.message || 'Não foi possível executar esta ação.'),{code:result.code||result.error?.code});
     return result;
   }
 
@@ -88,7 +88,7 @@
       }
       state.data = snapshot;
       state.contacts = Array.isArray(snapshot.contacts) ? snapshot.contacts : [];
-      document.body.dataset.theme = snapshot.settings?.theme || 'dark';
+      document.body.dataset.theme = snapshot.settings?.theme || 'light';
       render();
       if(state.modal?.kind==='trace'&&!can('diagnostics.view'))closeModal();
       if (state.modal?.kind === 'connection') renderConnectionModal();
@@ -121,8 +121,9 @@
   function render(force=false) {
     const d = data();
     if (!d) return;
-    if (renderAuth()) return;
-    const nav = [['dashboard','Painel','dashboard'],['campaigns','Campanhas','campaign'],['buscas','BUSCAS','search'],['reminders','LEMBRETES','clock'],['contacts','Contatos','groups'],['groups','Grupos','groups'],['library','Biblioteca','library'],['history','Histórico','history'],['reports','Relatórios','history'],['diagnostics','Diagnóstico','shield'],['alerts','Alertas','whatsapp'],['users','Usuários e perfis','shield'],['settings','Configurações','settings']].filter(([key])=>canPage(key));
+    if(licenseUI?.sync(d)&&d.auth?.authenticated)state.page='license';
+    if (renderAuth()) {licenseUI?.updateChrome();return;}
+    const nav = [['dashboard','Painel','dashboard'],['campaigns','Campanhas','campaign'],['buscas','BUSCAS','search'],['reminders','LEMBRETES','clock'],['contacts','Contatos','groups'],['groups','Grupos','groups'],['library','Biblioteca','library'],['history','Histórico','history'],['reports','Relatórios','history'],['diagnostics','Diagnóstico','shield'],['alerts','Alertas','whatsapp'],['users','Usuários e perfis','shield'],['settings','Configurações','settings'],['license','Licença','shield']].filter(([key])=>canPage(key));
     if (!canPage(state.page)) state.page='dashboard';
     $('#navigation').innerHTML = nav.map(([key,label,ico]) => `<button class="nav-item${state.page===key?' active':''}" data-action="navigate" data-id="${key}" ${state.page===key?'aria-current="page"':''}><span class="nav-icon"><svg viewBox="0 0 24 24">${icons[ico]}</svg></span><span>${label}</span>${key==='campaigns' ? `<span class="nav-count">${campaigns().length}</span>` : ''}</button>`).join('');
     const conn = d.connection || {state:'disconnected'};
@@ -133,13 +134,15 @@
     $('#user-bar').innerHTML = `<button class="account-button" data-action="account"><span class="user-avatar">${e((auth().user?.name||'U').slice(0,1).toUpperCase())}</span><span>${e(auth().user?.name||'Usuário')}<small>${e(auth().user?.roleName||'')}</small></span></button>${button('logout','Sair','small ghost')}`;
     $('.topbar [data-action="stop-all"]').disabled=!can('automation.control');
     renderConnectionBanner();
+    licenseUI?.updateChrome();
     $('#theme-toggle').disabled=!can('settings.edit');
     $('#theme-toggle').innerHTML = icon(document.body.dataset.theme==='dark'?'sun':'moon');
     $('#version').textContent = d.version || '1.0';
-    const renderers = {dashboard:renderDashboard,campaigns:renderCampaigns,buscas:()=>buscasUI.render(),groups:renderGroups,library:()=>libraryUI.render(),reminders:()=>remindersUI.render(),history:renderHistory,settings:renderSettings,reports:renderReports,diagnostics:renderDiagnostics,users:renderUsers,contacts:renderContacts,alerts:renderAlerts};
+    const renderers = {dashboard:renderDashboard,campaigns:renderCampaigns,buscas:()=>buscasUI.render(),groups:renderGroups,library:()=>libraryUI.render(),reminders:()=>remindersUI.render(),history:renderHistory,settings:renderSettings,reports:renderReports,diagnostics:renderDiagnostics,users:renderUsers,contacts:renderContacts,alerts:renderAlerts,license:()=>licenseUI.renderPage()};
     if (!force && state.page==='settings' && $('#settings-form') && (state.settingsDirty || $('#settings-form').contains(document.activeElement))) return;
     if(!force&&state.page==='contacts'&&contactIntakeUI.shouldPreserveDOM())return;
     if(!force&&state.page==='library'&&libraryUI.shouldPreserveDOM())return;
+    if(!force&&state.page==='license'&&licenseUI.shouldPreserveDOM())return;
     if (!force && state.page==='buscas' && buscasUI.shouldPreserveDOM()) {buscasUI.updateStatus();return;}
     const focused=document.activeElement?.id;
     const selection=focused==='page-search'?document.activeElement.selectionStart:null;
@@ -205,6 +208,7 @@
   function renderSettings() {
     const s = settings();
     return pageTitle('Do seu jeito','Configurações','Conexão, controle pelo WhatsApp e dados protegidos neste computador.') +
+      licenseUI.renderPanel() +
       `<form id="settings-form"><div class="settings-grid"><div><div class="panel"><div class="panel-header"><h2>Conexão e integração</h2>${icon('whatsapp')}</div><div class="panel-body"><div class="field"><label for="integration-mode">Modo de operação</label><select id="integration-mode" name="integrationMode"><option value="simulated"${currentMode()==='simulated'?' selected':''}>Simulação — sem envios reais</option><option value="whatsapp"${currentMode()==='whatsapp'?' selected':''}>WhatsApp Web — integração não oficial</option></select></div><div class="warning-note">A integração WhatsApp Web é não oficial. Ela permite usar grupos da conta, mas pode mudar, desconectar ou sofrer restrições. A integração oficial da Meta exige elegibilidade específica para grupos e não oferece acesso geral aos seus grupos existentes.</div><label class="check-label"><input name="unofficialAcknowledged" type="checkbox"${s.unofficialAcknowledged?' checked':''}> Entendo as limitações da integração não oficial e tenho autorização para usar os grupos selecionados.</label><div class="subtle-divider"></div>${button('connection','Abrir conexão','','','link')}<p class="soft-text">Mudanças do modo são aplicadas após salvar. Reconecte e revise os destinos das campanhas.</p></div></div><div class="panel"><div class="panel-header"><h2>Administradores autorizados</h2>${icon('shield')}</div><div class="panel-body"><div class="field"><label for="admin-numbers">Números com código do país e DDD</label><textarea id="admin-numbers" name="admins" placeholder="5511999999999&#10;5521988888888">${e((s.admins||[]).join('\n'))}</textarea><span class="field-hint">Um número por linha, vinculado ao telefone de um usuário ativo. As permissões desse usuário valem também nos comandos. O remetente é validado pela conexão.</span></div><div class="info-note">Comandos somente em conversa direta autorizada. Mensagens de grupos, encaminhadas e remetentes não verificados são ignorados. Controle administrativo exige a permissão Parar e retomar todas as automações; a permissão de BUSCAS não concede esse controle.</div><div class="settings-command"><code>!mega ajuda</code> · lista os comandos<br><code>!mega menu</code> · configuração por opções numeradas<br><code>!mega status</code> · conexão, filas, alertas, monitoramento e lembretes<br><code>!mega parar tudo</code> · interrompe as campanhas</div></div></div></div><div><div class="panel"><div class="panel-header"><h2>Preferências do aplicativo</h2>${icon('settings')}</div><div class="panel-body"><div class="field-grid"><div class="field"><label for="theme">Aparência</label><select name="theme" id="theme"><option value="dark"${(s.theme||'dark')==='dark'?' selected':''}>Tema escuro</option><option value="light"${s.theme==='light'?' selected':''}>Tema claro</option></select></div><div class="field"><label for="group-limit">Limite de grupos por campanha</label><input id="group-limit" name="maxSelectedGroups" type="number" min="1" max="1000" required value="${e(selectedLimit())}"><span class="field-hint">Padrão de 15 grupos. Ajustável.</span></div><div class="field field-full"><label for="close-behavior">Ao fechar a janela</label><select id="close-behavior" name="closeBehavior"><option value="ask"${s.closeBehavior==='ask'?' selected':''}>Perguntar: minimizar ou encerrar</option><option value="tray"${s.closeBehavior==='tray'?' selected':''}>Minimizar para a bandeja e continuar</option><option value="quit"${s.closeBehavior==='quit'?' selected':''}>Encerrar o aplicativo e interromper envios</option></select></div></div><label class="check-label"><input name="launchAtLogin" type="checkbox"${s.launchAtLogin?' checked':''}> Iniciar com o Windows</label><p class="soft-text">Os agendamentos usam o fuso horário deste computador. Mantenha-o ligado, com internet e sem suspensão durante os envios.</p></div></div><div class="panel"><div class="panel-header"><h2>Backup e armazenamento</h2>${icon('folder')}</div><div class="panel-body"><p class="soft-text">O backup inclui campanhas, configurações e cópias das mídias. Credenciais de conexão ficam fora do backup comum.</p>${data().upgradeBackup?`<div class="info-note">Cópia anterior à atualização verificada em ${e(fmt(data().upgradeBackup.createdAt))}.<br><span class="trace-id">${e(data().upgradeBackup.path)}</span><br>O snapshot contém o banco local; guarde também a pasta completa com mídias e sessão.</div>`:''}<div class="settings-actions">${button('backup','Criar backup','','','upload')}${button('restore','Restaurar backup','','','history')}${button('open-data','Abrir pasta de dados','ghost','','folder')}</div><div class="subtle-divider"></div><span class="field-hint">Local dos dados</span><p class="soft-text" style="word-break:break-all">${e(data().dataDir||'Pasta local do aplicativo')}</p></div></div>${currentMode()==='simulated'?`<div class="panel"><div class="panel-header"><h2>Validar comandos na simulação</h2></div><div class="panel-body"><p class="soft-text">Teste autorização, status e o menu antes de conectar a conta real.</p>${button('simulation-command','Enviar comando simulado','','','text')}</div></div>`:''}</div></div>${enhancedSettings(s)}<div class="settings-savebar"><button class="button primary" type="submit" ${can('settings.edit')?'':'disabled'}>${icon('check')} Salvar configurações</button></div></form>`;
   }
 
@@ -213,7 +217,7 @@
   const actionPermissions = {'new-campaign':'campaign.create','edit-campaign':'campaign.edit','save-campaign':'campaign.edit','confirm-save':'campaign.edit','duplicate':'campaign.create','delete-campaign':'campaign.delete','activate':'campaign.start','resume':'campaign.start','confirm-activation':'campaign.start','pause':'campaign.pause','stop-all':'automation.control','resume-automation':'automation.control','refresh-groups':'groups.view','import-media':'media.create','import-editor-media':'media.create','save-template':'media.create','delete-template':'media.delete','connection':'connection.view','connect':'connection.manage','disconnect':'connection.manage','backup':'settings.edit','restore':'settings.edit','open-data':'settings.edit','toggle-theme':'settings.edit','clear-history':'history.clear','export-history':'history.export','export-diagnostics':'diagnostics.export','export-reports':'reports.export','new-user':'users.create','edit-user':'users.edit','delete-user':'users.delete','reset-user':'users.edit','new-role':'users.roles','edit-role':'users.roles','delete-role':'users.roles','new-contact':'contacts.create','edit-contact':'contacts.edit','delete-contact':'contacts.delete','new-recipient':'notifications.manage','edit-recipient':'notifications.manage','delete-recipient':'notifications.manage','test-recipient':'notifications.manage','test-alert':'notifications.manage','retry-alert':'notifications.manage','import-audio':'settings.edit','test-sound':'settings.edit','confirm-job':'campaign.edit','discard-job':'campaign.edit','confirm-alert':'notifications.manage','discard-alert':'notifications.manage','save-user':'users.edit','save-role':'users.roles'};
   Object.assign(actionPermissions,{'view-trace':'diagnostics.view','copy-trace':'diagnostics.view','copy-diagnostic':'diagnostics.view'});
   const canAction = action => !actionPermissions[action] || can(actionPermissions[action]) || (action==='save-campaign'&&state.draft&&!campaign(state.draft.id)&&can('campaign.create')) || (action==='save-user'&&!state.modal?.userId&&can('users.create'));
-  const canPage = page => ({dashboard:()=>true,campaigns:()=>can('campaign.view'),reminders:()=>can('reminder.view'),buscas:()=>can('search.view')&&(data()?.buscas?.authorized===true||auth().user?.isOwner),groups:()=>can('groups.view'),library:()=>can('media.view'),contacts:()=>can('contacts.view'),history:()=>can('history.view'),reports:()=>can('reports.view'),diagnostics:()=>can('diagnostics.view'),alerts:()=>can('notifications.view'),users:()=>can('users.view'),settings:()=>can('settings.view')})[page]?.() || false;
+  const canPage = page => ({dashboard:()=>true,license:()=>true,campaigns:()=>can('campaign.view'),reminders:()=>can('reminder.view'),buscas:()=>can('search.view')&&(data()?.buscas?.authorized===true||auth().user?.isOwner),groups:()=>can('groups.view'),library:()=>can('media.view'),contacts:()=>can('contacts.view'),history:()=>can('history.view'),reports:()=>can('reports.view'),diagnostics:()=>can('diagnostics.view'),alerts:()=>can('notifications.view'),users:()=>can('users.view'),settings:()=>can('settings.view')})[page]?.() || false;
   const field = (label,name,value='',type='text',extra='') => `<div class="field"><label for="field-${e(name)}">${e(label)}</label><input id="field-${e(name)}" name="${e(name)}" type="${e(type)}" value="${e(value)}" ${extra}></div>`;
   const panel = (title,body,action='') => `<div class="panel"><div class="panel-header"><h2>${e(title)}</h2>${action}</div><div class="panel-body">${body}</div></div>`;
   const authFields = setup => `${setup?field('Seu nome','name','','text','required maxlength="140"'):''}${field('Nome de usuário','username','','text','required autocomplete="username" maxlength="80"')}${field('Senha','password','','password',`required autocomplete="${setup?'new-password':'current-password'}" ${setup?'minlength="12"':''}`)}${setup?`${field('Confirme a senha','confirmPassword','','password','required minlength="12" autocomplete="new-password"')}${field('WhatsApp para alertas (país + DDD, opcional)','phone','','tel','placeholder="5511999999999"')}<div class="info-note">Cadastre o dono deste computador. Depois, somente usuários autorizados poderão criar novos acessos. Use uma senha de pelo menos 12 caracteres.</div>`:''}`;
@@ -225,7 +229,7 @@
     $('.app-shell').hidden=locked;$('#auth-root').hidden=!locked;
     if(!locked){state.authKey=null;$('#auth-root').replaceChildren();return false;}
     if(!a.authenticated){$('#main').replaceChildren();$('#navigation').replaceChildren();$('#user-bar').replaceChildren();state.users=[];state.roles=[];state.contacts=[];state.recipients=[];state.history=null;state.diagnostics=null;state.alerts=null;state.settingsDirty=false;buscasUI?.reset();libraryUI?.reset();remindersUI?.reset();contactIntakeUI?.reset();}
-    if(state.modal?.kind!=='recovery-codes') closeModal();
+    if(!['recovery-codes','license'].includes(state.modal?.kind)) closeModal();
     const screen = a.setupRequired?'setup':a.user?.requirePasswordChange?'password':state.authScreen==='recovery'?'recovery':'login';
     const key=`${screen}:${a.user?.id||''}`;
     if(state.authKey===key && $('#auth-form')) return true;
@@ -545,6 +549,8 @@
   async function onAction(action,el) {
     const id=el.dataset.id;
     if (!canAction(action)) throw new Error('Seu perfil não permite esta ação.');
+    licenseUI?.assertAction(action);
+    if(action.startsWith('license-'))return licenseUI.onAction(action,el);
     if(action.startsWith('buscas-'))return buscasUI.onAction(action,el);
     if(action.startsWith('library-'))return libraryUI.onAction(action,el);
     if(action.startsWith('reminders-'))return remindersUI.onAction(action,el);
@@ -642,7 +648,7 @@
       case 'toggle-theme': {const theme=document.body.dataset.theme==='dark'?'light':'dark';await perform('saveSettings',{settings:{theme}});if(state.settingsDirty&&$('#settings-form'))$('#settings-form').elements.theme.value=theme;break;}
       case 'window-minimize': await call('windowMinimize');break;
       case 'stop-all': {const report=await perform('stopAll');const count=x=>typeof x==='number'?x:number(x?.cancelled||x?.campaigns||x?.paused,0);toast(`Automações interrompidas. Campanhas: ${count(report.campaigns)}; respostas: ${count(report.search)}; alertas: ${count(report.alerts)}; lembretes: ${count(report.reminders)}. Novas entradas bloqueadas até Retomar sistema.${report.inFlight?' '+report.inFlight+' envio(s) já em andamento podem concluir.':''}`);break;}
-      case 'resume-automation':await perform('resumeAutomation',undefined,'Sistema desbloqueado. Reative as campanhas e os lembretes que deseja retomar.');break;
+      case 'resume-automation':if(confirm('Retomar o sistema? Revise e reative somente as campanhas e os lembretes que deseja usar.'))await perform('resumeAutomation',undefined,'Sistema desbloqueado. Reative as campanhas e os lembretes que deseja retomar.');break;
       case 'connection': state.modal={kind:'connection',previousFocus:document.activeElement};renderConnectionModal();break;
       case 'connect': await perform('connect');renderConnectionModal();break;
       case 'disconnect': await perform('disconnect');renderConnectionModal();break;
@@ -797,6 +803,7 @@
   document.addEventListener('submit',async event=>{
     event.preventDefault();
     try{
+      if(event.target.id==='license-activation-form'){await licenseUI.onSubmit(event.target);return;}
       if(event.target.id.startsWith('buscas-')){await buscasUI.onSubmit(event.target);return;}
       if(event.target.id.startsWith('library-')){await libraryUI.onSubmit(event.target);return;}
       if(event.target.id==='reminders-form'){await remindersUI.onSubmit(event.target);return;}
@@ -850,6 +857,7 @@
   buscasUI=window.MegaBuscasUI.create(moduleContext);
   libraryUI=window.KennedLibraryUI.create({...moduleContext,useTemplate:template=>{if(!can('campaign.create'))throw new Error('Sem permissão para criar campanhas.');editCampaign(undefined,template);}});
   remindersUI=window.KennedRemindersUI.create(moduleContext);contactIntakeUI=window.KennedContactIntakeUI.create(moduleContext);
+  licenseUI=window.KennedLicenseUI.create({...moduleContext,navigate:page=>{if((state.settingsDirty||buscasUI.hasUnsaved())&&!confirm('Abrir Licença e descartar alterações não salvas?'))return;state.settingsDirty=false;state.page=page;render(true);}});
   if(window.mega?.onUpdate)window.mega.onUpdate(()=>refresh());
   refresh();
 })();

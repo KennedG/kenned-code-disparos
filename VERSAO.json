@@ -1,8 +1,8 @@
 {
-  "tag": "v2.3.1",
-  "installer": "Kenned-Code-Disparos-Setup-2.3.1-x64.exe",
-  "installerSha256": "91ac573183b1808f6737c3193bf22abbf2729945e312b6f7d8db9ec10fce3c7d",
+  "tag": "v2.3.2-original",
+  "installer": "Kenned-Code-Disparos-Setup-2.3.2-x64.exe",
+  "installerSha256": "761124675c09587fe50d6c4718195a18aabf9e6b169ca8ceb7e0af8de71b40aa",
   "sourceRecoveredFromInstaller": false,
-  "packagedSourceFilesAudited": 67,
+  "packagedSourceFilesAudited": 76,
   "latestRecommended": false
 }

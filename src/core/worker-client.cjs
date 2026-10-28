@@ -24,7 +24,7 @@ class WorkerClient extends EventEmitter {
     }
     if(message?.type==='hostCall'){
       try{const result=await this.host(message.action,message.payload);if(!this.closed)this.worker.postMessage({type:'hostResult',id:message.id,result});}
-      catch(error){if(!this.closed)this.worker.postMessage({type:'hostResult',id:message.id,error:error.message||'Não foi possível concluir a operação nativa.'});}
+      catch(error){if(!this.closed)this.worker.postMessage({type:'hostResult',id:message.id,error:error.message||'Não foi possível concluir a operação nativa.',code:error.code});}
     }
   }
   _failed(error){

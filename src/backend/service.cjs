@@ -3,6 +3,7 @@
 // Runs in the backend worker. The desktop process only owns native Windows
 // facilities and forwards explicitly named requests; it never owns the queue.
 const {EventEmitter}=require('node:events');
+const {AsyncLocalStorage}=require('node:async_hooks');
 const fs=require('node:fs');
 const path=require('node:path');
 const {randomUUID,randomBytes,createHash}=require('node:crypto');
@@ -21,6 +22,7 @@ const {ReminderService}=require('../core/reminders.cjs');
 const {ContactIntake}=require('../core/contact-intake.cjs');
 const {AutomationControl}=require('../core/automation-control.cjs');
 const {writeRecordsJSON}=require('../core/export-records.cjs');
+const {publicLicenseStatus,unavailableLicenseService,licenseError}=require('../core/license-policy.cjs');
 
 const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook','systemAlertRecipientIds','alertRetryPolicy'];
 const DEFAULTS={alertRetryPolicy:{maxAttempts:3,delaySeconds:15},reconnect:{enabled:false,maxAttempts:3,delaySeconds:15,autoResume:false},notifications:{nativeEnabled:true},sound:{enabled:true,volume:65,sound:'soft',customAudioId:null,events:['disconnect','critical'],repeat:false,intervalSeconds:30,maxRepeats:3,quiet:{enabled:false,start:'22:00',end:'08:00'}},retention:{days:90,maxEntries:20000,maxMegabytes:64},webhook:{enabled:false,url:''}};
@@ -32,18 +34,62 @@ const withoutPath=m=>{const {path:ignored,...safe}=m;return {...safe,previewUrl:
 const bounded=(v,min,max,name)=>validation.number(v,min,max,name);
 const asText=(value,max)=>String(value??'').slice(0,max);
 
-async function createAppService({dir,safeStorage,host=async()=>{throw new Error('Recurso nativo indisponível.');},version='2.3.1',runtimePlatform='win32',now=()=>Date.now()}={}){
+async function createAppService({dir,safeStorage,host=async()=>{throw new Error('Recurso nativo indisponível.');},version='2.3.2',runtimePlatform='win32',now=()=>Date.now(),licenseService}={}){
+  const licensing=licenseService||unavailableLicenseService();
+  if(typeof licensing.initialize==='function')await licensing.initialize();
   const store=await createStore(dir,{upgradeVersion:version});seed(store);store.recoverInterrupted();
   for(const [key,value] of Object.entries(DEFAULTS))if(store.getSetting(key)===undefined)store.setSetting(key,value);
   const media=new MediaManager(store),events=new EventEmitter();
   let channelUrl='';try{const value=await host('secretGet',{key:'webhookUrl'});if(typeof value==='string')channelUrl=value;}catch{}
   const auth=new AuthService({store,clock:now});
-  let adapter,scheduler,commands,alerts,searches,reminders,contacts,templates,automation,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,groupSync=null,groupSyncSource=null,groupLoadError=null;
+  let adapter,scheduler,commands,alerts,searches,reminders,contacts,templates,automation,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,licenseTimer=null,licenseStopOperation=null,licenseStopLatched=false,licenseCapturePaused=false,groupSync=null,groupSyncSource=null,groupLoadError=null;
+  const controlReplyScope=new AsyncLocalStorage();
   const cleanupTokens=new Map();
   const nativeTasks=new Set();
   const audioDir=path.join(dir,'audio');fs.mkdirSync(audioDir,{recursive:true});
   const settings=()=>{const result=Object.fromEntries(SETTINGS.map(k=>[k,store.getSetting(k)]));result.sound={...result.sound,customAudioName:(store.getSetting('audioAssets',[])||[]).find(a=>a.id===result.sound.customAudioId)?.name||''};if(result.webhook)result.webhook={...result.webhook,url:can('settings.edit')&&channelUrl?channelUrl:result.webhook.url};return result;};
-  const makeAdapter=()=>store.getSetting('integrationMode','simulated')==='whatsapp'?new WhatsAppAdapter({store,credentialsDir:path.join(dir,'credentials'),safeStorage}):new SimulatedAdapter({store});
+  const licenseStatus=()=>publicLicenseStatus(licensing.getStatus(),{resumeRequired:store.getSetting('licenseResumeRequired',false)===true});
+  function stopForLicense(status=licenseStatus(),force=false){
+    if(status.allowed&&!force||!automation||licenseStopLatched)return licenseStopOperation;
+    // Latch synchronously before callbacks/network awaits. Renewal leaves this
+    // persisted stop in place until an authorised operator explicitly resumes.
+    licenseStopLatched=true;
+    try{store.setSetting('licenseResumeRequired',true);}catch{scheduler?.blockOnPersistenceFailure();}
+    const reason=status.reason||'Teste ou licença indisponível; ative ou valide para realizar novos envios.';
+    try{store.addDiagnostic({id:randomUUID(),at:now(),stage:'license.blocked',code:status.reasonCode||'LICENSE_REQUIRED',level:'warning',description:reason,action:'Novas automações e envios bloqueados; dados preservados.',guidance:'Abra Licença para ativar ou validar. Depois confirme a retomada e ative individualmente as campanhas desejadas.'});}catch{if(store.persistenceFailed)scheduler?.blockOnPersistenceFailure();}
+    const stopped=automation.stop({source:'license',reason});
+    licenseCapturePaused=true;
+    const suspended=searches?.suspendCapture('license_unavailable');
+    licenseStopOperation=Promise.allSettled([stopped,suspended]).then(()=>{broadcast(true);});
+    return licenseStopOperation;
+  }
+  function assertLicense(operation){
+    const status=licenseStatus();
+    if(!status.allowed){stopForLicense(status);throw licenseError(status,operation);}
+    try{
+      const result=licensing.assertAllowed(operation);
+      if(result&&typeof result.then==='function')throw Object.assign(new Error('A validação final da licença precisa ser síncrona.'),{code:'LICENSE_GUARD_ASYNC'});
+    }catch(error){stopForLicense(licenseStatus());throw error;}
+    return status;
+  }
+  const automationUnavailable=()=>!licenseStatus().allowed||automation?.isStopped()===true;
+  function guardAdapter(source){
+    // Each transport validates again after resolving PN/LID and reading media.
+    // The bypass is a private async scope established only for authorised
+    // administrative replies; renderer parameters cannot create this scope.
+    for(const [name,index] of [['send',3],['sendPrivate',2],['sendPrivateContent',3],['sendSearchDocument',2],['sendSearchText',2],['reply',2]]){
+      if(typeof source[name]!=='function')continue;
+      const original=source[name];source[name]=function(...args){
+        const options=args[index]||{},previous=options.beforeSubmit,control=controlReplyScope.getStore();
+        const controlOnly=!!control&&control.adapter===source&&['reply','sendSearchText'].includes(name)&&args[0]===control.chatId&&args[1]===control.text&&options.clientMessageId===control.messageId&&options.replyContext===control.context;
+        if(!controlOnly)assertLicense(`whatsapp.${name}`);
+        args[index]={...options,beforeSubmit:()=>{if(previous)previous();if(!controlOnly)assertLicense(`whatsapp.${name}`);}};
+        return original.apply(this,args);
+      };
+    }
+    return source;
+  }
+  const makeAdapter=()=>guardAdapter(store.getSetting('integrationMode','simulated')==='whatsapp'?new WhatsAppAdapter({store,credentialsDir:path.join(dir,'credentials'),safeStorage}):new SimulatedAdapter({store}));
   const can=(permission,campaign)=>auth.can(permission,campaign);
   const assert=(permission,campaign)=>auth.assert(permission,campaign);
   const user=()=>auth.currentUser();
@@ -83,7 +129,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   };
   const visibleMedia=()=>can('media.view')?store.listMedia().map(withoutPath):[];
   function snapshot(){
-    const status=auth.status(),base={auth:status,version,maintenance,storageMode:store.getStorageMode(),settings:{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()},campaigns:[],groups:[],media:[],templates:[],contacts:[],alertRecipients:[],campaignUsers:[],history:[],metrics:{confirmed:0,failed:0,uncertain:0,activeCampaigns:0,selectedGroups:0,nextRunAt:null}};
+    const status=auth.status(),base={auth:status,license:licenseStatus(),version,maintenance,storageMode:store.getStorageMode(),settings:{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()},campaigns:[],groups:[],media:[],templates:[],contacts:[],alertRecipients:[],campaignUsers:[],history:[],metrics:{confirmed:0,failed:0,uncertain:0,activeCampaigns:0,selectedGroups:0,nextRunAt:null}};
     if(!status.authenticated)return {...base,connection:null};
     const cs=campaigns(),ids=cs.map(c=>c.id),storageError=store.persistenceFailed||scheduler.persistenceFailed?'Armazenamento indisponível: envios bloqueados. Corrija o espaço ou as permissões e reabra o aplicativo.':null;
     const metrics=store.getMetrics?store.getMetrics({campaignIds:scopeIds()}):{confirmed:0,failed:0,uncertain:0};
@@ -146,11 +192,12 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(!id)return null;const entry=(store.getSetting('audioAssets',[])||[]).find(a=>a.id===id);if(!entry)return null;
     try{const real=fs.realpathSync(entry.path);if(!real.startsWith(fs.realpathSync(audioDir)+path.sep))return null;return real;}catch{return null;}
   }
-  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');return await task();}finally{searches?.resumeCapture();maintenance=false;broadcast();}}
+  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');return await task();}finally{if(licenseStatus().allowed&&!licenseCapturePaused)searches?.resumeCapture();maintenance=false;broadcast();}}
   async function switchMode(mode){
     await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await alerts.waitForIdle?.();await reminders?.waitForIdle?.();if(groupSync)await groupSync.catch(()=>{});adapter.removeAllListeners();
     store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);reminders?.setAdapter(adapter);automation?.syncMode();contacts?.invalidateContacts();bindAdapter();
     cleanupTokens.clear();groupLoadError=null;
+    licenseStopLatched=false;if(!licenseStatus().allowed||store.getSetting('licenseResumeRequired',false))await stopForLicense(licenseStatus(),true);
     if(mode==='simulated'){await adapter.connect();await syncGroups(adapter);}
   }
   const configRevision=c=>c.configRevision??c.revision;
@@ -215,6 +262,9 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   const actions={
     snapshot:async()=>snapshot(),authStatus:async()=>auth.status(),
+    licenseStatus:async()=>licenseStatus(),
+    licenseActivate:async p=>{if(typeof p.key!=='string'||!p.key.trim()||p.key.length>256)throw Object.assign(new Error('Cole uma chave de licença válida.'),{code:'LICENSE_KEY_INVALID'});await licensing.activate(p.key.trim());await stopForLicense();broadcast(true);return licenseStatus();},
+    licenseRefresh:async()=>{await licensing.validate();await stopForLicense();broadcast(true);return licenseStatus();},
     setupOwner:async p=>{const result=await auth.setupOwner(p);broadcast(true);return result;},
     login:async p=>{const result=await auth.login(p);broadcast(true);return result;},
     logout:async()=>{auth.logout();cleanupTokens.clear();broadcast(true);return true;},
@@ -286,7 +336,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     pauseCampaign:async p=>{const c=getCampaign(p.id,'campaign.pause');await scheduler.pause(c.id);audit('campaign.pause',{campaignId:c.id});return store.getCampaign(c.id);},
     stopCampaign:async p=>{const c=getCampaign(p.id,'campaign.stop');await scheduler.pause(c.id);const latest=store.getCampaign(c.id);store.saveCampaign({...latest,state:'stopped',nextRunAt:null});audit('campaign.stop',{campaignId:c.id});return store.getCampaign(c.id);},
     stopAll:async()=>{assert('automation.control');const result=await automation.stop({actorId:user().id,source:'app'});audit('automation.stopAll',{result});return result;},
-    resumeAutomation:async()=>{assert('automation.control');const result=await automation.resume({actorId:user().id,source:'app'});audit('automation.resume');return result;},
+    resumeAutomation:async()=>{assert('automation.control');assertLicense('automation.resume');const result=await automation.resume({actorId:user().id,source:'app'});audit('automation.resume');return result;},
     automationStatus:async()=>{assert('automation.control');return automation.getState();},
     importMedia:async()=>{assert('media.create');const r=await host('showOpenDialog',{title:'Importar mídias para a biblioteca',properties:['openFile','multiSelections'],filters:[{name:'Mídias e documentos',extensions:['jpg','jpeg','png','webp','mp4','mov','pdf','doc','docx','xls','xlsx','pptx','txt','csv','zip']}]});if(r.canceled)return [];assert('media.create');const imported=[];for(const file of r.filePaths)imported.push(withoutPath(await media.importFile(file)));audit('media.create',{count:imported.length});return imported;},
     mediaPath:async p=>{if(p.kind&&p.kind!=='media')throw new Error('Tipo de recurso inválido.');assert('media.view');return media.getPath(p.id);},
@@ -347,17 +397,19 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     testSimulation:async p=>{assert('settings.edit');if(adapter.status.mode!=='simulated'&&store.getSetting('integrationMode')!=='simulated')throw new Error('Disponível somente no modo simulado.');const senderNumber=cleanPhone(p.senderNumber||user().phone);if(![user().phone,...(user().authorizedPhones||[])].includes(senderNumber))throw new Error('O teste aceita somente um número vinculado ao usuário conectado.');const before=adapter.replies?.length||0;const context=adapter.injectIncoming({messageId:randomUUID(),senderNumber,verified:true,isGroup:!!p.isGroup,forwarded:!!p.forwarded,fromMe:false,chatId:`${senderNumber}@s.whatsapp.net`,text:String(p.text||''),type:'text',timestamp:now()});await commands.handle(context);const replies=adapter.replies?.slice(before)||[];return replies.length?{text:replies.map(r=>r.text).join('\n\n'),replies}:{text:'Comando ignorado; confira a autorização.'};},
     windowMinimize:async()=>host('windowMinimize',{}),windowQuit:async()=>host('windowQuit',{})
   };
-  const publicUnprotected=new Set(['snapshot','authStatus','setupOwner','login','recoverPassword','windowMinimize','windowQuit']);
-  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory','searchRecipientStatus','searchResultPage','searchListDeliveryStatus','tracePage','listReminders','reminderHistory','listPendingContacts','automationStatus','resumeAutomation']);
+  const publicUnprotected=new Set(['snapshot','authStatus','setupOwner','login','recoverPassword','windowMinimize','windowQuit','licenseStatus','licenseActivate','licenseRefresh']);
+  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory','searchRecipientStatus','searchResultPage','searchListDeliveryStatus','tracePage','listReminders','reminderHistory','listPendingContacts','automationStatus','resumeAutomation','licenseStatus','licenseActivate','licenseRefresh']);
+  const licensedActions=new Set(['activateCampaign','resumeCampaign','searchSendList','testSearchRecipient','retrySearchDelivery','testReminder','activateReminder','testAlertRecipient','testAlert','retryAlert','importSearchHistory']);
   events.call=async(action,payload={})=>{
     if(closed)throw new Error('Aplicativo encerrado.');if(!Object.hasOwn(actions,action))throw new Error('Ação não autorizada.');
     if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');
     if(maintenance&&!immediate.has(action))throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');
-    const invoke=async()=>{if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');if(maintenance&&!immediate.has(action))throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');return actions[action](payload||{});};
+    const invoke=async()=>{if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');if(maintenance&&!immediate.has(action))throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');if(licensedActions.has(action)||action==='runSearch'&&payload.deliver===true||action==='saveReminder'&&(payload.reminder||payload).enabled===true)assertLicense(action);return actions[action](payload||{});};
     try{const result=await (immediate.has(action)?invoke():enqueue(invoke));broadcast();return result;}catch(error){if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();curatedError(action,error);broadcast();throw error;}
   };
   events.snapshot=snapshot;
   events.systemCall=async(action,payload={})=>{
+    if(action==='licenseChanged'){await stopForLicense();broadcast(true);return licenseStatus();}
     if(action==='networkState'){if(typeof payload.online!=='boolean')throw new Error('Estado da rede inválido.');await alerts.networkStateChanged(payload);return true;}
     if(action==='nativeNotificationResult'){const record=store.getEntity('notifications',payload.id);if(record&&['shown','failed','disabled','unsupported'].includes(payload.status))store.saveNotification({...record,nativeStatus:payload.status,nativeResultAt:now()});broadcast();return true;}
     if(action==='suspend'){for(const c of store.listCampaigns())if(c.state==='active')await scheduler.pause(c.id,'Computador suspenso; retome após conferir a conexão.');broadcast();return true;}
@@ -367,16 +419,21 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(action==='shutdown')return events.shutdown();
     throw new Error('Ação interna não autorizada.');
   };
-  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);await scheduler?.stopAll();await searches?.shutdown();await reminders?.stop();await adapter?.disconnect();commands?.close?.();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
-  adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now});automation=new AutomationControl({store,scheduler,now});
+  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);clearInterval(licenseTimer);licensing.off?.('change',licenseChanged);await licenseStopOperation;await scheduler?.stopAll();await searches?.shutdown();await reminders?.stop();await adapter?.disconnect();commands?.close?.();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
+  adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now,licenseGuard:()=>assertLicense('campaign.send')});automation=new AutomationControl({store,scheduler,now,beforeResume:()=>{assertLicense('automation.resume');store.setSetting('licenseResumeRequired',false);licenseStopLatched=false;}});
   media.auth=auth;templates=new TemplateService({store,auth,media,now});contacts=new ContactIntake({store,auth,now});
-  commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,automationControl:automation,statusProvider:()=>({connection:adapter.status,campaigns:store.getMetrics(),queue:store.getMetrics().pending,search:searches?.getState(store.listEntities('users').find(u=>u.roleId==='role-owner')?.id)?.monitor,alerts:{pending:store.queryEntities('alerts',{status:'pending'}).total,failed:store.queryEntities('alerts',{status:'failed'}).total},reminders:reminders?.status(),automation:automation.getState()}),now});
-  alerts=new AlertService({store,scheduler,adapter,now,isAutomationStopped:()=>automation.isStopped(),secretGet:async key=>host('secretGet',{key}),sendWebhook:async({secret,message,occurrenceId,originalAt,idempotencyKey})=>{if(!channelUrl)throw Object.assign(new Error('Canal independente não configurado.'),{definitive:true});const parsed=new URL(channelUrl);if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw Object.assign(new Error('Canal HTTPS inválido.'),{definitive:true});const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);try{const response=await fetch(parsed.href,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${secret}`,'idempotency-key':idempotencyKey},body:JSON.stringify({message,occurrenceId,originalAt}),signal:controller.signal,redirect:'error'});if(!response.ok)throw Object.assign(new Error('WEBHOOK_HTTP_FAILURE'),{definitive:true,code:'WEBHOOK_HTTP_FAILURE'});return {status:'confirmed',messageId:idempotencyKey};}finally{clearTimeout(timer);}}});
-  searches=new SearchService({store,adapter,authService:auth,now,scheduler,host,mediaManager:media,automationGuard:()=>!automation.isStopped()});
-  reminders=new ReminderService({store,auth,scheduler,adapter,now,isAutomationStopped:()=>automation.isStopped(),onCriticalIncident:incident=>alerts.recordSystemIncident(incident)});
+  commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,automationControl:automation,sendAdminReply:(context,text,options)=>scheduler.runExternalSubmission(()=>controlReplyScope.run({adapter,chatId:context.chatId,text,messageId:options.clientMessageId,context},()=>adapter.reply(context.chatId,text,{...options,replyContext:context})),{manual:true,controlOnly:true}),statusProvider:()=>({connection:adapter.status,license:licenseStatus(),campaigns:store.getMetrics(),queue:store.getMetrics().pending,search:searches?.getState(store.listEntities('users').find(u=>u.roleId==='role-owner')?.id)?.monitor,alerts:{pending:store.queryEntities('alerts',{status:'pending'}).total,failed:store.queryEntities('alerts',{status:'failed'}).total},reminders:reminders?.status(),automation:automation.getState()}),now});
+  alerts=new AlertService({store,scheduler,adapter,now,isAutomationStopped:automationUnavailable,secretGet:async key=>host('secretGet',{key}),sendWebhook:async({secret,message,occurrenceId,originalAt,idempotencyKey})=>{assertLicense('alert.webhook');if(automation.isStopped())throw Object.assign(new Error('Envios automáticos interrompidos.'),{code:'AUTOMATION_STOPPED',definitive:true,submitted:false,safeToRetry:false});if(!channelUrl)throw Object.assign(new Error('Canal independente não configurado.'),{definitive:true});const parsed=new URL(channelUrl);if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw Object.assign(new Error('Canal HTTPS inválido.'),{definitive:true});const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);try{assertLicense('alert.webhook');if(automation.isStopped())throw Object.assign(new Error('Envios automáticos interrompidos.'),{code:'AUTOMATION_STOPPED',definitive:true,submitted:false,safeToRetry:false});const response=await fetch(parsed.href,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${secret}`,'idempotency-key':idempotencyKey},body:JSON.stringify({message,occurrenceId,originalAt}),signal:controller.signal,redirect:'error'});if(!response.ok)throw Object.assign(new Error('WEBHOOK_HTTP_FAILURE'),{definitive:true,code:'WEBHOOK_HTTP_FAILURE'});return {status:'confirmed',messageId:idempotencyKey};}finally{clearTimeout(timer);}}});
+  searches=new SearchService({store,adapter,authService:auth,now,scheduler,host,mediaManager:media,automationGuard:()=>!automationUnavailable()});
+  reminders=new ReminderService({store,auth,scheduler,adapter,now,isAutomationStopped:automationUnavailable,onCriticalIncident:incident=>alerts.recordSystemIncident(incident)});
   automation.register('search',()=>searches.stopPending());automation.register('alerts',()=>alerts.stopPending());automation.register('reminders',()=>reminders.stopAll({source:'global-stop'}));
-  automation.on('change',()=>broadcast());reminders.on('change',()=>broadcast());contacts.on('change',()=>broadcast());
+  automation.on('change',()=>{if(!automation.isStopped()&&licenseStatus().allowed&&!store.getSetting('licenseResumeRequired',false)&&licenseCapturePaused&&!maintenance){licenseCapturePaused=false;searches.resumeCapture();}broadcast();});reminders.on('change',()=>broadcast());contacts.on('change',()=>broadcast());
   contacts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});
+  if(!licenseStatus().allowed||store.getSetting('licenseResumeRequired',false))await stopForLicense(licenseStatus(),true);
+  let lastLicenseFingerprint='';
+  const licenseChanged=()=>{if(closed)return;const status=licenseStatus();void Promise.resolve(stopForLicense(status)).catch(()=>{});const fingerprint=JSON.stringify([status.allowed,status.status,status.plan,status.expiresAt,status.offlineUntil,status.reasonCode,status.autoResumeRequired,Math.ceil((status.remainingMs||0)/60000)]);if(fingerprint!==lastLicenseFingerprint){lastLicenseFingerprint=fingerprint;broadcast(true);}};
+  licensing.on?.('change',licenseChanged);
+  licenseTimer=setInterval(licenseChanged,1000);licenseTimer.unref?.();
   reminders.start();
   searches.on('change',()=>broadcast());searches.start();
   alerts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});alerts.on('change',()=>broadcast());scheduler.on('change',()=>broadcast());bindAdapter();alerts.start();scheduler.start();

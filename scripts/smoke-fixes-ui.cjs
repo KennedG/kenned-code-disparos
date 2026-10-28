@@ -15,7 +15,7 @@ const { _electron, expect } = require('@playwright/test');
   const errors = [];
   let app, page;
   try {
-    app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', '--disable-gpu', process.env.MEGA_APP_PATH || '.'], env: { ...process.env, MEGA_DATA_DIR: dir }, timeout: 20000 });
+    app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', '--disable-gpu', ...(process.env.MEGA_PROXY_TEST ? ['--proxy-server=http://proxy:8080'] : []), process.env.MEGA_APP_PATH || '.'], env: { ...process.env, MEGA_DATA_DIR: dir }, timeout: 20000 });
     await expect.poll(() => { page = app.windows().find(w => /\/ui\/index\.html$/.test(w.url())); return !!page; }, { timeout: 20000 }).toBe(true);
     page.on('pageerror', error => errors.push(error.message));
     page.on('dialog', dialog => dialog.accept());
@@ -28,14 +28,14 @@ const { _electron, expect } = require('@playwright/test');
     const navigate = async id => { await page.locator('#navigation [data-id="' + id + '"]').click(); };
     const tabs = async id => { await page.locator('[data-action=buscas-tab][data-id="' + id + '"]').click(); };
     const saveBuscas = async () => { await page.locator('#buscas-settings-form [type=submit]').click(); await expect.poll(async () => (await rpc('searchesState')).settings.enabled).toBe(true); };
-    await page.getByRole('heading', { name: 'Cadastre o dono' }).waitFor();
+    await page.getByRole('heading', { name: 'Cadastre o dono' }).waitFor();await expect.poll(async()=>{const state=await page.evaluate(()=>window.mega.call('licenseStatus'));return state?.allowed===true;},{timeout:30000}).toBe(true);
     await expect(page.locator('#auth-root')).toContainText('KENNED CODE DISPAROS');
     assert.equal(await page.title(), 'Kenned Code Disparos');
     assert.equal(await app.evaluate(({ app }) => app.getName()), 'Kenned Code Disparos');
     for (const [key, value] of Object.entries({ name: 'Dono teste Kenned', username: 'dono.kenned', password: 'SenhaKenned-Teste-2026', confirmPassword: 'SenhaKenned-Teste-2026', phone: '5511999999999' })) await page.locator('#auth-form [name=' + key + ']').fill(value);
     await page.locator('#auth-form [type=submit]').click();
     await page.getByRole('button', { name: 'Guardei os códigos' }).click();
-    await page.getByRole('heading', { name: 'Tudo sob controle' }).waitFor();
+    await page.getByRole('heading', { name: 'Tudo sob controle' }).waitFor();await page.evaluate(async()=>{let r=await window.mega.call('licenseRefresh');if(r?.error||r?.allowed!==true)throw new Error(r?.error||'Real licensing service did not authorize test device');r=await window.mega.call('resumeAutomation');if(r?.error)throw new Error(r.error);});
     await expect(page.locator('#simulation-banner')).toBeVisible();
     await expect(page.locator('#simulation-banner')).toContainText('SIMULAÇÃO — DADOS FICTÍCIOS');
     await expect.poll(async () => (await snapshot()).connection.state).toBe('connected');
@@ -133,6 +133,9 @@ const { _electron, expect } = require('@playwright/test');
     assert.deepEqual(errors, []);
     console.log('PASS: real mode has empty real data, no simulation banner or selectors; simulation data and settings restored separately.');
     console.log('Kenned Code Disparos corrections: real Electron UI and SQLite worker verified with simulation only. No real WhatsApp or physical Windows test performed.');
+  } catch (error) {
+    if (page && !page.isClosed()) { console.error('Isolated UI failure page:', (await page.locator('body').innerText()).slice(0,1800)); await page.screenshot({path:path.join(shots,'failed-fixes-smoke.png'),fullPage:true}).catch(()=>{}); }
+    throw error;
   } finally {
     if (app) await app.close();
     if (process.env.MEGA_KEEP_TEST_DATA) console.log('Test data:', dir);

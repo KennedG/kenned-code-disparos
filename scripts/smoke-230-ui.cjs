@@ -24,14 +24,14 @@ const { MediaManager } = require('../src/core/media.cjs');
   const nav = async id => { await page.locator('#navigation [data-id="' + id + '"]').click(); };
   const tab = async id => { await page.locator('[data-action=buscas-tab][data-id="' + id + '"]').click(); };
   const launch = async () => {
-    app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', '--disable-gpu', process.env.MEGA_APP_PATH || '.'], env: { ...process.env, MEGA_DATA_DIR: dir }, timeout: 20000 });
+    app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', '--disable-gpu', ...(process.env.MEGA_PROXY_TEST ? ['--proxy-server=http://proxy:8080'] : []), process.env.MEGA_APP_PATH || '.'], env: { ...process.env, MEGA_DATA_DIR: dir }, timeout: 20000 });
     await expect.poll(() => { page = app.windows().find(w => /\/ui\/index\.html$/.test(w.url())); return !!page; }, { timeout: 20000 }).toBe(true);
     page.on('pageerror', error => errors.push(error.message)); page.on('dialog', dialog => dialog.accept());
   };
   try {
-    await launch(); await page.getByRole('heading', { name: 'Cadastre o dono' }).waitFor();
+    await launch(); await page.getByRole('heading', { name: 'Cadastre o dono' }).waitFor();await expect.poll(async()=>{const state=await page.evaluate(()=>window.mega.call('licenseStatus'));return state?.allowed===true;},{timeout:30000}).toBe(true);
     for (const [name, value] of Object.entries({ name: 'Dono interface 2.3', ...credentials, confirmPassword: credentials.password, phone: '5562999990001' })) await page.locator('#auth-form [name="' + name + '"]').fill(value);
-    await page.locator('#auth-form [type=submit]').click(); await page.getByRole('button', { name: 'Guardei os códigos' }).click(); await page.getByRole('heading', { name: 'Tudo sob controle' }).waitFor();
+    await page.locator('#auth-form [type=submit]').click(); await page.getByRole('button', { name: 'Guardei os códigos' }).click(); await page.getByRole('heading', { name: 'Tudo sob controle' }).waitFor();await page.evaluate(async()=>{let r=await window.mega.call('licenseRefresh');if(r?.error||r?.allowed!==true)throw new Error(r?.error||'Real licensing service did not authorize test device');r=await window.mega.call('resumeAutomation');if(r?.error)throw new Error(r.error);});
     assert.equal(await page.title(), 'Kenned Code Disparos'); const initial = await snap(); assert.equal(initial.groups.length, 15); assert.equal(initial.media.length, 3);
 
     await nav('buscas'); await tab('setup'); await page.locator('#buscas-settings-form [name=enabled]').check();

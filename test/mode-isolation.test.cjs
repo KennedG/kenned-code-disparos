@@ -1,4 +1,5 @@
 'use strict';
+const {createLicenseFixture}=require('./fixtures/license.cjs');
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {DatabaseSync}=require('node:sqlite');
@@ -46,7 +47,7 @@ test('legacy migration identifies explicit simulated destinations while preservi
 });
 
 test('backend mode switching removes all fictitious screens and selectors and keeps legitimate users and real registrations',async t=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kenned-backend-mode-'));const service=await createAppService({dir,runtimePlatform:'linux',host:async()=>({canceled:true,nativeStatus:'unsupported',soundStatus:'disabled'})});t.after(async()=>{await service.shutdown();fs.rmSync(dir,{recursive:true,force:true});});
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kenned-backend-mode-'));const service=await createAppService({licenseService:createLicenseFixture(),dir,runtimePlatform:'linux',host:async()=>({canceled:true,nativeStatus:'unsupported',soundStatus:'disabled'})});t.after(async()=>{await service.shutdown();fs.rmSync(dir,{recursive:true,force:true});});
   await service.call('setupOwner',{name:'Dono',username:'dono',password:'Senha-Segura-Teste-2026',phone});const simulation=service.snapshot();assert.equal(simulation.storageMode,'simulated');assert.equal(simulation.groups.length,15);
   await service.call('saveContact',{name:'Contato criado na simulação',phone});await service.call('saveAlertRecipient',{name:'Fictício',phone});
   await service.call('saveSettings',{settings:{integrationMode:'whatsapp',unofficialAcknowledged:true}});const real=service.snapshot();assert.equal(real.storageMode,'whatsapp');assert.deepEqual(real.groups,[]);assert.deepEqual(real.campaigns,[]);assert.deepEqual(real.contacts,[]);assert.deepEqual(real.alertRecipients,[]);assert.equal(real.metrics.confirmed,0);assert.equal(real.auth.user.name,'Dono');assert.equal(real.buscas.groups.length,0);

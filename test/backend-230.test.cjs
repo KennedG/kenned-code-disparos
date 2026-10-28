@@ -1,4 +1,5 @@
 'use strict';
+const {createLicenseFixture}=require('./fixtures/license.cjs');
 
 // Independent service-level integration checks. All transports here are the
 // explicitly isolated simulation adapter; these are not live WhatsApp tests.
@@ -24,7 +25,7 @@ async function fixture(t) {
     if (action === 'localAlert') { notices.push(payload); return { nativeStatus: 'unsupported', soundStatus: 'disabled' }; }
     return { canceled: true };
   };
-  const open = async () => { service = await createAppService({ dir, runtimePlatform: 'linux', now: () => clock, host }); return service; };
+  const open = async () => { service = await createAppService({ licenseService:createLicenseFixture(), dir, runtimePlatform: 'linux', now: () => clock, host }); return service; };
   const close = async () => { if (service) { await service.shutdown(); service = null; } };
   t.after(async () => { await close(); fs.rmSync(dir, { recursive: true, force: true }); });
   await open(); const result = await service.call('setupOwner', OWNER);

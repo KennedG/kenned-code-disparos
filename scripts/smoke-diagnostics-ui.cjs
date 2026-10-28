@@ -11,12 +11,12 @@ const {createStore}=require('../src/core/store.cjs');
   for(const [index,stage,code,level]of [[0,'transport.received','WA_EVENT_RECEIVED','info'],[1,'buscas.authorized','SEARCH_AUTHORIZED','info'],[2,'transport.failed','WA_SUBMISSION_ERROR_403','error']])store.addDiagnostic({id:'trace-ui-'+index,traceId,at:at+index,createdAt:at+index,stage,code,level,description:stage==='transport.failed'?'A integração recusou a submissão.':'Etapa registrada.',targetId:'5562999990101@s.whatsapp.net',...(level==='error'?{technicalError:'Protocolo 403; token=segredo_controlado',guidance:'Verifique a sessão e envie um novo comando após corrigir a conexão.'}:{})});
   store.close();let app,page;const errors=[];
   try{
-    app=await _electron.launch({executablePath:require('electron'),args:['--no-sandbox','--disable-gpu',process.env.MEGA_APP_PATH||'.'],env:{...process.env,MEGA_DATA_DIR:dir},timeout:30000});
+    app=await _electron.launch({executablePath:require('electron'),args:['--no-sandbox','--disable-gpu',...(process.env.MEGA_PROXY_TEST?['--proxy-server=http://proxy:8080']:[]),process.env.MEGA_APP_PATH||'.'],env:{...process.env,MEGA_DATA_DIR:dir},timeout:30000});
     await expect.poll(()=>{page=app.windows().find(w=>/\/ui\/index\.html$/.test(w.url()));return !!page;},{timeout:20000}).toBe(true);
     page.on('pageerror',error=>errors.push(error.message));
-    await page.getByRole('heading',{name:'Cadastre o dono'}).waitFor();
+    await page.getByRole('heading',{name:'Cadastre o dono'}).waitFor();await expect.poll(async()=>{const state=await page.evaluate(()=>window.mega.call('licenseStatus'));return state?.allowed===true;},{timeout:30000}).toBe(true);
     for(const [name,value]of Object.entries({name:'Dono teste diagnóstico',username:'owner-trace-ui',password:'Senha-Diagnostico-231-Segura!',confirmPassword:'Senha-Diagnostico-231-Segura!'}))await page.locator('#auth-form [name="'+name+'"]').fill(value);
-    await page.locator('#auth-form [type=submit]').click();await page.getByRole('button',{name:'Guardei os códigos'}).click();
+    await page.locator('#auth-form [type=submit]').click();await page.getByRole('button',{name:'Guardei os códigos'}).click();await page.evaluate(async()=>{let r=await window.mega.call('licenseRefresh');if(r?.error||r?.allowed!==true)throw new Error(r?.error||'Real licensing service did not authorize test device');r=await window.mega.call('resumeAutomation');if(r?.error)throw new Error(r.error);});
     await page.locator('#navigation [data-id=diagnostics]').click();await expect(page.locator('[data-page-filter=traceId]')).toBeVisible();
     await page.locator('[data-page-filter=traceId]').fill(traceId);await page.locator('[data-page-filter=traceId]').dispatchEvent('change');
     await expect(page.locator('#main [data-action=view-trace]')).toHaveCount(3);

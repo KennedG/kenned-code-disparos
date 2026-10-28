@@ -2,7 +2,8 @@
 
 const {parentPort,workerData}=require('node:worker_threads');
 const {createAppService}=require('./service.cjs');
-let service,sequence=0;const pending=new Map();
+const {createLicenseWorkerProxy}=require('../core/license-worker.cjs');
+let service,licensing,sequence=0;const pending=new Map();
 function host(action,payload={}){
   const id=++sequence;return new Promise((resolve,reject)=>{pending.set(id,{resolve,reject});parentPort.postMessage({type:'hostCall',id,action,payload});});
 }
@@ -12,9 +13,14 @@ const safeStorage={
   decryptString:value=>host('decryptString',{value:Buffer.from(value)})
 };
 parentPort.on('message',async message=>{
+  if(message?.type==='licenseChanged'){
+    licensing?.setStatus(message.status);
+    if(service)await service.systemCall('licenseChanged').catch(()=>{});
+    return;
+  }
   if(message?.type==='hostResult'){
     const request=pending.get(message.id);if(!request)return;pending.delete(message.id);
-    if(message.error)request.reject(new Error(message.error));else request.resolve(message.result);return;
+    if(message.error)request.reject(Object.assign(new Error(message.error),{code:message.code}));else request.resolve(message.result);return;
   }
   if(message?.type!=='call')return;
   try{
@@ -24,7 +30,8 @@ parentPort.on('message',async message=>{
   }catch(error){parentPort.postMessage({type:'result',id:message.id,error:error.message||'Não foi possível concluir a operação.',code:error.code});}
 });
 (async()=>{
-  service=await createAppService({dir:workerData.dir,version:workerData.version,runtimePlatform:workerData.runtimePlatform,safeStorage,host});
+  licensing=createLicenseWorkerProxy(host);await licensing.initialize();
+  service=await createAppService({dir:workerData.dir,version:workerData.version,runtimePlatform:workerData.runtimePlatform,safeStorage,host,licenseService:licensing});
   service.on('update',snapshot=>parentPort.postMessage({type:'event',name:'update',payload:snapshot}));
   service.on('nativeEvent',event=>parentPort.postMessage({type:'event',name:'nativeEvent',payload:event}));
   parentPort.postMessage({type:'ready',payload:await service.systemCall('settings')});

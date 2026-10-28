@@ -5,9 +5,9 @@ const { EventEmitter } = require('node:events');
 // This latch is deliberately independent of campaign state. Pausing a campaign
 // must not accidentally reopen alerts, reminders or a queued private delivery.
 class AutomationControl extends EventEmitter {
-  constructor({ store, scheduler, now = () => Date.now() }) {
+  constructor({ store, scheduler, now = () => Date.now(), beforeResume = () => {} }) {
     super();
-    Object.assign(this, { store, scheduler, now });
+    Object.assign(this, { store, scheduler, now, beforeResume });
     this.handlers = new Map();
     this.operation = null;
     this.syncMode();
@@ -73,6 +73,7 @@ class AutomationControl extends EventEmitter {
   resume({ actorId = null, source = 'app' } = {}) {
     if (this.operation) throw Object.assign(new Error('Aguarde a conclusão da interrupção antes de retomar o sistema.'), { code: 'AUTOMATION_STOPPING' });
     if (this.store.persistenceFailed || this.scheduler?.persistenceFailed) throw Object.assign(new Error('Corrija a falha de armazenamento e reinicie antes de retomar.'), { code: 'STORAGE_UNAVAILABLE' });
+    this.beforeResume();
     const state = { ...this.state, stopped: false, resumedAt: this.now(), resumedBy: actorId, resumeSource: source };
     // Persist before reopening the gate. Failed writes cannot reopen processing.
     this.store.setSetting('automationState', state);

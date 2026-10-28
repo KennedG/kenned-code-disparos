@@ -1,4 +1,5 @@
 'use strict';
+const {createLicenseFixture}=require('./fixtures/license.cjs');
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {createAppService}=require('../src/backend/service.cjs');
@@ -11,7 +12,7 @@ const searchGrants=Object.fromEntries(SEARCH_PERMISSIONS.map(permission=>[permis
 async function fixture(t,{prepare}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mega-search-backend-'));
   if(prepare){const store=await createStore(dir);seed(store);await prepare(store);store.close();}
-  const service=await createAppService({dir,runtimePlatform:'linux',host:async()=>({canceled:true,nativeStatus:'unsupported',soundStatus:'disabled'})});
+  const service=await createAppService({licenseService:createLicenseFixture(),dir,runtimePlatform:'linux',host:async()=>({canceled:true,nativeStatus:'unsupported',soundStatus:'disabled'})});
   t.after(async()=>{await service.shutdown();fs.rmSync(dir,{recursive:true,force:true});});
   return {dir,service};
 }

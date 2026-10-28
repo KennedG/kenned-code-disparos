@@ -91,7 +91,7 @@ class SimulatedAdapter extends EventEmitter {
     while (this.automaticMessages.size > 10000) this.automaticMessages.delete(this.automaticMessages.values().next().value);
   }
 
-  async send(groupId, item, media) {
+  async send(groupId, item, media, {beforeSubmit} = {}) {
     if (this.status.state !== 'connected') {
       throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     }
@@ -111,6 +111,7 @@ class SimulatedAdapter extends EventEmitter {
       throw Object.assign(new Error('Falha temporária simulada antes do envio.'), { safeToRetry: true });
     }
     const messageId = item.clientMessageId || `SIM-${randomUUID()}`;
+    this._beforeSubmit(beforeSubmit);
     this._markAutomatic(messageId);
     this.sent.push({ groupId, item: { ...item }, mediaId: media?.id, messageId, at: new Date().toISOString(), simulation: true });
     if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);

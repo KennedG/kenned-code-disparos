@@ -7,13 +7,13 @@ const {_electron,expect}=require('@playwright/test');
   const preStore=await createStore(dir);preStore.setSetting('integrationMode','simulated');await new MediaManager(preStore).importFile(path.resolve('assets/icon.png'));preStore.close();
   let app;const errors=[];
   try{
-    app=await _electron.launch({executablePath:require('electron'),args:['--no-sandbox','--disable-gpu',process.env.MEGA_APP_PATH||'.'],env:{...process.env,MEGA_DATA_DIR:dir},timeout:20000});
+    app=await _electron.launch({executablePath:require('electron'),args:['--no-sandbox','--disable-gpu',...(process.env.MEGA_PROXY_TEST?['--proxy-server=http://proxy:8080']:[]),process.env.MEGA_APP_PATH||'.'],env:{...process.env,MEGA_DATA_DIR:dir},timeout:20000});
     let page;await expect.poll(()=>{page=app.windows().find(w=>/\/ui\/index\.html$/.test(w.url()));return !!page;},{timeout:20000}).toBe(true);page.on('pageerror',error=>errors.push(error.message));page.on('dialog',dialog=>dialog.accept());
-    await page.getByRole('heading',{name:'Cadastre o dono'}).waitFor();
+    await page.getByRole('heading',{name:'Cadastre o dono'}).waitFor();await expect.poll(async()=>{const state=await page.evaluate(()=>window.mega.call('licenseStatus'));return state?.allowed===true;},{timeout:30000}).toBe(true);
     const locked=await page.evaluate(()=>window.mega.call('snapshot'));assert.equal(locked.campaigns.length,0);assert.equal(locked.auth.setupRequired,true);
     await page.locator('#auth-form [name=name]').fill('Dono de teste');await page.locator('#auth-form [name=username]').fill('dono.teste');await page.locator('#auth-form [name=password]').fill('SenhaSegura-de-Teste-2026');await page.locator('#auth-form [name=confirmPassword]').fill('SenhaSegura-de-Teste-2026');await page.locator('#auth-form [name=phone]').fill('5511999999999');
     await page.locator('#auth-form [type=submit]').click();await page.getByRole('heading',{name:'Guarde seus códigos de recuperação'}).waitFor();assert.equal(await page.locator('.secret-codes').count(),1);await page.getByRole('button',{name:'Guardei os códigos'}).click();
-    await page.getByRole('heading',{name:'Tudo sob controle'}).waitFor();
+    await page.getByRole('heading',{name:'Tudo sob controle'}).waitFor();await page.evaluate(async()=>{let r=await window.mega.call('licenseRefresh');if(r?.error||r?.allowed!==true)throw new Error(r?.error||'Real licensing service did not authorize test device');r=await window.mega.call('resumeAutomation');if(r?.error)throw new Error(r.error);});
     const snap=()=>page.evaluate(()=>window.mega.call('snapshot'));
     const initial=await snap();assert.equal(initial.connection.mode,'simulated');assert.equal(initial.campaigns[0].state,'draft');assert.equal(initial.groups.length,15);assert.equal(initial.metrics.selectedGroups,15);
     await page.screenshot({path:path.join(screenshotDir,'painel.png')});

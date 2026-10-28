@@ -85,11 +85,12 @@ function defaultSleep(ms, signal) {
 }
 
 class Scheduler extends EventEmitter {
-  constructor({ store, adapter, now = () => Date.now(), sleep = defaultSleep }) {
+  constructor({ store, adapter, now = () => Date.now(), sleep = defaultSleep, licenseGuard = () => {} }) {
     super();
     this.store = store;
     this.now = now;
     this.sleep = sleep;
+    this.licenseGuard = licenseGuard;
     this.timer = null;
     this.worker = null;
     this.busy = false;
@@ -284,6 +285,7 @@ class Scheduler extends EventEmitter {
 
   async activate(id) {
     if (this.closed) throw new Error('O agendador está encerrado.');
+    this.licenseGuard();
     if (this._automationStopped()) throw this._automationError();
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
     if (this.persistenceFailed) throw new Error('O agendador foi bloqueado após uma falha de persistência. Reinicie o aplicativo e confira o histórico.');
@@ -371,9 +373,10 @@ class Scheduler extends EventEmitter {
   getInFlightCount() { return this.externalInFlight + this.campaignInFlight; }
   getCampaignInFlightCount() { return this.campaignInFlight; }
 
-  runExternalSubmission(task, { manual = false } = {}) {
+  runExternalSubmission(task, { manual = false, controlOnly = false } = {}) {
     // All private alerts and search results share this queue. Holding the
     // scheduler immediately prevents a new campaign round taking their slot.
+    try{if(!controlOnly)this.licenseGuard();}catch(error){return Promise.reject(error);}
     if (!manual && this._automationStopped()) return Promise.reject(this._automationError());
     const release = this.holdSubmissions();
     let resolve, reject;
@@ -385,6 +388,7 @@ class Scheduler extends EventEmitter {
       await this.waitForIdle();
       if (entry.cancelled) return;
       if (this.closed || this.persistenceFailed || this.store.persistenceFailed) throw new Error('Envios externos bloqueados: processamento indisponível.');
+      if(!controlOnly)this.licenseGuard();
       if (!entry.manual && this._automationStopped()) throw this._automationError();
       entry.started = true;
       this.externalInFlight++;
@@ -398,6 +402,7 @@ class Scheduler extends EventEmitter {
 
   tick() {
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
+    try{this.licenseGuard();}catch{return Promise.resolve();}
     if (this.closed || this.persistenceFailed || this.submissionHolds || this._automationStopped()) return Promise.resolve();
     // Lock before invoking _tick: an adapter may synchronously emit an event
     // that calls tick again, before the worker promise has been assigned.
@@ -435,6 +440,7 @@ class Scheduler extends EventEmitter {
   }
 
   _maySend(campaignId, groupId) {
+    try{this.licenseGuard();}catch{return false;}
     if (this.store.persistenceFailed) { this.blockOnPersistenceFailure(); return false; }
     const campaign = this.store.getCampaign(campaignId);
     const group = this.store.getGroup(groupId);
@@ -469,7 +475,7 @@ class Scheduler extends EventEmitter {
       try {
         this.campaignInFlight++;
         let result;
-        try { result = await this.adapter.send(job.groupId, { ...job.itemSnapshot, clientMessageId: job.messageId }, job.itemSnapshot.mediaId ? this.store.getMedia(job.itemSnapshot.mediaId) : null); }
+        try { result = await this.adapter.send(job.groupId, { ...job.itemSnapshot, clientMessageId: job.messageId }, job.itemSnapshot.mediaId ? this.store.getMedia(job.itemSnapshot.mediaId) : null, {beforeSubmit:()=>{this.licenseGuard();if(signal.aborted||!this._maySend(job.campaignId,job.groupId))throw Object.assign(new Error('Campanha interrompida antes da submissão.'),{code:'CAMPAIGN_SUBMISSION_BLOCKED',definitive:true,submitted:false,safeToRetry:false});}}); }
         finally { this.campaignInFlight--; }
         const confirmed = result?.status === 'confirmed' || this.receipts.has(result?.messageId || job.messageId);
         this._persist('updateJob', job.id, {

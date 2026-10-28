@@ -1,4 +1,5 @@
 'use strict';
+const {createLicenseFixture}=require('./fixtures/license.cjs');
 
 // Production backend dispatcher, SQLite, Auth, Commands, Search, Alerts and
 // WhatsAppAdapter. Only the socket and OS encryption facade are controlled.
@@ -40,6 +41,7 @@ async function fixture(t) {
   const originalConnect = WhatsAppAdapter.prototype.connect;
   const safeStorage = { isEncryptionAvailable: () => true, encryptString: text => Buffer.from(text), decryptString: bytes => bytes.toString() };
   let service, socket, offset = 0, lookupDisabled = false, failure = null;
+  const license = createLicenseFixture();
   const adapters = [], submissions = [], local = [], lookups = [];
   const library = {
     BufferJSON: { replacer: (_key, value) => value, reviver: (_key, value) => value },
@@ -76,7 +78,7 @@ async function fixture(t) {
     return { canceled: true };
   };
   const open = async () => {
-    service = await createAppService({ dir, safeStorage, host, runtimePlatform: 'win32', now: () => Date.now() + offset });
+    service = await createAppService({ licenseService:license, dir, safeStorage, host, runtimePlatform: 'win32', now: () => Date.now() + offset });
     return service;
   };
   const close = async () => { if (service) { await service.shutdown(); service = null; } };
@@ -94,7 +96,7 @@ async function fixture(t) {
   const owner = (await service.call('setupOwner', { name: 'Dono de teste', username: 'dono-integrado', phone: PERSONAL, password: PASSWORD })).user;
   await service.call('saveSearchSettings', { settings: { enabled: true, monitoredGroupIds: [GROUP], commandGroupIds: [], privateCommandsEnabled: true, commandPrivateNumbers: [], userRateLimit: { max: 100, windowSeconds: 60 } } });
   await connect();
-  return { dir, owner, submissions, local, lookups, emit, connect, close, open, history, diagnostics, searchFinished,
+  return { dir, owner, license, submissions, local, lookups, emit, connect, close, open, history, diagnostics, searchFinished,
     get service() { return service; }, get socket() { return socket; }, get adapter() { return adapters.at(-1); },
     disableLookup(value = true) { lookupDisabled = value; }, failSending(error) { failure = error; } };
 }
@@ -291,4 +293,49 @@ test('deactivated user linked to a responsible is excluded consistently from ale
   await f.service.call('updateUser', { id: user.id, active: false });
   await assert.rejects(f.service.call('searchListPreview', { runId: result.runId, selection: 'all', format: 'excel', recipientIds: [recipient.id] }), error => ['SEARCH_RECIPIENT_MISSING', 'SEARCH_RECIPIENT_INVALID'].includes(error.code));
   assert.equal(f.submissions.length, 0);
+});
+
+
+test('licence expiration at the actual adapter submission boundary blocks private alert while authorised control replies remain available', async t => {
+  const f = await fixture(t);
+  const recipient = await f.service.call('saveAlertRecipient', { name: 'Destinatário isolado', phone: PERSONAL });
+  let prepared = false;
+  const expire = record => {
+    if (record.code !== 'WA_SUBMISSION_PREPARED' || prepared) return;
+    prepared = true;
+    f.license.set({ allowed: false, status: 'expired', reasonCode: 'LICENSE_EXPIRED', reason: 'A licença venceu durante a resolução do destinatário.', expiresAt: Date.now()-1 });
+  };
+  f.adapter.on('transportDiagnostic', expire);
+  const result = await f.service.call('testAlertRecipient', { id: recipient.id });
+  f.adapter.off('transportDiagnostic', expire);
+  assert.equal(prepared, true);
+  assert.equal(f.submissions.length, 0, 'A licence check before socket.sendMessage must block the prepared message');
+  assert.ok(['failed','cancelled','uncertain'].includes(result.status));
+  assert.equal(f.service.snapshot().license.allowed, false);
+  assert.equal(f.service.snapshot().automation.stopped, true);
+  const diagnostic = await f.diagnostics();
+  assert.ok(diagnostic.items.some(row => row.stage === 'license.blocked' && row.code === 'LICENSE_EXPIRED'));
+  const {reply} = await adminReply(f, '!mega ajuda');
+  assert.equal(reply.target, `${PERSONAL}@s.whatsapp.net`);
+  assert.match(reply.content.text, /!mega/);
+  await assert.rejects(f.service.call('resumeAutomation'), error => error.code === 'LICENSE_EXPIRED');
+});
+
+
+test('expired-licence administrative reply scope cannot authorise an unrelated nested automatic submission', async t => {
+  const f = await fixture(t);
+  f.license.set({ allowed:false, status:'expired', reasonCode:'LICENSE_EXPIRED', reason:'Licença expirada.', expiresAt:Date.now()-1 });
+  await f.service.systemCall('licenseChanged');
+  let nestedError = null;
+  const nested = record => {
+    if(record.code !== 'WA_SUBMISSION_PREPARED') return;
+    try { const result=f.adapter.sendPrivate(PERSONAL,'Este alerta não pode herdar a permissão da resposta administrativa.',{clientMessageId:'UNRELATED-NESTED-AUTOMATIC'});result?.catch(error=>{nestedError=error;}); }
+    catch(error) { nestedError=error; }
+  };
+  f.adapter.on('transportDiagnostic',nested);
+  const {reply}=await adminReply(f,'!mega status');
+  f.adapter.off('transportDiagnostic',nested);
+  assert.equal(reply.target,`${PERSONAL}@s.whatsapp.net`);
+  assert.equal(f.submissions.length,1);
+  assert.equal(nestedError?.code,'LICENSE_EXPIRED');
 });

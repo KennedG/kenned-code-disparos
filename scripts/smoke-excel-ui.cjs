@@ -9,14 +9,14 @@ const ExcelJS = require('exceljs');
   fs.mkdirSync(shots, { recursive: true });
   let app, page; const errors = [];
   try {
-    app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', '--disable-gpu', process.env.MEGA_APP_PATH || '.'], env: { ...process.env, MEGA_DATA_DIR: dir }, timeout: 30000 });
+    app = await _electron.launch({ executablePath: require('electron'), args: ['--no-sandbox', '--disable-gpu', ...(process.env.MEGA_PROXY_TEST ? ['--proxy-server=http://proxy:8080'] : []), process.env.MEGA_APP_PATH || '.'], env: { ...process.env, MEGA_DATA_DIR: dir }, timeout: 30000 });
     await expect.poll(() => { page = app.windows().find(w => /\/ui\/index\.html$/.test(w.url())); return !!page; }, { timeout: 30000 }).toBe(true);
     page.on('pageerror', error => errors.push(error.message)); page.on('dialog', dialog => dialog.accept());
     const rpc = async (action, payload) => { const value = await page.evaluate(({ action, payload }) => window.mega.call(action, payload), { action, payload }); if (value?.error) throw new Error(action + ': ' + value.error); return value; };
-    await page.getByRole('heading', { name: 'Cadastre o dono' }).waitFor();
+    await page.getByRole('heading', { name: 'Cadastre o dono' }).waitFor();await expect.poll(async()=>{const state=await page.evaluate(()=>window.mega.call('licenseStatus'));return state?.allowed===true;},{timeout:30000}).toBe(true);
     for (const [key, value] of Object.entries({ name: 'Dono Excel', username: 'dono.excel', password: 'SenhaExcel-Teste-2026', confirmPassword: 'SenhaExcel-Teste-2026', phone: '5511999999001' })) await page.locator('#auth-form [name=' + key + ']').fill(value);
     await page.locator('#auth-form [type=submit]').click(); await page.getByRole('button', { name: 'Guardei os códigos' }).click();
-    await page.getByRole('heading', { name: 'Tudo sob controle' }).waitFor();
+    await page.getByRole('heading', { name: 'Tudo sob controle' }).waitFor();await page.evaluate(async()=>{let r=await window.mega.call('licenseRefresh');if(r?.error||r?.allowed!==true)throw new Error(r?.error||'Real licensing service did not authorize test device');r=await window.mega.call('resumeAutomation');if(r?.error)throw new Error(r.error);});
     const first = await rpc('snapshot'), ownerId = first.auth.user.id, groupId = first.groups[0].id;
     await rpc('saveSearchSettings', { settings: { enabled: true, monitoredGroupIds: [groupId], maxAgeEnabled: true, maxAgeValue: 2, maxAgeUnit: 'hours', recipientMode: 'owner', ownerRecipientUserId: ownerId } });
     const now = Date.now(), messages = Array.from({ length: 121 }, (_, i) => ({ groupId, messageId: 'excel-offer-' + i, senderNumber: '5511' + String(970000000 + i), supplierName: 'Fornecedor ' + i, timestamp: now - i * 1000, text: 'iPhone 15 Pro Max 256GB Azul seminovo bateria 85% R$ ' + (3000 + i).toLocaleString('pt-BR', { minimumFractionDigits: 2 }) + ' à vista' }));
