@@ -499,7 +499,7 @@ class CommandController {
     } else {
       this._assert('campaign.start', current);
       this._validateActivation(current);
-      await this.scheduler.activate(current.id);
+      await this.scheduler.activate(current.id,{relative:true});
     }
     this._audit(request.operation === 'edit' ? 'campaign.edit-and-start' : 'campaign.start', current.id);
     const session = this.sessions.get(sender);

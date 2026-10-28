@@ -37,7 +37,7 @@
   }
   function renderTiming(campaign) {
     const value = timing(campaign);
-    return `<div class="campaign-timing"><span><small>Última rodada prevista</small><strong>${escape(format(value.last))}</strong></span><span><small>Próxima rodada</small><strong>${escape(format(value.next))}</strong></span></div><span class="table-subtitle recovery-status">${escape(value.status)}</span>${value.authorizedAt ? `<span class="table-subtitle">Iniciada: ${escape(format(value.authorizedAt))} · ${escape(value.authorizedTimezone || 'fuso do computador')}</span>` : ''}`;
+    return `<div class="campaign-timing"><span><small>Última rodada prevista</small><strong>${escape(format(value.last))}</strong></span><span><small>Próxima rodada</small><strong>${escape(format(value.next))}</strong></span></div><span class="table-subtitle recovery-status">${escape(value.status)}</span>${campaign?.roundAnchorAt ? `<span class="table-subtitle">Intervalo contado desde: ${escape(format(campaign.roundAnchorAt))}</span>` : ''}${value.authorizedAt ? `<span class="table-subtitle">Iniciada: ${escape(format(value.authorizedAt))} · ${escape(value.authorizedTimezone || 'fuso do computador')}</span>` : ''}`;
   }
   function activeIncidents(snapshot) {
     const d = snapshot || {}, mode = d.storageMode || d.settings?.integrationMode || d.connection?.mode;

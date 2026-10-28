@@ -1,8 +1,8 @@
 {
-  "tag": "v2.3.2-r3",
-  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Oportunidades-x64.exe",
-  "installerSha256": "24fd890e32c657ed7952fbe1b0945487cbbf34c254cab8ca4358e0316627f07d",
+  "tag": "v2.3.2-r4",
+  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Imediato-x64.exe",
+  "installerSha256": "640cabc0c2e4a64b770faa4ff99eefa9c10be90b1c7b3c74e424982ba8066926",
   "sourceRecoveredFromInstaller": true,
-  "packagedSourceFilesAudited": 116,
+  "packagedSourceFilesAudited": 117,
   "latestRecommended": false
 }

@@ -29,7 +29,7 @@ function minuteValue(value, fallback = 0) {
 
 // Return the first real slot, never a backlog. Each allowed window establishes
 // its own grid (08:00, 08:10, ...), including windows crossing midnight.
-function nextComputerRoundSlot(timestamp, schedule = {}, intervalMinutes = 10, { strictlyFuture = false } = {}) {
+function nextComputerRoundSlot(timestamp, schedule = {}, intervalMinutes = 10, { strictlyFuture = false, anchorAt = null } = {}) {
   const days = schedule.days ?? [0, 1, 2, 3, 4, 5, 6];
   const start = minuteValue(schedule.startTime), end = minuteValue(schedule.endTime);
   const intervalMs = Number(intervalMinutes) * 60000;
@@ -49,8 +49,10 @@ function nextComputerRoundSlot(timestamp, schedule = {}, intervalMinutes = 10, {
     opens.setHours(Math.floor(start / 60), start % 60, 0, 0);
     closes.setHours(Math.floor(end / 60), end % 60, 0, 0);
     if (end <= start) closes.setDate(closes.getDate() + 1);
-    const offset = Math.max(0, Math.ceil((timestamp - opens.getTime()) / intervalMs));
-    let slot = opens.getTime() + offset * intervalMs;
+    const base = Number.isFinite(anchorAt) ? anchorAt : opens.getTime();
+    const earliest = Math.max(timestamp, opens.getTime(), base);
+    const offset = Math.max(0, Math.ceil((earliest - base) / intervalMs));
+    let slot = base + offset * intervalMs;
     if (strictlyFuture && slot <= timestamp) slot += intervalMs;
     if (slot >= timestamp && slot >= opens.getTime() && slot < closes.getTime()) return slot;
   }

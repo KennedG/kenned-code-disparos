@@ -473,31 +473,60 @@ class Scheduler extends EventEmitter {
       const interval = config.intervalMinutes * 60000;
       const pendingDue = pending ? Math.min(...pending.jobs.filter(j => j.groupId === groupId).map(j => j.nextAttemptAt || lower)) : lower;
       const due = pending ? Math.max(lower, pendingDue) : last === undefined || last === null ? lower : last + interval;
-      const scheduled = nextComputerRoundSlot(Math.max(lower, due), config.schedule, config.intervalMinutes, { strictlyFuture: strictlyFuture && lower <= at && due <= at });
+      const scheduled = nextComputerRoundSlot(Math.max(lower, due), config.schedule, config.intervalMinutes, { strictlyFuture: strictlyFuture && lower <= at && due <= at, anchorAt: campaign.roundAnchorAt });
       if (!campaign.endAt || scheduled < campaign.endAt) next = Math.min(next, scheduled);
     }
     return next;
   }
 
-  async activate(id) {
+  async activate(id, { relative = false } = {}) {
     if (this.closed) throw new Error('O agendador está encerrado.');
     this.licenseGuard();
     if (this._automationStopped()) throw this._automationError();
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
     if (this.persistenceFailed) throw new Error('O agendador foi bloqueado após uma falha de persistência. Reinicie o aplicativo e confira o histórico.');
-    const campaign = this.store.getCampaign(id);
+    let campaign = this.store.getCampaign(id);
     this._validateCampaign(campaign);
     if (!this._connected()) throw new Error('Conecte o WhatsApp ou o modo simulado antes de ativar.');
     if (campaign.state === 'active') return campaign;
-    const next = this._nextEligibleAt(campaign, this.now(), { includePending: true });
-    if (!Number.isFinite(next)) throw new Error('Não há horário futuro disponível na programação.');
     const at = this.now();
+    if (relative) {
+      const anchor = Math.min(...campaign.groupIds.map(groupId => nextScheduledAt(at, this._groupConfig(campaign, groupId).schedule)));
+      campaign = { ...campaign, roundAnchorAt: anchor, groupLastScheduledSlots: Object.fromEntries(campaign.groupIds.map(groupId => [groupId, anchor - this._groupConfig(campaign, groupId).intervalMinutes * 60000])) };
+    }
+    const next = this._nextEligibleAt(campaign, at, { includePending: true });
+    if (!Number.isFinite(next)) throw new Error('Não há horário futuro disponível na programação.');
     this._persist('saveCampaign', { ...campaign, state: 'active', nextRunAt: next, pauseReason: null, pausedAt: null, executionAuthorization: { at, dateKey: computerDateKey(at), timezone: this.getClockStatus().timezone, manual: true }, executionRecovery: null, scheduleClock: this.getClockStatus() });
     this.emit('change');
     return this.store.getCampaign(id);
   }
 
-  async resume(id) { return this.activate(id); }
+  async resume(id, options) { return this.activate(id, options); }
+
+  _immediateKey(id, requestId) { return `campaignImmediate:${this.store.getStorageMode?.() || this.adapter?.status?.mode || 'local'}:${id}:${requestId}`; }
+  hasImmediateRequest(id, requestId) { return typeof requestId === 'string' && !!requestId && (this.store.getCampaign(id)?.lastImmediateRequestId === requestId || Boolean(this.store.getSetting?.(this._immediateKey(id, requestId), null))); }
+
+  async sendNow(id, { requestId } = {}) {
+    this.licenseGuard();
+    if (this.closed || this._automationStopped()) throw this._automationError();
+    if (typeof requestId !== 'string' || !requestId || requestId.length > 128) throw new Error('Identificador da solicitação imediata inválido.');
+    const campaign = this.store.getCampaign(id); this._validateCampaign(campaign);
+    if (this.hasImmediateRequest(id, requestId)) return campaign;
+    if (this.busy || this.submissionHolds || this.currentRound) throw Object.assign(new Error('Há um envio em andamento. Aguarde sua conclusão antes de enviar uma rodada imediata.'), { code: 'SCHEDULER_BUSY' });
+    if (!this._connected()) throw new Error('Conecte o WhatsApp antes de enviar agora.');
+    if (this.store.persistenceFailed || this.persistenceFailed) throw new Error('Persistência indisponível. Reinicie e revise os registros antes de enviar.');
+    const at = this.now(), candidate = { ...campaign, roundAnchorAt: at, groupLastScheduledSlots: Object.fromEntries(campaign.groupIds.map(groupId => [groupId, at - this._groupConfig(campaign, groupId).intervalMinutes * 60000])) };
+    const due = this._nextEligibleAt(candidate, at);
+    if (due !== at) throw new Error('Não é possível enviar agora: confira dias, horários, destinos e limites de rodadas/envios.');
+    const persist = () => { const saved = this._persist('saveCampaign', { ...candidate, state: 'active', nextRunAt: at, lastImmediateRequestId: requestId, pauseReason: null, pausedAt: null, executionPendingRoundId: null, executionRecovery: null, executionAuthorization: { at, dateKey: computerDateKey(at), timezone: this.getClockStatus().timezone, manual: true }, scheduleClock: this.getClockStatus() });
+      if (typeof this.store.setSetting === 'function') this._persist('setSetting', this._immediateKey(id, requestId), { campaignId: id, requestId, requestedAt: at });
+      return saved; };
+    const result = typeof this.store.transaction === 'function' ? this.store.transaction(persist) : persist();
+    this.emit('change');
+    // Tick remains the only queue owner. Repeated RPCs use the durable request ID.
+    queueMicrotask(() => { if (!this.closed) void this.tick().catch(() => {}); });
+    return result || this.store.getCampaign(id);
+  }
 
   _cancelQueued(campaignId, reason) {
     for (const job of this.store.listJobs({ campaignId, status: 'queued', limit: 1000000 })) this._persist('updateJob', job.id, { status: 'cancelled', error: reason, resultAt: this.now() });
@@ -761,7 +790,7 @@ class Scheduler extends EventEmitter {
       const tolerance = Math.max(1000, Math.min(10000, Number(this.store.getSetting?.('roundSlotToleranceMilliseconds', 5000)) || 5000));
       const slotValid = Number.isFinite(slot) && currentAt >= slot && currentAt - slot <= tolerance && campaign.groupIds.some(id => {
         const config = this._groupConfig(campaign, id);
-        return nextComputerRoundSlot(slot, config.schedule, config.intervalMinutes) === slot && isWithinSchedule(currentAt, config.schedule);
+        return nextComputerRoundSlot(slot, config.schedule, config.intervalMinutes, { anchorAt: campaign.roundAnchorAt }) === slot && isWithinSchedule(currentAt, config.schedule);
       });
       const pending = this._pendingRound(campaign);
       const due = slotValid ? slot : this._nextEligibleAt(campaign, currentAt, { includePending: Boolean(pending), tickToleranceMs: tolerance });
@@ -1092,7 +1121,7 @@ class Scheduler extends EventEmitter {
       if (campaign.destinationHealth?.[groupId]?.suspended || !this._eligibleItems(campaign, groupId).length) return false;
       const config = this._groupConfig(campaign, groupId);
       const last = campaign.groupLastScheduledSlots?.[groupId] ?? history.get(groupId)?.lastAt;
-      const onGrid = nextComputerRoundSlot(scheduledAt, config.schedule, config.intervalMinutes) === scheduledAt;
+      const onGrid = nextComputerRoundSlot(scheduledAt, config.schedule, config.intervalMinutes, { anchorAt: campaign.roundAnchorAt }) === scheduledAt;
       return onGrid && (pending ? pending.jobs.some(j => j.groupId === groupId && (!j.nextAttemptAt || j.nextAttemptAt <= at)) : last === undefined || last === null || last + config.intervalMinutes * 60000 <= scheduledAt) && isWithinSchedule(at, config.schedule);
     });
     if (!groups.length) return;
@@ -1153,7 +1182,7 @@ class Scheduler extends EventEmitter {
       const remaining = this.store.listJobs({ roundId: round.id, status: 'queued', limit: 1000000 }).filter(job => {
         if (!liveBeforeFinish) return true;
         const config = this._groupConfig(liveBeforeFinish, job.groupId);
-        const nextSlot = nextComputerRoundSlot(this.now(), config.schedule, config.intervalMinutes, { strictlyFuture: true });
+        const nextSlot = nextComputerRoundSlot(this.now(), config.schedule, config.intervalMinutes, { strictlyFuture: true, anchorAt: liveBeforeFinish.roundAnchorAt });
         if (Number.isFinite(nextSlot) && (!liveBeforeFinish.endAt || nextSlot < liveBeforeFinish.endAt)) return true;
         // Preserve technical interruptions only when this destination can
         // actually run again. A definitive end date must not leave dangling
