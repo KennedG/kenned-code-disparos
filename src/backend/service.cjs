@@ -16,24 +16,28 @@ const {WhatsAppAdapter}=require('../adapters/whatsapp.cjs');
 const {AuthService}=require('../core/auth.cjs');
 const {AlertService}=require('../core/alerts.cjs');
 const {SearchService}=require('../core/search-service.cjs');
+const {TemplateService}=require('../core/template-service.cjs');
+const {ReminderService}=require('../core/reminders.cjs');
+const {ContactIntake}=require('../core/contact-intake.cjs');
+const {AutomationControl}=require('../core/automation-control.cjs');
 const {writeRecordsJSON}=require('../core/export-records.cjs');
 
-const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook','systemAlertRecipientIds'];
-const DEFAULTS={reconnect:{enabled:false,maxAttempts:3,delaySeconds:15,autoResume:false},notifications:{nativeEnabled:true},sound:{enabled:true,volume:65,sound:'soft',customAudioId:null,events:['disconnect','critical'],repeat:false,intervalSeconds:30,maxRepeats:3,quiet:{enabled:false,start:'22:00',end:'08:00'}},retention:{days:90,maxEntries:20000,maxMegabytes:64},webhook:{enabled:false,url:''}};
+const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook','systemAlertRecipientIds','alertRetryPolicy'];
+const DEFAULTS={alertRetryPolicy:{maxAttempts:3,delaySeconds:15},reconnect:{enabled:false,maxAttempts:3,delaySeconds:15,autoResume:false},notifications:{nativeEnabled:true},sound:{enabled:true,volume:65,sound:'soft',customAudioId:null,events:['disconnect','critical'],repeat:false,intervalSeconds:30,maxRepeats:3,quiet:{enabled:false,start:'22:00',end:'08:00'}},retention:{days:90,maxEntries:20000,maxMegabytes:64},webhook:{enabled:false,url:''}};
 const HISTORY_CATEGORIES=['campaigns','sends','errors','notifications'];
 const cleanPhone=value=>String(value||'').replace(/[\s()+.-]/g,'');
-const validPhone=value=>/^\d{10,15}$/.test(value);
+const validPhone=value=>/^[1-9]\d{9,14}$/.test(value);
 const withoutPath=m=>{const {path:ignored,...safe}=m;return {...safe,previewUrl:`mega-media://asset/${encodeURIComponent(m.id)}`};};
 const bounded=(v,min,max,name)=>validation.number(v,min,max,name);
 const asText=(value,max)=>String(value??'').slice(0,max);
 
-async function createAppService({dir,safeStorage,host=async()=>{throw new Error('Recurso nativo indisponível.');},version='2.0.0',runtimePlatform='win32',now=()=>Date.now()}={}){
+async function createAppService({dir,safeStorage,host=async()=>{throw new Error('Recurso nativo indisponível.');},version='2.3.0',runtimePlatform='win32',now=()=>Date.now()}={}){
   const store=await createStore(dir);seed(store);store.recoverInterrupted();
   for(const [key,value] of Object.entries(DEFAULTS))if(store.getSetting(key)===undefined)store.setSetting(key,value);
   const media=new MediaManager(store),events=new EventEmitter();
   let channelUrl='';try{const value=await host('secretGet',{key:'webhookUrl'});if(typeof value==='string')channelUrl=value;}catch{}
   const auth=new AuthService({store,clock:now});
-  let adapter,scheduler,commands,alerts,searches,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,groupSync=null,groupSyncSource=null,groupLoadError=null;
+  let adapter,scheduler,commands,alerts,searches,reminders,contacts,templates,automation,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,groupSync=null,groupSyncSource=null,groupLoadError=null;
   const cleanupTokens=new Map();
   const nativeTasks=new Set();
   const audioDir=path.join(dir,'audio');fs.mkdirSync(audioDir,{recursive:true});
@@ -47,8 +51,8 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   const scopeIds=()=>user()?.isOwner||auth.status().campaignScope==='all'?undefined:store.listCampaigns().filter(c=>(c.ownerId||c.ownerUserId)===user()?.id).map(c=>c.id);
   function assertGlobal(permission,requirements=[]){assert(permission);if(!user()?.isOwner&&auth.status().campaignScope!=='all')throw new Error('Esta operação altera ou exporta dados de todo o aplicativo e exige acesso a todas as campanhas.');for(const p of requirements){assert(p);if(p.startsWith('campaign.'))for(const c of store.listCampaigns())assert(p,c);}}
   const assertModeChange=()=>assertGlobal('settings.edit',['connection.manage','campaign.stop']);
-  const assertBackup=()=>assertGlobal('settings.edit',['campaign.view','media.view','groups.view','contacts.view','notifications.view']);
-  const assertRestore=()=>assertGlobal('settings.edit',['connection.manage','users.edit','campaign.view','campaign.create','campaign.edit','campaign.delete','campaign.stop','groups.edit','media.create','media.delete','contacts.create','contacts.delete','notifications.manage']);
+  const assertBackup=()=>assertGlobal('settings.edit',['campaign.view','media.view','groups.view','contacts.view','notifications.view','reminder.view']);
+  const assertRestore=()=>assertGlobal('settings.edit',['connection.manage','users.edit','campaign.view','campaign.create','campaign.edit','campaign.delete','campaign.stop','groups.edit','media.create','media.delete','contacts.create','contacts.delete','notifications.manage','reminder.view','reminder.create','reminder.edit','reminder.delete','reminder.control']);
   const assertSearchActor=()=>{const actor=user();if(!actor)throw new Error('Faça login para continuar.');return actor.id;};
   const getCampaign=(id,permission='campaign.view')=>{const c=store.getCampaign(id);if(!c)throw new Error('Campanha não encontrada.');assert(permission,c);return c;};
   const audit=(action,details={})=>store.addAudit({id:randomUUID(),at:now(),userId:user()?.id||null,userName:user()?.name||null,action,...details});
@@ -84,7 +88,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     const metrics=store.getMetrics?store.getMetrics({campaignIds:scopeIds()}):{confirmed:0,failed:0,uncertain:0};
     let recent=[];if(can('history.view'))recent=historyPage({limit:50,offset:0}).items||[];
     const publicSettings=can('settings.view')?settings():{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()};
-    return {...base,auth:status,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,groupLoadError:can('groups.view')?groupLoadError:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items:[]};
+    return {...base,auth:status,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,groupLoadError:can('groups.view')?groupLoadError:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items.filter(n=>!n.ownerOnly||user()?.isOwner):[],pendingContacts:can('contacts.view')?contacts?.listPendingContacts({limit:50},user()?.id):{items:[],total:0},reminders:can('reminder.view')?reminders?.list(user()?.id):null,automation:automation?.getState()};
   }
   function broadcast(immediate=false){
     if(closed)return;
@@ -103,6 +107,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     const source=adapter;
     source.on('status',status=>{broadcast();if(status.state==='connected')syncGroups(source).catch(()=>{});});
     source.on('incoming',ctx=>{
+      if(source===adapter&&!maintenance){try{contacts?.handleIncoming(ctx);}catch(error){store.addDiagnostic({id:randomUUID(),at:now(),stage:'contacts.intake',code:'CONTACT_INTAKE_FAILED',description:'Não foi possível registrar o primeiro contato.',action:'Confira o armazenamento e as permissões do aplicativo.'});}}
       const emergency=ctx.type==='text'&&/^!mega\s+(?:parar\s+tudo|pausar\s+\S+)\s*$/i.test(String(ctx.text||''));
       if(source!==adapter||(maintenance&&!emergency))return;
       const handle=()=>source===adapter&&(!maintenance||emergency)?commands.handle(ctx):false;
@@ -137,8 +142,8 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
   }
   async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');return await task();}finally{searches?.resumeCapture();maintenance=false;broadcast();}}
   async function switchMode(mode){
-    await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await alerts.waitForIdle?.();if(groupSync)await groupSync.catch(()=>{});adapter.removeAllListeners();
-    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);bindAdapter();
+    await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await alerts.waitForIdle?.();await reminders?.waitForIdle?.();if(groupSync)await groupSync.catch(()=>{});adapter.removeAllListeners();
+    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);reminders?.setAdapter(adapter);automation?.syncMode();contacts?.invalidateContacts();bindAdapter();
     cleanupTokens.clear();groupLoadError=null;
     if(mode==='simulated'){await adapter.connect();await syncGroups(adapter);}
   }
@@ -196,7 +201,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
       const fromMe=p.fromMe===true;
       if(fromMe){if(!auth.status().user?.isOwner)throw new Error('O comando manual da conta conectada é reservado ao dono.');adapter.setOwnAccount?.(senderNumber);}
       const own=fromMe?adapter.getOwnAccount?.():null;
-      adapter.injectOfferMessage({messageId:`SIM-COMMAND-${randomUUID()}`,senderId:`${senderNumber}@s.whatsapp.net`,senderNumber,verified:true,identityVerified:true,isGroup,fromMe,trustedSelf:fromMe,ownAccountNumber:own?.phone||null,accountId:own?.id||null,ownAccountId:own?.id||null,selfChat:fromMe&&chatId===own?.id,forwarded:!!p.forwarded,chatId,text:String(p.text??p.command),type:'text',timestamp:now(),simulation:true});
+      adapter.injectIncoming({messageId:`SIM-COMMAND-${randomUUID()}`,senderId:`${senderNumber}@s.whatsapp.net`,senderNumber,verified:true,identityVerified:true,isGroup,fromMe,trustedSelf:fromMe,ownAccountNumber:own?.phone||null,accountId:own?.id||null,ownAccountId:own?.id||null,selfChat:fromMe&&chatId===own?.id,forwarded:!!p.forwarded,chatId,text:String(p.text??p.command),type:'text',timestamp:now(),simulation:true});
       await searches.waitForIdle();
     }
     audit('search.simulation',{messages:fixtures.length});
@@ -253,14 +258,31 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     resumeCampaign:async p=>{const c=getCampaign(p.id,'campaign.start');checkRevision(c,p);await scheduler.resume(c.id);audit('campaign.resume',{campaignId:c.id});return store.getCampaign(c.id);},
     pauseCampaign:async p=>{const c=getCampaign(p.id,'campaign.pause');await scheduler.pause(c.id);audit('campaign.pause',{campaignId:c.id});return store.getCampaign(c.id);},
     stopCampaign:async p=>{const c=getCampaign(p.id,'campaign.stop');await scheduler.pause(c.id);const latest=store.getCampaign(c.id);store.saveCampaign({...latest,state:'stopped',nextRunAt:null});audit('campaign.stop',{campaignId:c.id});return store.getCampaign(c.id);},
-    stopAll:async()=>{assert('campaign.stop');const all=store.listCampaigns().filter(c=>can('campaign.stop',c));for(const c of all){await scheduler.pause(c.id);const latest=store.getCampaign(c.id);if(['active','paused'].includes(latest.state))store.saveCampaign({...latest,state:'stopped',nextRunAt:null});}audit('campaign.stopAll',{count:all.length});return true;},
+    stopAll:async()=>{assert('automation.control');const result=await automation.stop({actorId:user().id,source:'app'});audit('automation.stopAll',{result});return result;},
+    resumeAutomation:async()=>{assert('automation.control');const result=await automation.resume({actorId:user().id,source:'app'});audit('automation.resume');return result;},
+    automationStatus:async()=>{assert('automation.control');return automation.getState();},
     importMedia:async()=>{assert('media.create');const r=await host('showOpenDialog',{title:'Importar mídias para a biblioteca',properties:['openFile','multiSelections'],filters:[{name:'Mídias e documentos',extensions:['jpg','jpeg','png','webp','mp4','mov','pdf','doc','docx','xls','xlsx','pptx','txt','csv','zip']}]});if(r.canceled)return [];assert('media.create');const imported=[];for(const file of r.filePaths)imported.push(withoutPath(await media.importFile(file)));audit('media.create',{count:imported.length});return imported;},
     mediaPath:async p=>{if(p.kind&&p.kind!=='media')throw new Error('Tipo de recurso inválido.');assert('media.view');return media.getPath(p.id);},
-    saveTemplate:async p=>{assert('media.create');if(!String(p.name||'').trim())throw new Error('Informe o nome do modelo.');return store.saveTemplate({id:randomUUID(),name:String(p.name).slice(0,120),items:validation.items(p.items,store),createdAt:now()});},
-    deleteTemplate:async p=>{assert('media.delete');store.deleteTemplate(p.id);audit('media.deleteTemplate',{templateId:p.id});return true;},
+    saveTemplate:async p=>templates.save(p.template||p,assertSearchActor()),
+    duplicateTemplate:async p=>templates.duplicate(p.id,assertSearchActor()),
+    deleteTemplate:async p=>templates.delete(p.id,assertSearchActor()),
+    getTemplate:async p=>templates.get(p.id,assertSearchActor()),
+    templateItems:async p=>templates.apply(p.id,assertSearchActor()),
+    mediaDeletionPreview:async p=>media.inspectDeletion(p.ids||[p.id],assertSearchActor()),
+    deleteMedia:async p=>media.deleteFiles(p.ids||[p.id],{confirmation:p.confirmation,userId:assertSearchActor()}),
+    listReminders:async()=>reminders.list(assertSearchActor()),
+    saveReminder:async p=>reminders.save(p.reminder||p,assertSearchActor()),
+    pauseReminder:async p=>reminders.pause(p.id,assertSearchActor()),
+    activateReminder:async p=>reminders.activate(p.id,assertSearchActor()),
+    deleteReminder:async p=>reminders.remove(p.id,assertSearchActor()),
+    testReminder:async p=>reminders.test(p.id,assertSearchActor()),
+    reminderHistory:async p=>reminders.history(p,assertSearchActor()),
+    listPendingContacts:async p=>contacts.listPendingContacts(p,assertSearchActor()),
+    savePendingContact:async p=>contacts.savePendingContact(p,assertSearchActor()),
+    dismissPendingContact:async p=>contacts.dismissPendingContact(p,assertSearchActor()),
     saveSettings:async p=>{
       assert('settings.edit');const changesMode=p.settings?.integrationMode&&p.settings.integrationMode!==store.getSetting('integrationMode');if(changesMode)assertModeChange();
-      if(p.settings?.systemAlertRecipientIds!==undefined)assert('notifications.manage');
+      if(p.settings?.systemAlertRecipientIds!==undefined||p.settings?.alertRetryPolicy!==undefined)assert('notifications.manage');
       const next=validateSettings(p.settings||{},store),previousWebhook=store.getSetting('webhook',DEFAULTS.webhook);
       const changesChannel=p.settings?.webhookToken!==undefined||next.webhook&&(next.webhook.enabled!==previousWebhook.enabled||next.webhook.url!==(channelUrl||previousWebhook.url));
       if(changesChannel)assertGlobal('settings.edit',['notifications.manage']);
@@ -281,11 +303,11 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     clearHistory:async p=>{assert('history.clear');if(p.confirmation!=='APAGAR')throw new Error('Digite APAGAR para confirmar.');const token=cleanupTokens.get(p.token),categories=validateCategories(p.categories);if(!token||token.userId!==user().id||now()-token.at>5*60*1000||JSON.stringify(categories)!==JSON.stringify(token.categories))throw new Error('A confirmação expirou. Confira uma nova prévia.');if(token.fingerprint!==JSON.stringify(store.cleanupPreview(categories)))throw new Error('Os registros mudaram. Confira uma nova prévia antes de apagar.');cleanupTokens.delete(p.token);const result=store.clearHistory({categories,actor:{id:user().id,name:user().name},at:now()});broadcast();return result;},
     reviewJob:async p=>{assert('history.view');const j=store.getJob(p.id);if(!j||j.status!=='uncertain')throw new Error('Envio incerto não encontrado.');getCampaign(j.campaignId,'campaign.edit');if(!['confirm','discard'].includes(p.decision))throw new Error('Decisão inválida.');const result=store.updateJob(j.id,{status:p.decision==='confirm'?'confirmed':'cancelled',resultAt:now(),error:p.decision==='confirm'?'Confirmado manualmente após verificação no WhatsApp.':'Descartado manualmente. Não reenviado.',reviewed:true,reviewedBy:user().id});audit('history.review',{campaignId:j.campaignId,jobId:j.id,decision:p.decision});return result;},
     listContacts:async p=>{assert('contacts.view');return p?.limit?pageEntities('contacts',p):entityList('contacts');},
-    saveContact:async p=>{const v=p.contact||p,old=v.id?store.getEntity('contacts',v.id):null;assert(old?'contacts.edit':'contacts.create');const phone=cleanPhone(v.phone);if(!asText(v.name,121).trim()||asText(v.name,121).length>120||!validPhone(phone))throw new Error('Informe nome e telefone com país + DDD + número.');const result=store.saveEntity('contacts',{id:old?.id||randomUUID(),name:asText(v.name,120).trim(),phone,notes:asText(v.notes,1000),createdAt:old?.createdAt||now(),updatedAt:now()});audit(old?'contacts.edit':'contacts.create',{contactId:result.id});return result;},
-    deleteContact:async p=>{assert('contacts.delete');store.deleteEntity('contacts',p.id);audit('contacts.delete',{contactId:p.id});return true;},
+    saveContact:async p=>{const v=p.contact||p,old=v.id?store.getEntity('contacts',v.id):null;assert(old?'contacts.edit':'contacts.create');const phone=cleanPhone(v.phone);if(!asText(v.name,121).trim()||asText(v.name,121).length>120||!validPhone(phone))throw new Error('Informe nome e telefone com país + DDD + número.');const result=store.saveEntity('contacts',{id:old?.id||randomUUID(),name:asText(v.name,120).trim(),phone,notes:asText(v.notes,1000),category:v.category!==undefined?(['Cliente Nerópolis','Lojista Camelódromo'].includes(v.category)?v.category:old?.category||''):old?.category||'',savedLocation:'system',addressBookSupported:false,createdAt:old?.createdAt||now(),updatedAt:now()});contacts?.invalidateContacts();audit(old?'contacts.edit':'contacts.create',{contactId:result.id});return result;},
+    deleteContact:async p=>{assert('contacts.delete');store.deleteEntity('contacts',p.id);contacts?.invalidateContacts();audit('contacts.delete',{contactId:p.id});return true;},
     listAlertRecipients:async()=>{assert('notifications.view');return listRecipients();},
     saveAlertRecipient:async p=>{assert('notifications.manage');const v=p.recipient||p,old=v.id?getRecipient(v.id):null,phone=cleanPhone(v.phone);if(!asText(v.name,121).trim()||asText(v.name,121).length>120||!validPhone(phone))throw new Error('Informe nome e telefone com país + DDD + número.');if(v.userId&&!store.getEntity('users',v.userId))throw new Error('Usuário não encontrado.');const result=store.saveEntity('alert_recipients',{id:old?.id||randomUUID(),name:asText(v.name,120).trim(),phone,userId:v.userId||null,enabled:v.enabled!==false});audit('alerts.recipientSave',{recipientId:result.id});return result;},
-    deleteAlertRecipient:async p=>{assert('notifications.manage');if(store.listCampaigns().some(c=>(c.alertRecipientIds||[]).includes(p.id)))throw new Error('Remova o destinatário das campanhas antes de excluí-lo.');store.deleteEntity('alert_recipients',p.id);audit('alerts.recipientDelete',{recipientId:p.id});return true;},
+    deleteAlertRecipient:async p=>{assert('notifications.manage');if(store.listCampaigns().some(c=>(c.alertRecipientIds||[]).includes(p.id))||store.listEntities('reminders').some(r=>r.recipientId===p.id))throw new Error('Remova o destinatário das campanhas e dos lembretes antes de excluí-lo.');store.deleteEntity('alert_recipients',p.id);audit('alerts.recipientDelete',{recipientId:p.id});return true;},
     testAlertRecipient:async p=>{assert('notifications.manage');const r=getRecipient(p.id);if(!r||!r.enabled)throw new Error('Destinatário não encontrado ou desativado.');audit('alerts.test',{recipientId:r.id});return alerts.testRecipient(r.phone,user().id,{recipientId:r.id});},
     testAlert:async p=>{assert('notifications.manage');if(p.event!==undefined&&!['critical','disconnect'].includes(p.event))throw new Error('Evento de alerta inválido.');audit('alerts.testOccurrence',{event:p.event||'critical'});return alerts.testAlert({userId:user().id,event:p.event||'critical'});},
     retryAlert:async p=>{assert('notifications.manage');const a=store.getAlert(p.id);if(!a)throw new Error('Alerta não encontrado.');if(a.campaignId)getCampaign(a.campaignId,'campaign.view');audit('alerts.retry',{alertId:a.id});return alerts.retryAlert(a.id,{userId:user().id});},
@@ -294,11 +316,11 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     silenceAlert:async p=>{assert('notifications.view');const notification=store.getEntity('notifications',p.id)||store.listEntities('notifications').find(n=>n.occurrenceId===p.id);if(!notification)throw new Error('Alerta não encontrado.');if(notification.campaignId&&scopeIds()&&!scopeIds().includes(notification.campaignId))throw new Error('Sem permissão para este alerta.');alerts.muteOccurrence(p.id);await host('silenceAlert',{id:p.id,occurrenceId:p.occurrenceId||notification.occurrenceId});return true;},
     importAudio:async()=>{assert('settings.edit');const r=await host('showOpenDialog',{title:'Selecionar som de alerta',properties:['openFile'],filters:[{name:'Áudio',extensions:['wav','mp3','ogg']}]});if(r.canceled)return {cancelled:true};assert('settings.edit');const original=r.filePaths[0],stat=fs.statSync(original),ext=path.extname(original).toLowerCase();if(!stat.isFile()||stat.size<1||stat.size>20*1024*1024||!['.wav','.mp3','.ogg'].includes(ext))throw new Error('Escolha WAV, MP3 ou OGG de até 20 MB.');const id=randomUUID(),filename=path.join(audioDir,`${id}${ext}`);await fs.promises.copyFile(original,filename);const entry={id,name:path.basename(original),path:filename,size:stat.size,createdAt:now()};store.setSetting('audioAssets',[...(store.getSetting('audioAssets',[])||[]),entry]);audit('settings.importAudio');return {id,name:entry.name,size:entry.size};},
     testSound:async p=>{assert('settings.edit');const prefs=validateSound(p.preferences||p.sound||store.getSetting('sound'));return host('testSound',{preferences:prefs,audioPath:audioPath(prefs.customAudioId)});},
-    testSimulation:async p=>{assert('settings.edit');if(adapter.status.mode!=='simulated'&&store.getSetting('integrationMode')!=='simulated')throw new Error('Disponível somente no modo simulado.');const senderNumber=cleanPhone(p.senderNumber||user().phone);if(![user().phone,...(user().authorizedPhones||[])].includes(senderNumber))throw new Error('O teste aceita somente um número vinculado ao usuário conectado.');const before=adapter.replies?.length||0;await commands.handle({messageId:randomUUID(),senderNumber,verified:true,isGroup:!!p.isGroup,forwarded:!!p.forwarded,fromMe:false,chatId:`${senderNumber}@s.whatsapp.net`,text:String(p.text||''),type:'text',timestamp:now()});const replies=adapter.replies?.slice(before)||[];return replies.length?{text:replies.map(r=>r.text).join('\n\n'),replies}:{text:'Comando ignorado; confira a autorização.'};},
+    testSimulation:async p=>{assert('settings.edit');if(adapter.status.mode!=='simulated'&&store.getSetting('integrationMode')!=='simulated')throw new Error('Disponível somente no modo simulado.');const senderNumber=cleanPhone(p.senderNumber||user().phone);if(![user().phone,...(user().authorizedPhones||[])].includes(senderNumber))throw new Error('O teste aceita somente um número vinculado ao usuário conectado.');const before=adapter.replies?.length||0;const context=adapter.injectIncoming({messageId:randomUUID(),senderNumber,verified:true,isGroup:!!p.isGroup,forwarded:!!p.forwarded,fromMe:false,chatId:`${senderNumber}@s.whatsapp.net`,text:String(p.text||''),type:'text',timestamp:now()});await commands.handle(context);const replies=adapter.replies?.slice(before)||[];return replies.length?{text:replies.map(r=>r.text).join('\n\n'),replies}:{text:'Comando ignorado; confira a autorização.'};},
     windowMinimize:async()=>host('windowMinimize',{}),windowQuit:async()=>host('windowQuit',{})
   };
   const publicUnprotected=new Set(['snapshot','authStatus','setupOwner','login','recoverPassword','windowMinimize','windowQuit']);
-  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory','searchRecipientStatus']);
+  const immediate=new Set(['snapshot','authStatus','historyPage','diagnosticsPage','auditPage','alertsPage','mediaPath','pauseCampaign','stopCampaign','stopAll','windowMinimize','windowQuit','searchesState','searchOffers','searchMessages','searchHistory','searchRecipientStatus','listReminders','reminderHistory','listPendingContacts','automationStatus','resumeAutomation']);
   events.call=async(action,payload={})=>{
     if(closed)throw new Error('Aplicativo encerrado.');if(!Object.hasOwn(actions,action))throw new Error('Ação não autorizada.');
     if(!publicUnprotected.has(action)&&!auth.status().authenticated)throw new Error('Faça login para continuar.');
@@ -313,14 +335,21 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(action==='suspend'){for(const c of store.listCampaigns())if(c.state==='active')await scheduler.pause(c.id,'Computador suspenso; retome após conferir a conexão.');broadcast();return true;}
     if(action==='resume'){broadcast();return true;}
     if(action==='settings')return settings();
-    if(action==='emergencyStop'){await scheduler.stopAll();store.addAudit({id:randomUUID(),at:now(),action:'campaign.stopAll.native',userId:null,userName:'Parada de emergência local'});broadcast();return true;}
+    if(action==='emergencyStop'){await automation.stop({source:'native-emergency'});store.addAudit({id:randomUUID(),at:now(),action:'campaign.stopAll.native',userId:null,userName:'Parada de emergência local'});broadcast();return true;}
     if(action==='shutdown')return events.shutdown();
     throw new Error('Ação interna não autorizada.');
   };
-  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);await scheduler?.stopAll();await searches?.shutdown();await adapter?.disconnect();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
-  adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now});commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,now});
-  alerts=new AlertService({store,scheduler,adapter,now,secretGet:async key=>host('secretGet',{key}),sendWebhook:async({secret,message,occurrenceId,originalAt,idempotencyKey})=>{if(!channelUrl)throw Object.assign(new Error('Canal independente não configurado.'),{definitive:true});const parsed=new URL(channelUrl);if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw Object.assign(new Error('Canal HTTPS inválido.'),{definitive:true});const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);try{const response=await fetch(parsed.href,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${secret}`,'idempotency-key':idempotencyKey},body:JSON.stringify({message,occurrenceId,originalAt}),signal:controller.signal,redirect:'error'});if(!response.ok)throw Object.assign(new Error('WEBHOOK_HTTP_FAILURE'),{definitive:true,code:'WEBHOOK_HTTP_FAILURE'});return {status:'confirmed',messageId:idempotencyKey};}finally{clearTimeout(timer);}}});
-  searches=new SearchService({store,adapter,authService:auth,now,scheduler,host});
+  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);await scheduler?.stopAll();await searches?.shutdown();await reminders?.stop();await adapter?.disconnect();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
+  adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now});automation=new AutomationControl({store,scheduler,now});
+  media.auth=auth;templates=new TemplateService({store,auth,media,now});contacts=new ContactIntake({store,auth,now});
+  commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,automationControl:automation,statusProvider:()=>({connection:adapter.status,campaigns:store.getMetrics(),queue:store.getMetrics().pending,search:searches?.getState(store.listEntities('users').find(u=>u.roleId==='role-owner')?.id)?.monitor,alerts:{pending:store.queryEntities('alerts',{status:'pending'}).total,failed:store.queryEntities('alerts',{status:'failed'}).total},reminders:reminders?.status(),automation:automation.getState()}),now});
+  alerts=new AlertService({store,scheduler,adapter,now,isAutomationStopped:()=>automation.isStopped(),secretGet:async key=>host('secretGet',{key}),sendWebhook:async({secret,message,occurrenceId,originalAt,idempotencyKey})=>{if(!channelUrl)throw Object.assign(new Error('Canal independente não configurado.'),{definitive:true});const parsed=new URL(channelUrl);if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw Object.assign(new Error('Canal HTTPS inválido.'),{definitive:true});const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);try{const response=await fetch(parsed.href,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${secret}`,'idempotency-key':idempotencyKey},body:JSON.stringify({message,occurrenceId,originalAt}),signal:controller.signal,redirect:'error'});if(!response.ok)throw Object.assign(new Error('WEBHOOK_HTTP_FAILURE'),{definitive:true,code:'WEBHOOK_HTTP_FAILURE'});return {status:'confirmed',messageId:idempotencyKey};}finally{clearTimeout(timer);}}});
+  searches=new SearchService({store,adapter,authService:auth,now,scheduler,host,automationGuard:()=>!automation.isStopped()});
+  reminders=new ReminderService({store,auth,scheduler,adapter,now,isAutomationStopped:()=>automation.isStopped(),onCriticalIncident:incident=>alerts.recordSystemIncident(incident)});
+  automation.register('search',()=>searches.stopPending());automation.register('alerts',()=>alerts.stopPending());automation.register('reminders',()=>reminders.stopAll({source:'global-stop'}));
+  automation.on('change',()=>broadcast());reminders.on('change',()=>broadcast());contacts.on('change',()=>broadcast());
+  contacts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});
+  reminders.start();
   searches.on('change',()=>broadcast());searches.start();
   alerts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});alerts.on('change',()=>broadcast());scheduler.on('change',()=>broadcast());bindAdapter();alerts.start();scheduler.start();
   retentionTimer=setInterval(()=>{try{store.applyRetention?.(store.getSetting('retention',DEFAULTS.retention));}catch{if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();}},60000);retentionTimer.unref?.();
@@ -346,6 +375,7 @@ function validateSettings(v,store){
   if(v.integrationMode==='whatsapp'&&!(next.unofficialAcknowledged??store.getSetting('unofficialAcknowledged',false)))throw new Error('Reconheça as limitações da integração não oficial antes de conectar.');
   if(v.sound!==undefined){next.sound=validateSound(v.sound);if(next.sound.sound==='custom'&&!(store.getSetting('audioAssets',[])||[]).some(a=>a.id===next.sound.customAudioId))throw new Error('Importe o arquivo de áudio antes de selecioná-lo.');}
   if(v.reconnect!==undefined){const r=v.reconnect;next.reconnect={enabled:!!r.enabled,maxAttempts:Math.floor(bounded(r.maxAttempts??3,0,10,'Tentativas de reconexão')),delaySeconds:bounded(r.delaySeconds??15,3,3600,'Intervalo de reconexão'),autoResume:!!r.autoResume};}
+  if(v.alertRetryPolicy!==undefined){const p=v.alertRetryPolicy;next.alertRetryPolicy={maxAttempts:Math.floor(bounded(p.maxAttempts??3,1,5,'Tentativas de alerta')),delaySeconds:bounded(p.delaySeconds??15,3,3600,'Intervalo de novas tentativas de alerta')};}
   if(v.notifications!==undefined)next.notifications={nativeEnabled:v.notifications.nativeEnabled!==false};
   if(v.systemAlertRecipientIds!==undefined){
     if(!Array.isArray(v.systemAlertRecipientIds)||v.systemAlertRecipientIds.length>100||v.systemAlertRecipientIds.some(id=>typeof id!=='string'||!id||id.length>512))throw new Error('Destinatários dos alertas do sistema inválidos.');

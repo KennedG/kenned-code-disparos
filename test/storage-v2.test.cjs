@@ -101,7 +101,7 @@ test('transaction rollback is atomic, UNIQUE validation does not poison storage 
 });
 
 test('diagnostics and audit omit credential fields and truncate oversized messages',async t=>{
-  const {store:s}=await fixture(t);const d=s.addDiagnostic({description:'token=HIDE password=HIDE2 Bearer HIDE3',token:'HIDE4',details:{password:'HIDE5',safe:'ok'},extra:'x'.repeat(20000)}),a=s.addAudit({action:'settings.edit',detail:{passwordHash:'HIDE6',safe:'retained'}});
+  const {store:s}=await fixture(t);const d=s.addDiagnostic({description:'token=HIDE password=HIDE2 Bearer HIDE3',token:'HIDE4',details:{password:'HIDE5',replyProof:'HIDE_SIGNED_PROOF',safe:'ok'},extra:'x'.repeat(20000)}),a=s.addAudit({action:'settings.edit',detail:{passwordHash:'HIDE6',sourceReplyProof:'HIDE_STORED_PROOF',safe:'retained'}});
   const serialized=JSON.stringify([d,a]);assert.equal(serialized.includes('HIDE'),false);assert.equal(d.extra.length,16000);assert.equal(d.details.safe,'ok');assert.equal(a.detail.safe,'retained');
 });
 

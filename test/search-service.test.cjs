@@ -25,7 +25,7 @@ async function fixture(t) {
   const message = (text, overrides = {}) => ({ messageId: randomUUID(), chatId: group, isGroup: true, senderId: '5511888880001@s.whatsapp.net', senderNumber: '5511888880001', verified: true, identityVerified: true, displayName: 'Fornecedor 1', savedName: null, type: 'text', text, timestamp: now(), capturedAt: now(), forwarded: false, fromMe: false, history: false, ...overrides });
   const capture = async (text, overrides = {}) => { const ctx = message(text, { dataOnly: true, ...overrides }); await searches.handleIncoming(ctx); await searches.waitForIdle(); return ctx; };
   const command = (text, overrides = {}) => message(text, { senderNumber: owner.phone, senderId: `${owner.phone}@s.whatsapp.net`, displayName: 'Dono', ...overrides });
-  return { store, auth, adapter, searches, owner, group, secondGroup, now, advance: ms => { clock += ms; }, message, capture, command };
+  return { dir, store, auth, adapter, searches, owner, group, secondGroup, now, advance: ms => { clock += ms; }, message, capture, command };
 }
 
 test('BUSCAS captures separate list products, exact versions and prices without monthly instalments', async t => {
@@ -316,4 +316,134 @@ test('supplier filters inspect identity fields and bare blocked phones match tru
   assert.equal((await f.searches.executeSearch({query:'18 Pro Max Silver',filters:{supplier:'marcia'}},f.owner.id)).count,1);
   assert.deepEqual(f.searches.saveSettings({blockedSupplierIds:['5511888880001','phone:5511888880001','account:trusted@lid']},f.owner.id).blockedSupplierIds,['phone:5511888880001','account:trusted@lid']);
   assert.equal((await f.searches.executeSearch({query:'18 Pro Max Silver'},f.owner.id)).count,0);
+});
+
+
+test('rolling two-hour window uses original publication time, supports minutes/hours and disabling without fake cheap prices', async t => {
+  const f = await fixture(t);
+  const capture = (value, ageMinutes, suffix) => f.capture(`iPhone 15 Pro Max 256GB Silver seminovo ${value}`, { timestamp: f.now() - ageMinutes * 60_000, senderNumber: `55118888800${suffix}`, senderId: `55118888800${suffix}@s.whatsapp.net` });
+  await capture('R$ 3.900,00', 121, '11');
+  await capture('R$ 4.100,00', 120, '12');
+  await capture('R$ 4.200,00', 70, '13');
+  await capture('R$ 4.700,00', 5, '14');
+  await capture('entrada R$ 900 + 12x R$ 450', 4, '15');
+  await capture('consulte o preço', 3, '16');
+  let result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max 256GB' }, f.owner.id);
+  assert.deepEqual(result.results.map(o => o.priceCents), [410000, 420000, 470000]);
+  assert.equal(result.period.from, f.now() - 120 * 60_000); assert.equal(result.period.maxAgeMinutes, 120);
+  assert.match(formatSearchResults(result, f.searches._settings()).join('\n'), /últimas 2 horas/);
+  f.searches.saveSettings({ maxAgeValue: 60, maxAgeUnit: 'minutes' }, f.owner.id);
+  result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max 256GB' }, f.owner.id);
+  assert.deepEqual(result.results.map(o => o.priceCents), [470000]);
+  f.searches.saveSettings({ maxAgeEnabled: false }, f.owner.id);
+  result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max 256GB' }, f.owner.id);
+  assert.equal(result.period.from, null); assert.equal(result.period.maxAgeMinutes, null);
+  assert.deepEqual(result.results.map(o => o.priceCents), [390000, 410000, 420000, 470000]);
+  assert.match(formatSearchResults(result, f.searches._settings()).join('\n'), /Sem limite de idade/);
+  assert.ok(result.results.every(o => Number.isSafeInteger(o.priceCents) && o.priceKind === 'cash'));
+});
+
+test('an edited old offer stays outside the two-hour window even when captured or edited now', async t => {
+  const f = await fixture(t), old = await f.capture('iPhone 15 Pro Max 256GB Silver seminovo R$ 3.500,00', { timestamp: f.now() - 121 * 60_000 });
+  f.adapter.emit('offerMessageUpdate', { ...old, timestamp: f.now(), revisionAt: f.now(), text: 'iPhone 15 Pro Max 256GB Silver seminovo R$ 3.400,00' });
+  await f.searches.waitForIdle();
+  assert.equal((await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id)).count, 0);
+  f.searches.saveSettings({ maxAgeEnabled: false }, f.owner.id);
+  const result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id);
+  assert.equal(result.count, 1); assert.equal(result.results[0].originalAt, old.timestamp); assert.equal(result.results[0].priceCents, 340000);
+});
+
+test('higher-price and newest sorting happen before the ten-result limit and saved preferences survive reopening SQLite', async t => {
+  const f = await fixture(t);
+  for (let i = 0; i < 12; i++) { f.advance(1000); await f.capture(`iPhone 15 Pro Max 256GB Silver seminovo R$ ${5000 + i * 100}`, { senderNumber: `55118888000${String(i).padStart(2, '0')}`, displayName: `Fornecedor ${i}` }); }
+  f.searches.saveSettings({ sort: 'cashDescending', maxAgeValue: 90, maxAgeUnit: 'minutes', defaultFilters: { storageGB: 256, condition: 'seminovo', groupIds: [f.group] } }, f.owner.id);
+  let result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id);
+  assert.equal(result.count, 10); assert.equal(result.results[0].priceCents, 610000); assert.equal(result.results.at(-1).priceCents, 520000);
+  f.searches.saveSettings({ sort: 'recent' }, f.owner.id); result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id);
+  assert.equal(result.results[0].priceCents, 610000);
+  f.searches.saveSettings({ sort: 'cashAscending' }, f.owner.id); result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id);
+  assert.equal(result.results[0].priceCents, 500000);
+  const reopened = await createStore(f.dir); t.after(() => reopened.close());
+  assert.equal(reopened.getSetting('buscasSettings').maxAgeValue, 90); assert.equal(reopened.getSetting('buscasSettings').maxAgeUnit, 'minutes');
+  assert.equal(reopened.getSetting('buscasSettings').sort, 'cashAscending'); assert.deepEqual(reopened.getSetting('buscasSettings').defaultFilters.groupIds, [f.group]);
+});
+
+test('configured model, storage, condition, supplier and group filters use captured metadata', async t => {
+  const f = await fixture(t);
+  await f.capture('iPhone 15 Pro Max 256GB Silver seminovo R$ 3.850,00', { displayName: 'Loja Alfa' });
+  await f.capture('iPhone 15 Pro Max 512GB Silver lacrado R$ 5.500,00', { senderNumber: '5511888880002', displayName: 'Loja Beta', chatId: f.secondGroup });
+  f.searches.saveSettings({ defaultFilters: { model: 'iPhone 15 Pro Max', storageGB: 256, condition: 'seminovo', supplier: 'Alfa', groupIds: [f.group] } }, f.owner.id);
+  const result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id);
+  assert.equal(result.count, 1); assert.equal(result.results[0].supplierName, 'Loja Alfa'); assert.equal(result.results[0].groupId, f.group);
+  assert.equal((await f.searches.executeSearch({ query: 'iPhone 15 Pro Max', filters: { groupIds: [f.secondGroup] } }, f.owner.id)).count, 0);
+  assert.throws(() => f.searches.saveSettings({ defaultFilters: { groupIds: ['not-a-loaded-group@g.us'] } }, f.owner.id), /grupos disponíveis/);
+});
+
+test('authorized incoming private search replies only to the requester despite configured owner or responsible recipients', async t => {
+  const f = await fixture(t);
+  const requester = await f.auth.createUser({ name: 'Pessoa autorizada', username: 'private-buscas', phone: '5511999990002', password: PASSWORD, roleId: 'role-admin', requirePasswordChange: false, permissionOverrides: { 'search.view': true, 'search.run': true } });
+  f.searches.saveAuthorization({ userId: requester.id, permissions: ['search'] }, f.owner.id);
+  f.searches.saveSettings({ privateCommandsEnabled: true, commandPrivateNumbers: [], recipientMode: 'owner' }, f.owner.id);
+  await f.capture('iPhone 15 Pro Max 256GB Azul seminovo R$ 3.850,00');
+  const incoming = f.adapter.injectIncoming({ text: '!busca iPhone 15 Pro Max 256GB', senderNumber: requester.phone, isGroup: false }); await f.searches.waitForIdle();
+  assert.equal(f.adapter.sent.length, 1); assert.equal(f.adapter.sent[0].targetId, `${requester.phone}@s.whatsapp.net`);
+  assert.match(f.adapter.sent[0].text, /RESULTADO DA BUSCA/); assert.match(f.adapter.sent[0].text, /3\.850,00/); assert.match(f.adapter.sent[0].text, /Cor: Azul/i);
+  assert.equal(f.store.listSearchDeliveries().items[0].status, 'confirmed');
+  assert.equal(await f.searches.handleIncoming(incoming), false); assert.equal(f.adapter.sent.length, 1);
+  f.store.saveAlertRecipient({ id: 'responsible-other', name: 'Outro destinatário', phone: '5511999990003', enabled: true });
+  f.searches.saveSettings({ recipientMode: 'responsibles', responsibleRecipientIds: ['responsible-other'] }, f.owner.id);
+  f.adapter.injectIncoming({ text: '!busca iPhone 18 Pro Max', senderNumber: requester.phone, isGroup: false }); await f.searches.waitForIdle();
+  assert.equal(f.adapter.sent.at(-1).targetId, `${requester.phone}@s.whatsapp.net`); assert.match(f.adapter.sent.at(-1).text, /Não foram encontradas ofertas compatíveis/);
+  f.adapter.injectIncoming({ text: '!busca', senderNumber: requester.phone, isGroup: false }); await f.searches.waitForIdle();
+  assert.equal(f.adapter.sent.at(-1).targetId, `${requester.phone}@s.whatsapp.net`); assert.match(f.adapter.sent.at(-1).text, /Use !busca iPhone/);
+  assert.ok(f.adapter.sent.every(send => send.targetId === `${requester.phone}@s.whatsapp.net`));
+});
+
+test('private default allows explicitly authorized users while unapproved identities, an explicit disable and a restricted whitelist are respected', async t => {
+  const f = await fixture(t); f.searches.saveSettings({ privateCommandsEnabled: true, commandPrivateNumbers: [] }, f.owner.id);
+  assert.equal(validateSearchSettings({}).privateCommandsEnabled, true);
+  const before = f.adapter.sent.length;
+  f.adapter.injectIncoming({ text: '!busca iPhone 15 Pro Max', senderNumber: '5511999990099', displayName: 'Dono', isGroup: false }); await f.searches.waitForIdle(); assert.equal(f.adapter.sent.length, before);
+  f.adapter.injectIncoming({ text: '!busca', senderNumber: f.owner.phone, isGroup: false }); await f.searches.waitForIdle(); assert.equal(f.adapter.sent.length, before + 1);
+  f.searches.saveSettings({ privateCommandsEnabled: false }, f.owner.id);
+  f.adapter.injectIncoming({ text: '!busca', senderNumber: f.owner.phone, isGroup: false }); await f.searches.waitForIdle(); assert.equal(f.adapter.sent.length, before + 1);
+  const diagnostics = f.store.queryEntities('diagnostics', { limit: 100 }).items;
+  assert.ok(diagnostics.some(d => d.stage === 'buscas.rejected' && /Comando privado bloqueado/.test(d.description)));
+  const other = await f.auth.createUser({ name: 'Outro', username: 'private-whitelist', phone: '5511999990004', password: PASSWORD, roleId: 'role-admin', requirePasswordChange: false });
+  f.searches.saveSettings({ privateCommandsEnabled: true, commandPrivateNumbers: [other.phone] }, f.owner.id);
+  f.adapter.injectIncoming({ text: '!busca', senderNumber: f.owner.phone, isGroup: false }); await f.searches.waitForIdle(); assert.equal(f.adapter.sent.length, before + 1);
+});
+
+test('global automation guard blocks new search deliveries and prevents queued sends until an explicit resumption', async t => {
+  const f = await fixture(t); let allowed = true; f.searches.setAutomationGuard(() => allowed);
+  await f.adapter.disconnect(); const pending = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id, { deliver: true });
+  assert.equal(pending.delivery[0].status, 'pending'); allowed = false;
+  await f.adapter.connect(); await f.searches.waitForIdle(); assert.equal(f.adapter.sent.length, 0);
+  await assert.rejects(f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id, { deliver: true }), { code: 'AUTOMATION_STOPPED' });
+  assert.equal((await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id)).count, 0);
+  allowed = true; await f.searches.flushDeliveries(); assert.equal(f.adapter.sent.length, 1); assert.equal(f.store.getSearchDelivery(pending.delivery[0].id).status, 'confirmed');
+});
+
+
+test('a global stop cancels pending search deliveries permanently, reports in-flight submissions and preserves command dedupe', async t => {
+  const f = await fixture(t); await f.adapter.disconnect();
+  const result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id, { deliver: true });
+  f.store.saveSearchDelivery({ id: 'submitted-search', runId: 'submitted-run', actorId: f.owner.id, target: `${f.owner.phone}@s.whatsapp.net`, text: 'Já em processamento', status: 'sending', messageId: 'ALREADY-IN-FLIGHT', clientMessageId: 'ALREADY-IN-FLIGHT', createdAt: f.now() });
+  const stopped = f.searches.stopPending({ actorId: f.owner.id, reason: 'Parar tudo de teste' });
+  assert.deepEqual(stopped, { cancelled: 1, inFlight: 1 });
+  assert.equal(f.store.getSearchDelivery(result.delivery[0].id).status, 'cancelled'); assert.equal(f.store.getSearchDelivery('submitted-search').status, 'sending');
+  await f.adapter.connect(); await f.searches.waitForIdle(); assert.equal(f.adapter.sent.length, 0);
+  await assert.rejects(f.searches.retryDelivery({ id: result.delivery[0].id }, f.owner.id), /Somente falhas/);
+  assert.equal(f.store.getSearchRun(result.runId).resultCount, 0);
+});
+
+test('a confirmed integration receipt wins over a later provider rejection and cannot become a retry', async t => {
+  const f = await fixture(t);
+  f.adapter.sendSearchText = async (_target, _text, { clientMessageId }) => {
+    f.adapter.emit('receipt', { messageId: clientMessageId, status: 'confirmed', confirmationScope: 'recipient-delivered', deliveredAt: f.now(), simulation: true });
+    throw Object.assign(new Error('Falha do retorno após recibo'), { safeToRetry: true, code: 'WA_RECIPIENT_TIMEOUT' });
+  };
+  const result = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max' }, f.owner.id, { deliver: true });
+  assert.equal(result.delivery[0].status, 'confirmed'); assert.equal(result.delivery[0].deliveredAt, f.now()); assert.equal(result.delivery[0].safeToRetry, false);
+  assert.equal(f.store.listSearchDeliveries({ status: 'pending' }).total, 0);
 });

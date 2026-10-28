@@ -31,7 +31,100 @@ function format(name, mime) {
   return {ext, mime: types[ext][0], type: types[ext][1], name: path.extname(name).toLowerCase() === ext ? name : `${name}${ext}`};
 }
 class MediaManager {
-  constructor(store, options = {}) { this.store = store; this.dir = path.join(store.dir,'media'); this.chunkSize=options.chunkSize || CHUNK; fs.mkdirSync(this.dir,{recursive:true}); }
+  constructor(store, options = {}) { this.store = store; this.auth=options.auth; this.now=options.now||(()=>Date.now()); this.dir = path.join(store.dir,'media'); this.chunkSize=options.chunkSize || CHUNK; this._deletionTail=Promise.resolve(); fs.mkdirSync(this.dir,{recursive:true});this.recoverDeletions(); }
+  _deletionAssert(userId,permission) {
+    if(!this.auth)throw Object.assign(new Error('A validação de acesso à biblioteca está indisponível.'),{code:'AUTH_REQUIRED'});
+    return this.auth.assertFor(userId??this.auth.currentUserId,permission);
+  }
+  _deletionIds(ids) {
+    if(!Array.isArray(ids)||!ids.length||ids.length>10000||ids.some(id=>typeof id!=='string'||!id||id.length>512))throw new Error('Selecione de 1 a 10.000 mídias válidas.');
+    return [...new Set(ids)];
+  }
+  _references(ids,userId) {
+    const selected=new Set(ids),references=new Map(ids.map(id=>[id,[]]));
+    const add=(items,ref)=>{for(const item of items||[])if(selected.has(item.mediaId)){const list=references.get(item.mediaId);if(!list.some(r=>r.kind===ref.kind&&r.id===ref.id&&r.groupId===ref.groupId))list.push(ref);}};
+    for(const campaign of this.store.listCampaigns()){
+      const visible=this.auth?.canFor(userId??this.auth.currentUserId,'campaign.view',campaign);
+      const ref=visible?{kind:'campaign',id:campaign.id,label:campaign.name,state:campaign.state}:{kind:'campaign',label:'Campanha sem permissão de visualização',restricted:true};
+      add(campaign.items,ref);
+      for(const [groupId,override]of Object.entries(campaign.groupOverrides||{}))add(override.items,{...ref,kind:'groupOverride',...(visible?{groupId}:{}),label:visible?`${campaign.name} — conteúdo específico por grupo`:ref.label});
+    }
+    for(const template of this.store.listTemplates())add(template.items,{kind:'template',id:template.id,label:template.name});
+    for(const job of this.store.listJobs({status:['queued','pending','sending','accepted','uncertain']})){
+      const campaign=this.store.getCampaign(job.campaignId),visible=campaign&&this.auth?.canFor(userId??this.auth.currentUserId,'campaign.view',campaign);
+      add([job.itemSnapshot,job.contentSnapshot,{mediaId:job.mediaId}].filter(Boolean),{kind:'operational',...(visible?{id:job.id,campaignId:job.campaignId}:{}),label:visible?`${campaign.name} — envio ${job.status==='uncertain'?'incerto, aguardando revisão':'na fila ou em andamento'}`:'Envio operacional protegido',state:job.status});
+    }
+    const media=this.store.listMediaAnyMode?.()||this.store.listMedia();
+    for(const id of ids){const item=this.store.getMedia(id);if(!item?.path)continue;for(const other of media)if(other.id!==id&&!selected.has(other.id)&&path.resolve(other.path||'')===path.resolve(item.path))references.get(id).push({kind:'sharedFile',label:'Arquivo gerenciado compartilhado com outro registro da biblioteca'});}
+    return references;
+  }
+  inspectDeletion(ids,userId) {
+    this._deletionAssert(userId,'media.delete');this._deletionAssert(userId,'media.view');
+    ids=this._deletionIds(ids);const references=this._references(ids,userId);
+    const items=ids.map(id=>{const item=this.store.getMedia(id);if(!item)throw new Error('Uma mídia não existe neste modo. Atualize a biblioteca.');return {id,name:item.name,type:item.type,size:item.size,references:references.get(id),blocked:references.get(id).length>0};});
+    return {items,total:items.length,blocked:items.filter(item=>item.blocked).length,canDelete:items.every(item=>!item.blocked),description:'Excluir remove o cadastro e o arquivo gerenciado. O arquivo original importado não é alterado. Arquivos em uso são preservados.'};
+  }
+  _writeDeletionJournal(filename,value) {
+    const {atomicWrite}=require('./store.cjs');atomicWrite(filename,Buffer.from(JSON.stringify(value)));
+  }
+  recoverDeletions() {
+    for(const name of fs.readdirSync(this.dir).filter(name=>/^\.delete-[a-f0-9-]{36}\.json$/i.test(name))){
+      const journal=path.join(this.dir,name);let data;
+      try{
+        if(fs.lstatSync(journal).isSymbolicLink()||fs.statSync(journal).size>2*1024*1024)continue;
+        data=JSON.parse(fs.readFileSync(journal,'utf8'));
+        if(data.version!==1||!['whatsapp','simulated'].includes(data.mode)||!Array.isArray(data.items)||data.items.length>10000)continue;
+        if(!this.store.getMediaAnyMode&&data.mode!==this.store.getStorageMode?.())continue;
+        let complete=true;
+        for(const item of data.items){
+          const transactionId=name.slice(8,-5);
+          if(typeof item.id!=='string'||!item.original||! /^[a-f0-9-]{36}\.[a-z0-9]+$/i.test(item.original)||path.basename(item.original)!==item.original||!types[path.extname(item.original).toLowerCase()]||item.staged!==`.deleting-${transactionId}-${item.original}`||path.basename(item.staged)!==item.staged){complete=false;continue;}
+          const original=path.join(this.dir,item.original),staged=path.join(this.dir,item.staged);
+          const media=this.store.getMediaAnyMode?.(item.id)||this.store.getMedia(item.id);
+          if(media&&path.resolve(media.path||'')!==original){complete=false;continue;}
+          if(!fs.existsSync(staged))continue;
+          if(fs.lstatSync(staged).isSymbolicLink()){complete=false;continue;}
+          if(media){if(fs.existsSync(original)){complete=false;continue;}fs.renameSync(staged,original);}
+          else fs.unlinkSync(staged);
+        }
+        if(complete)fs.unlinkSync(journal);
+      }catch{/* Leave a journal and its files for the next safe recovery attempt. */}
+    }
+  }
+  deleteFiles(ids,options={}) {
+    const task=()=>this._deleteFiles(ids,options),result=this._deletionTail.then(task);
+    this._deletionTail=result.catch(()=>{});return result;
+  }
+  async _deleteFiles(ids,{confirmation,userId}={}) {
+    if(confirmation!=='EXCLUIR')throw new Error('Digite EXCLUIR para confirmar a exclusão das mídias.');
+    const user=this._deletionAssert(userId,'media.delete'),preview=this.inspectDeletion(ids,userId);
+    if(!preview.canDelete)throw Object.assign(new Error('Há arquivos em uso. Remova as referências indicadas ou revise os envios incertos antes de excluir.'),{code:'MEDIA_IN_USE',details:preview});
+    if(typeof this.store.deleteMedia!=='function')throw new Error('A exclusão persistente da biblioteca está indisponível.');
+    const mode=this.store.getStorageMode?.()||'whatsapp',transactionId=randomUUID(),journal=path.join(this.dir,`.delete-${transactionId}.json`),entries=[];
+    for(const item of preview.items){const media=this.store.getMedia(item.id);let original;
+      try{if(fs.lstatSync(media.path).isSymbolicLink())throw new Error('Mídia gerenciada ausente ou inválida.');}catch(error){if(error.code!=='ENOENT')throw error;}
+      try{original=this.getPath(item.id);}catch(error){if(media?.path&&!fs.existsSync(media.path)&&path.resolve(media.path).startsWith(path.resolve(this.dir)+path.sep))original=path.resolve(media.path);else throw error;}
+      if(path.dirname(original)!==fs.realpathSync(this.dir))throw new Error('O arquivo não pertence à pasta gerenciada da biblioteca.');
+      entries.push({id:item.id,original:path.basename(original),staged:`.deleting-${transactionId}-${path.basename(original)}`,missing:!fs.existsSync(original)});
+    }
+    this._writeDeletionJournal(journal,{version:1,mode,items:entries,at:this.now()});let committed=false;
+    try{
+      for(const entry of entries)if(!entry.missing){await fs.promises.rename(path.join(this.dir,entry.original),path.join(this.dir,entry.staged));if(mode!==this.store.getStorageMode?.())throw new Error('O modo de operação mudou. Atualize a biblioteca.');}
+      this.store.transaction(()=>{
+        this._deletionAssert(userId,'media.delete');this._deletionAssert(userId,'media.view');
+        if(mode!==this.store.getStorageMode?.())throw new Error('O modo de operação mudou. Atualize a biblioteca.');
+        const latest=this.inspectDeletion(preview.items.map(item=>item.id),userId);if(!latest.canDelete)throw Object.assign(new Error('Uma mídia passou a ser usada. Nenhum arquivo foi excluído.'),{code:'MEDIA_IN_USE',details:latest});
+        for(const entry of entries){this.store.deleteMedia(entry.id);if(this.store.getMedia(entry.id))throw new Error('Não foi possível excluir uma mídia do banco.');}
+        this.store.addAudit({id:randomUUID(),at:this.now(),userId:user.id,userName:user.name,action:'media.delete',mediaIds:entries.map(entry=>entry.id),count:entries.length});
+      });committed=true;
+      let cleanupPending=0;for(const entry of entries)if(!entry.missing)try{await fs.promises.unlink(path.join(this.dir,entry.staged));}catch(error){if(error.code!=='ENOENT')cleanupPending++;}
+      if(!cleanupPending)try{await fs.promises.unlink(journal);}catch(error){if(error.code!=='ENOENT')cleanupPending++;}await syncDirectory(this.dir);
+      return {deleted:true,ids:entries.map(entry=>entry.id),count:entries.length,cleanupPending,...(cleanupPending?{warning:'Cadastros removidos. Alguns arquivos em quarentena serão removidos na próxima abertura; confira as permissões do Windows.'}:{})};
+    }catch(error){
+      if(!committed){let restored=true;for(const entry of entries){const staged=path.join(this.dir,entry.staged),original=path.join(this.dir,entry.original);if(fs.existsSync(staged))try{await fs.promises.rename(staged,original);}catch{restored=false;}}if(restored)await fs.promises.unlink(journal).catch(()=>{});}
+      throw error;
+    }
+  }
   async importFile(filename) {
     const stat = await fs.promises.stat(filename);
     if (!stat.isFile() || !stat.size || stat.size > MAX_FILE) throw new Error('Selecione um arquivo de 1 byte a 64 MB.');

@@ -3,6 +3,7 @@ const actions = new Set(['snapshot','authStatus','setupOwner','login','logout','
 for(const action of ['pendingReviewsPage','exportReports','stopCampaign','notificationsPage'])actions.add(action);
 for(const action of ['searchesState','saveSearchSettings','searchOffers','searchMessages','searchHistory','runSearch','searchAuthorizations','saveSearchAuthorization','deleteSearchAuthorization','reviewSearchOffer','searchCleanupPreview','clearSearchHistory','clearSearchBase','testSearchSimulation','importSearchHistory'])actions.add(action);
 for(const action of ['searchRecipientStatus','testSearchRecipient','retrySearchDelivery','testAlert','retryAlert'])actions.add(action);
+for(const action of ['duplicateTemplate','getTemplate','templateItems','mediaDeletionPreview','deleteMedia','listReminders','saveReminder','pauseReminder','activateReminder','deleteReminder','testReminder','reminderHistory','listPendingContacts','savePendingContact','dismissPendingContact','resumeAutomation','automationStatus'])actions.add(action);
 contextBridge.exposeInMainWorld('mega',{
   call(action,payload={}) { if(!actions.has(action)) return Promise.reject(new Error('Ação não permitida.')); return ipcRenderer.invoke('mega:call',action,payload); },
   onUpdate(fn) { const listener=(_,data)=>fn(data); ipcRenderer.on('mega:update',listener); return ()=>ipcRenderer.removeListener('mega:update',listener); }

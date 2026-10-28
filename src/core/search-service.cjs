@@ -4,8 +4,8 @@ const { EventEmitter } = require('node:events');
 const { randomUUID, createHash } = require('node:crypto');
 
 const DEFAULT_SEARCH_SETTINGS = Object.freeze({ enabled: false, prefix: '!busca', maxResults: 10,
-  timezone: 'America/Sao_Paulo', monitoredGroupIds: [], commandGroupIds: [], privateCommandsEnabled: false,
-  commandPrivateNumbers: [], validityHours: 24, customFrom: '', customTo: '', retentionDays: 30,
+  timezone: 'America/Sao_Paulo', monitoredGroupIds: [], commandGroupIds: [], privateCommandsEnabled: true,
+  commandPrivateNumbers: [], maxAgeEnabled: true, maxAgeValue: 2, maxAgeUnit: 'hours', validityHours: 24, customFrom: '', customTo: '', retentionDays: 30,
   aliases: { colors: { prata: 'silver' }, models: {} }, defaultFilters: {},
   blockedSupplierIds: [], blockedGroupIds: [], onePerSupplier: false, sort: 'cashAscending', priceCriterion: 'cash',
   recipientMode: 'owner', ownerRecipientUserId: null, responsibleRecipientIds: [], allowOriginReplies: false, selfCommandsEnabled: true,
@@ -49,7 +49,8 @@ function validateFilters(input = {}) {
   for (const [key, value] of Object.entries(input)) {
     if (value === null || value === undefined || value === '') continue;
     if (numeric[key]) output[key] = safeNumber(value, ...numeric[key], key);
-    else if (['model', 'modelKey', 'color', 'colorKey', 'condition', 'supplier', 'supplierKey', 'warranty'].includes(key)) { if (!boundedText(value, 256)) fail(`Filtro ${key} inválido.`); output[key] = value.trim(); }
+    else if (['model', 'modelKey', 'color', 'colorKey', 'condition', 'supplier', 'supplierKey', 'warranty', 'groupId'].includes(key)) { if (!boundedText(value, 256)) fail(`Filtro ${key} inválido.`); output[key] = value.trim(); }
+    else if (key === 'groupIds') output[key] = strings(value);
     else fail('Um filtro informado não é reconhecido.');
   }
   if (output.condition && !['lacrado', 'seminovo', 'usado', 'cpo'].includes(output.condition.toLowerCase())) fail('Condição inválida.');
@@ -69,7 +70,7 @@ function offerContact(text) {
 function validateSearchSettings(input, previous = DEFAULT_SEARCH_SETTINGS) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('Configurações de BUSCAS inválidas.');
   const settings = { ...structuredClone(DEFAULT_SEARCH_SETTINGS), ...structuredClone(previous) };
-  for (const name of ['enabled', 'privateCommandsEnabled', 'onePerSupplier', 'allowOriginReplies', 'importHistory', 'selfCommandsEnabled']) {
+  for (const name of ['enabled', 'privateCommandsEnabled', 'onePerSupplier', 'allowOriginReplies', 'importHistory', 'selfCommandsEnabled', 'maxAgeEnabled']) {
     if (input[name] !== undefined) { if (typeof input[name] !== 'boolean') fail(`Opção ${name} inválida.`); settings[name] = input[name]; }
   }
   for (const name of ['monitoredGroupIds', 'commandGroupIds', 'commandPrivateNumbers', 'blockedSupplierIds', 'blockedGroupIds', 'responsibleRecipientIds']) if (input[name] !== undefined) settings[name] = strings(input[name]);
@@ -78,6 +79,9 @@ function validateSearchSettings(input, previous = DEFAULT_SEARCH_SETTINGS) {
   if (input.prefix !== undefined) { if (typeof input.prefix !== 'string' || !/^![\p{L}\p{N}_-]{1,31}$/u.test(input.prefix)) fail('O prefixo deve começar com ! e conter até 31 letras, números, _ ou -.'); settings.prefix = input.prefix; }
   if (input.maxResults !== undefined) settings.maxResults = safeNumber(input.maxResults, 1, 10, 'Quantidade de resultados');
   if (input.validityHours !== undefined) settings.validityHours = safeNumber(input.validityHours, 1, 8760, 'Validade em horas');
+  if (input.maxAgeValue !== undefined) settings.maxAgeValue = safeNumber(input.maxAgeValue, 1, 525600, 'Idade máxima da oferta');
+  if (input.maxAgeUnit !== undefined) { if (!['minutes', 'hours'].includes(input.maxAgeUnit)) fail('Unidade da idade máxima inválida.'); settings.maxAgeUnit = input.maxAgeUnit; }
+  if (settings.maxAgeValue * (settings.maxAgeUnit === 'hours' ? 60 : 1) > 525600) fail('A idade máxima não pode exceder 365 dias.');
   if (input.retentionDays !== undefined) settings.retentionDays = safeNumber(input.retentionDays, 1, 3650, 'Retenção em dias');
   if (input.timezone !== undefined) { try { new Intl.DateTimeFormat('pt-BR', { timeZone: input.timezone }).format(); } catch { fail('Fuso horário inválido.'); } settings.timezone = input.timezone; }
   if (input.sort !== undefined) { if (!['cashAscending', 'cashDescending', 'recent'].includes(input.sort)) fail('Critério de ordenação inválido.'); settings.sort = input.sort; }
@@ -99,8 +103,8 @@ function validateSearchSettings(input, previous = DEFAULT_SEARCH_SETTINGS) {
 }
 
 class SearchService extends EventEmitter {
-  constructor({ store, adapter, authService, scheduler, now = () => Date.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
-    super(); Object.assign(this, { store, adapter, authService, scheduler, now, sleep });
+  constructor({ store, adapter, authService, scheduler, now = () => Date.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), automationGuard = () => true }) {
+    super(); Object.assign(this, { store, adapter, authService, scheduler, now, sleep, automationGuard });
     this.started = false; this.closed = false; this.paused = false; this.capturePump = null; this.deliveryPump = null;
     this.waitingCommands = 0; this.commandTail = Promise.resolve(); this.rateLimits = new Map(); this.cleanupTokens = new Map();
     this.monitor = store.getSetting('buscasMonitor', { startedAt: null, lastCaptureAt: null, lastSyncAt: null, lastHeartbeatAt: null, openGap: null });
@@ -114,6 +118,8 @@ class SearchService extends EventEmitter {
       receipt: receipt => { this._receipt(receipt); }
     };
   }
+  setAutomationGuard(guard) { if (typeof guard !== 'function') throw new TypeError('Controle de automação inválido.'); this.automationGuard = guard; }
+  _automationAllowed() { return this.automationGuard() !== false; }
   _settings() { return validateSearchSettings({}, this.store.getSetting('buscasSettings', DEFAULT_SEARCH_SETTINGS)); }
   _user(id) { if (typeof id !== 'string' || !id) return null; const user = this.store.getEntity('users', id), role = user && this.store.getEntity('roles', user.roleId); return user && role && user.active !== false && !user.requirePasswordChange ? { ...user, isOwner: !!role.isOwner } : null; }
   _grant(actorId) { return this.store.getSearchAuthorization?.(`user:${actorId}`) || this.store.getSearchAuthorization?.(actorId) || null; }
@@ -128,11 +134,12 @@ class SearchService extends EventEmitter {
   _diagnostic(code, description, error) { this.store.addDiagnostic?.({ id: randomUUID(), at: this.now(), stage: 'buscas', code, description, action: 'Consulte BUSCAS e reveja a captura ou o resultado incerto.', guidance: 'Verifique conexão, grupos selecionados e permissões. Ofertas ambíguas não entram no ranking.', attempts: 0, detail: error?.code || null }); }
   _trace(traceId, stage, details = {}) {
     const descriptions = { received: 'Comando recebido.', authorization: 'Autorização do comando verificada.', parsed: 'Comando interpretado.', results: 'Consulta de ofertas concluída.', recipient: 'Destinatário da busca definido.', queued: 'Resposta colocada na fila persistente.', submitted: 'Resposta submetida à integração.', integration: 'Resultado da integração recebido.', rejected: 'Comando ignorado.', failure: 'Falha no processamento da busca.', retry: 'Nova tentativa de entrega solicitada.' };
-    this.store.addDiagnostic?.({ id: randomUUID(), at: this.now(), traceId, stage: `buscas.${stage}`, code: details.code || `SEARCH_${stage.toUpperCase()}`, description: descriptions[stage] || 'Etapa do processamento de BUSCAS.', actorId: details.actorId || null, action: details.action || 'Consulte o histórico de BUSCAS para acompanhar a entrega.', attempts: details.attempts || 0, detail: Object.fromEntries(Object.entries(details).filter(([key]) => ['reason', 'approved', 'resultCount', 'deliveryId', 'recipientId', 'target', 'status', 'messageId', 'source', 'confirmationScope'].includes(key))) });
+    const explanations = { conversation_not_enabled: 'Comando privado bloqueado pelas configurações de conversas habilitadas. Confira BUSCAS → Configurações: aceitar comandos privados e a lista opcional de números.', sender_not_authorized: 'O número real do remetente não possui autorização de busca e permissões correspondentes.', sender_identity_unavailable: 'O WhatsApp não forneceu identidade e telefone confiáveis suficientes para autorizar o comando.', module_disabled_or_paused: 'O módulo BUSCAS está desativado ou pausado.', old_or_missing_timestamp: 'O comando é antigo ou não possui data original confiável; foi ignorado para evitar repetição.', duplicate_message: 'Este comando já foi processado; nenhuma resposta duplicada foi criada.' };
+    this.store.addDiagnostic?.({ id: randomUUID(), at: this.now(), traceId, stage: `buscas.${stage}`, code: details.code || `SEARCH_${stage.toUpperCase()}`, description: explanations[details.reason] || descriptions[stage] || 'Etapa do processamento de BUSCAS.', actorId: details.actorId || null, action: details.action || 'Consulte o histórico de BUSCAS para acompanhar a entrega.', attempts: details.attempts || 0, detail: Object.fromEntries(Object.entries(details).filter(([key]) => ['reason', 'approved', 'resultCount', 'deliveryId', 'recipientId', 'target', 'status', 'messageId', 'source', 'confirmationScope'].includes(key))) });
   }
   _safeError(error) {
-    const messages = { SEARCH_RECIPIENT_MISSING: 'Nenhum destinatário válido está configurado', SEARCH_OWNER_RECIPIENT_INVALID: 'O dono selecionado está inativo ou sem telefone válido', SEARCH_RATE_LIMIT: 'Limite de buscas atingido; aguarde antes de tentar novamente', SEARCH_DENIED: 'A autorização para buscar foi removida', SEARCH_DISABLED: 'O módulo BUSCAS está desativado', RECIPIENT_NOT_REGISTERED: 'O destinatário não foi encontrado no WhatsApp', PRIVATE_RECIPIENT_INVALID: 'Telefone do destinatário inválido; confira código do país e DDD', DISCONNECTED: 'O WhatsApp está desconectado', SEARCH_TARGET_DISABLED: 'O destinatário ou a autorização mudou antes do envio; nenhuma mensagem foi enviada', SEARCH_RESULT_UNCERTAIN: 'Não foi possível confirmar a entrega; revise o histórico antes de repetir', SEARCH_INVALID: 'Os filtros ou a configuração da busca são inválidos' };
-    Object.assign(messages, { WA_RECIPIENT_INVALID: 'Telefone inválido; confira código do país, DDD e número', WA_RECIPIENT_OFFLINE: 'O WhatsApp está desconectado; o envio permanece pendente', WA_RECIPIENT_NOT_FOUND: 'O número configurado não foi encontrado no WhatsApp', WA_RECIPIENT_AMBIGUOUS: 'O WhatsApp retornou mais de um destinatário; revise o telefone', WA_RECIPIENT_MISMATCH: 'O telefone resolvido difere do cadastrado; revise o destinatário', WA_RECIPIENT_INVALID_JID: 'O WhatsApp retornou um identificador de destinatário inválido', WA_RECIPIENT_NUMBER_UNAVAILABLE: 'Cadastre o telefone real do destinatário com código do país e DDD', WA_RECIPIENT_UNSUPPORTED: 'A integração instalada não disponibiliza a validação do destinatário; atualize o aplicativo', WA_RECIPIENT_TIMEOUT: 'O WhatsApp não respondeu à validação do telefone; será feita uma tentativa limitada', WA_RECIPIENT_CONNECTION_CHANGED: 'A conexão mudou durante a validação; nenhuma mensagem foi enviada', WA_RECIPIENT_LOOKUP_INCOMPLETE: 'O WhatsApp não confirmou o destinatário; nenhuma mensagem foi enviada', WA_RECIPIENT_LOOKUP_TEMPORARY: 'Falha temporária na validação do telefone; será feita uma tentativa limitada', WA_RECIPIENT_LOOKUP_REJECTED: 'O WhatsApp recusou a validação do telefone; verifique a conexão e restrições', WA_RECIPIENT_BUSY: 'A fila de validação de destinatários está ocupada; aguarde uma nova tentativa' });
+    const messages = { SEARCH_RECIPIENT_MISSING: 'Nenhum destinatário válido está configurado', SEARCH_OWNER_RECIPIENT_INVALID: 'O dono selecionado está inativo ou sem telefone válido', SEARCH_RATE_LIMIT: 'Limite de buscas atingido; aguarde antes de tentar novamente', SEARCH_DENIED: 'A autorização para buscar foi removida', SEARCH_DISABLED: 'O módulo BUSCAS está desativado', SEARCH_MODE_CHANGED: 'O modo de operação mudou durante a busca; pesquise novamente', RECIPIENT_NOT_REGISTERED: 'O destinatário não foi encontrado no WhatsApp', PRIVATE_RECIPIENT_INVALID: 'Telefone do destinatário inválido; confira código do país e DDD', DISCONNECTED: 'O WhatsApp está desconectado', SEARCH_TARGET_DISABLED: 'O destinatário ou a autorização mudou antes do envio; nenhuma mensagem foi enviada', SEARCH_RESULT_UNCERTAIN: 'Não foi possível confirmar a entrega; revise o histórico antes de repetir', AUTOMATION_STOPPED: 'Os envios automáticos foram interrompidos; retome explicitamente para enviar novamente', SEARCH_INVALID: 'Os filtros ou a configuração da busca são inválidos' };
+    Object.assign(messages, { WA_RECIPIENT_INVALID: 'Telefone inválido; confira código do país, DDD e número', WA_RECIPIENT_OFFLINE: 'O WhatsApp está desconectado; o envio permanece pendente', WA_RECIPIENT_NOT_FOUND: 'O número configurado não foi encontrado no WhatsApp', WA_RECIPIENT_AMBIGUOUS: 'O WhatsApp retornou mais de um destinatário; revise o telefone', WA_RECIPIENT_MISMATCH: 'O telefone resolvido difere do cadastrado; revise o destinatário', WA_RECIPIENT_INVALID_JID: 'O WhatsApp retornou um identificador de destinatário inválido', WA_RECIPIENT_NUMBER_UNAVAILABLE: 'Cadastre o telefone real do destinatário com código do país e DDD', WA_RECIPIENT_UNSUPPORTED: 'A integração instalada não disponibiliza a validação do destinatário; atualize o aplicativo', WA_RECIPIENT_TIMEOUT: 'O WhatsApp não respondeu à validação do telefone; será feita uma tentativa limitada', WA_RECIPIENT_CONNECTION_CHANGED: 'A conexão mudou durante a validação; nenhuma mensagem foi enviada', WA_RECIPIENT_LOOKUP_INCOMPLETE: 'O WhatsApp não confirmou o destinatário; nenhuma mensagem foi enviada', WA_RECIPIENT_LOOKUP_TEMPORARY: 'Falha temporária na validação do telefone; será feita uma tentativa limitada', WA_RECIPIENT_LOOKUP_REJECTED: 'O WhatsApp recusou a validação do telefone; verifique a conexão e restrições', WA_RECIPIENT_BUSY: 'A fila de validação de destinatários está ocupada; aguarde uma nova tentativa', WA_REPLY_CONTEXT_INVALID: 'A conversa não possui prova válida do comando privado; envie o comando novamente pela conversa autorizada', WA_REPLY_RECIPIENT_MISMATCH: 'O destino da resposta difere do remetente autenticado; nenhuma mensagem foi enviada' });
     return messages[error?.code] || 'Não foi possível concluir a busca ou confirmar sua entrega';
   }
   _persistMonitor() { this.store.setSetting('buscasMonitor', this.monitor); }
@@ -149,15 +156,15 @@ class SearchService extends EventEmitter {
     this.monitor.lastHeartbeatAt = this.now(); this._persistMonitor();
     for (const delivery of page(this.store.listSearchDeliveries?.({ status: 'sending', limit: 500 }))) this.store.updateSearchDelivery(delivery.id, { status: 'uncertain', resultAt: this.now(), error: 'Envio interrompido; revisão necessária antes de repetir.' });
     this._configure(); this._onStatus(this.adapter?.status || { state: 'disconnected' }); this._drain();
-    this.timer = setInterval(() => { if (this.closed) return; try { this.monitor.lastHeartbeatAt = this.now(); this._persistMonitor(); this.store.applySearchRetention?.({ days: this._settings().retentionDays, at: this.now() }); this._drain(); void this.flushDeliveries(); } catch (e) { this._diagnostic('SEARCH_MAINTENANCE_ERROR', 'Falha na manutenção da captura.', e); } }, 30_000); this.timer.unref?.();
+    this.timer = setInterval(() => { if (this.closed) return; try { this.monitor.lastHeartbeatAt = this.now(); this._persistMonitor(); this.store.applySearchRetention?.({ days: this._settings().retentionDays, at: this.now() }); this._drain(); this._flushInBackground(); } catch (e) { this._diagnostic('SEARCH_MAINTENANCE_ERROR', 'Falha na manutenção da captura.', e); } }, 30_000); this.timer.unref?.();
   }
   async shutdown() { if (this.closed) return; this.closed = true; clearInterval(this.timer); this._detach(this.adapter); await this.capturePump?.catch(() => {}); await this.commandTail.catch(() => {}); await this.deliveryPump?.catch(() => {}); this.monitor.lastHeartbeatAt = this.now(); this._persistMonitor(); }
   setAdapter(adapter) { this._detach(this.adapter); this.adapter = adapter; this.monitor = this.store.getSetting('buscasMonitor', { startedAt: null, lastCaptureAt: null, lastSyncAt: null, lastHeartbeatAt: null, openGap: null }); this.rateLimits.clear(); this.cleanupTokens.clear(); if (this.started && !this.closed) this._attach(adapter); this._configure(); this._onStatus(adapter?.status || { state: 'disconnected' }); }
   async suspendCapture(reason = 'maintenance') { this.paused = true; if (this._settings().enabled) this._openGap(reason); this._configure(); await this.capturePump?.catch(() => {}); await this.commandTail.catch(() => {}); await this.deliveryPump?.catch(() => {}); }
   resumeCapture() { this.paused = false; this._configure(); this._onStatus(this.adapter?.status || { state: 'disconnected' }); this._drain(); }
   async _waitCaptureIdle() { while (!this.closed && !this.paused) { const running = this._drain(); if (running) await running; if (!page(this.store.listSearchInbox({ status: 'queued', limit: 1 })).length) break; } }
-  async waitForIdle() { await this._waitCaptureIdle(); await this.commandTail; await this._waitCaptureIdle(); do { await this.deliveryPump; if (this.closed || this.paused || this.adapter?.status?.state !== 'connected' || !page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length) break; await this.flushDeliveries(); } while (!this.closed); }
-  _onStatus(status) { if (this.closed || !this._settings().enabled) return; if (status?.state === 'connected' && !this.paused) { this._closeGap(); void this.flushDeliveries(); } else this._openGap(status?.reasonCode || 'disconnected'); this.emit('change'); }
+  async waitForIdle() { await this._waitCaptureIdle(); await this.commandTail; await this._waitCaptureIdle(); do { await this.deliveryPump; if (this.closed || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected' || !page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length) break; await this.flushDeliveries(); } while (!this.closed); }
+  _onStatus(status) { if (this.closed || !this._settings().enabled) return; if (status?.state === 'connected' && !this.paused) { this._closeGap(); this._flushInBackground(); } else this._openGap(status?.reasonCode || 'disconnected'); this.emit('change'); }
   getState(actorId) {
     this.groups = new Map(this.store.listGroups().map(group => [group.id, group]));
     const permissions = Object.fromEntries(Object.keys(PERMISSIONS).map(p => [p, this._can(actorId, p)]));
@@ -175,10 +182,10 @@ class SearchService extends EventEmitter {
   }
   saveSettings(payload, actorId) {
     const input = payload?.settings || payload; const previous = this._settings();
-    const keys = Object.keys(input || {}); if (keys.some(k => !['defaultFilters', 'aliases'].includes(k))) this._assert(actorId, 'manage'); else this._assert(actorId, 'filters');
+    const keys = Object.keys(input || {}); if (keys.some(k => !['defaultFilters', 'aliases', 'sort', 'maxAgeEnabled', 'maxAgeValue', 'maxAgeUnit'].includes(k))) this._assert(actorId, 'manage'); else this._assert(actorId, 'filters');
     const settings = validateSearchSettings(input, previous);
     const known = new Set(this.store.listGroups().map(g => g.id));
-    if ([...settings.monitoredGroupIds, ...settings.commandGroupIds, ...settings.blockedGroupIds].some(id => !known.has(id))) fail('Selecione grupos disponíveis na conta.');
+    if ([...settings.monitoredGroupIds, ...settings.commandGroupIds, ...settings.blockedGroupIds, ...(settings.defaultFilters.groupIds || []), ...(settings.defaultFilters.groupId ? [settings.defaultFilters.groupId] : [])].some(id => !known.has(id))) fail('Selecione grupos disponíveis na conta.');
     if (settings.ownerRecipientUserId) { const user = this._user(settings.ownerRecipientUserId); if (!user?.isOwner || !phone(user.phone)) fail('Selecione um Dono ativo com telefone real.'); }
     for (const id of settings.responsibleRecipientIds) if (!this._recipientById(id)) fail('Um responsável selecionado não está cadastrado ou não tem telefone válido.');
     for (const number of settings.commandPrivateNumbers) if (!this.authService.findAuthorizedPhone(number)) fail('Conversas de comando devem corresponder a usuários ativos com telefone autorizado.');
@@ -266,7 +273,7 @@ class SearchService extends EventEmitter {
     if (selfChat && settings.selfCommandsEnabled) return true;
     if (!settings.privateCommandsEnabled) return false;
     if (own) { const number = phone(ctx.chatId?.match(/^(\d+)@s\.whatsapp\.net$/)?.[1]); return !!number && settings.commandPrivateNumbers.includes(number); }
-    return settings.commandPrivateNumbers.includes(phone(ctx.senderNumber)) && (ctx.chatId === `${ctx.senderNumber}@s.whatsapp.net` || /^\d+@lid$/.test(ctx.chatId || ''));
+    return (!settings.commandPrivateNumbers.length || settings.commandPrivateNumbers.includes(phone(ctx.senderNumber))) && (ctx.chatId === `${ctx.senderNumber}@s.whatsapp.net` || /^\d+@lid$/.test(ctx.chatId || '')); 
   }
   async handleIncoming(ctx) {
     if (this.closed) return false; this._enqueue(ctx);
@@ -310,7 +317,12 @@ class SearchService extends EventEmitter {
     if (!options.run) this.store.saveSearchRun(run);
     try {
     await this._waitCaptureIdle();
-    const period = { from: settings.customFrom ? parseZonedTime(settings.customFrom, settings.timezone) : this.now() - settings.validityHours * 3600_000, to: settings.customTo ? parseZonedTime(settings.customTo, settings.timezone) : this.now() };
+    this._assert(actorId, 'search');
+    if (run.storageMode && run.storageMode !== this._mode()) fail('O modo de operação mudou durante a busca. Pesquise novamente no modo atual.', 'SEARCH_MODE_CHANGED');
+    const ageMinutes = settings.maxAgeEnabled ? settings.maxAgeValue * (settings.maxAgeUnit === 'hours' ? 60 : 1) : null;
+    const ageFrom = ageMinutes === null ? null : this.now() - ageMinutes * 60_000;
+    const customFrom = settings.customFrom ? parseZonedTime(settings.customFrom, settings.timezone) : null;
+    const period = { from: customFrom === null ? ageFrom : ageFrom === null ? customFrom : Math.max(customFrom, ageFrom), to: settings.customTo ? parseZonedTime(settings.customTo, settings.timezone) : this.now(), maxAgeMinutes: ageMinutes }; 
     const stale = this.adapter?.status?.state !== 'connected' || !!this.monitor.openGap;
     let results = [], parsedFilters = {}, guidance = null;
     if (!query) guidance = `Use ${settings.prefix} iPhone 18 Pro Max 256GB Silver para buscar ofertas capturadas.`;
@@ -324,6 +336,8 @@ class SearchService extends EventEmitter {
         const effective = { ...defaults, ...Object.fromEntries(Object.entries(parsedFilters).filter(([, value]) => value !== null && value !== undefined)), ...extra };
         effective.batteryMin = effective.minBattery ?? effective.batteryMin; effective.batteryMax = effective.maxBattery ?? effective.batteryMax; effective.priceMinCents = effective.minPriceCents ?? effective.priceMinCents; effective.priceMaxCents = effective.maxPriceCents ?? effective.priceMaxCents;
         const queryFilters = { ...effective, minBattery: effective.batteryMin, maxBattery: effective.batteryMax, minPriceCents: effective.priceMinCents, maxPriceCents: effective.priceMaxCents, priceKind: settings.priceCriterion === 'announced' ? undefined : settings.priceCriterion, order: settings.sort === 'recent' ? 'recent' : settings.sort === 'cashDescending' ? 'price-desc' : 'price', onePerSupplier: settings.onePerSupplier, from: period.from, to: period.to, excludedSupplierKeys: settings.blockedSupplierIds, excludedGroupIds: settings.blockedGroupIds, confidence: 'confirmed', latest: true, limit: 500, offset: 0, includeReview: false, includeUnavailable: false };
+        const requestedGroups = effective.groupIds || (effective.groupId ? [effective.groupId] : null);
+        queryFilters.groupIds = requestedGroups ? settings.monitoredGroupIds.filter(id => requestedGroups.includes(id)) : settings.monitoredGroupIds;
         delete queryFilters.valid; delete queryFilters.reason;
         const candidates = page(this.store.querySearchOffers(queryFilters));
         results = rankOffers(candidates, effective, { priceCriterion: settings.priceCriterion, candidateLimit: 500, maxResults: 10, onePerSupplier: false, blockedSuppliers: settings.blockedSupplierIds, blockedGroups: settings.blockedGroupIds }); const seenSuppliers = new Set();
@@ -341,15 +355,16 @@ class SearchService extends EventEmitter {
       const targets = this._targets(settings, actorId, options.context); const chunks = formatSearchResults(answer, settings);
       if (!targets.length) fail('Nenhum destinatário autorizado com telefone válido está configurado.', 'SEARCH_RECIPIENT_MISSING');
       for (const target of targets) for (const [index, text] of chunks.entries()) this._queueDelivery({ id: `${run.id}:${hash(target).slice(0, 16)}:${index}`, run, actorId, target, text, recipientMode: settings.recipientMode, context: options.context });
-      if (options.asyncDelivery) void this.flushDeliveries().catch(error => this._diagnostic('SEARCH_DELIVERY_PUMP_ERROR', this._safeError(error), error)); else await this.flushDeliveries(); answer.delivery = page(this.store.listSearchDeliveries({ runId: run.id, limit: 100 }));
+      if (options.asyncDelivery) this._flushInBackground(); else await this.flushDeliveries(); answer.delivery = page(this.store.listSearchDeliveries({ runId: run.id, limit: 100 })).map(delivery => this._deliveryView(delivery));
     }
     this.emit('change'); return answer;
     } catch (error) { this.store.saveSearchRun({ ...this.store.getSearchRun(run.id), status: 'failed', code: error.code || 'SEARCH_QUERY_ERROR', error: this._safeError(error), completedAt: this.now() }); this._trace(run.traceId || run.id, 'failure', { actorId, code: error.code || 'SEARCH_QUERY_ERROR', reason: this._safeError(error) }); this._diagnostic(error.code || 'SEARCH_QUERY_ERROR', this._safeError(error), error); this.emit('change'); throw error; }
   }
   _queueDelivery({ id, run, actorId, target, text, recipientMode, context, recipientId, test = false, errorNotice = false }) {
     const clientMessageId = `KENNED-SEARCH-${randomUUID()}`;
+    if (!this._automationAllowed()) fail('Os envios automáticos estão interrompidos. Retome explicitamente pelo aplicativo ou comando administrativo.', 'AUTOMATION_STOPPED');
     this._trace(run.traceId || run.id, 'recipient', { actorId, target, recipientId });
-    const delivery = this.store.saveSearchDelivery({ id, runId: run.id, traceId: run.traceId || run.id, actorId, target, recipientId: recipientId || null, text, clientMessageId, messageId: clientMessageId, recipientMode, status: 'pending', attempts: 0, createdAt: this.now(), sourceChatId: context?.chatId || null, sourceIsGroup: context?.isGroup === true, sourceSenderNumber: context?.senderNumber || null, sourceTrustedSelf: context?.sourceTrustedSelf === true || this._trustedSelf(context), sourceSelfChat: context?.selfChat === true, test, errorNotice, storageMode: this._mode(), simulation: this._mode() === 'simulated' });
+    const delivery = this.store.saveSearchDelivery({ id, runId: run.id, traceId: run.traceId || run.id, actorId, target, recipientId: recipientId || null, text, clientMessageId, messageId: clientMessageId, recipientMode, status: 'pending', attempts: 0, createdAt: this.now(), sourceChatId: context?.chatId || null, sourceIsGroup: context?.isGroup === true, sourceSenderNumber: context?.senderNumber || null, sourceIdentityVerified: context?.identityVerified === true || context?.verified === true, sourceSenderId: context?.senderId || null, sourceReplyProof: context?.replyProof || null,  sourceTrustedSelf: context?.sourceTrustedSelf === true || this._trustedSelf(context), sourceSelfChat: context?.selfChat === true, sourceIncomingPrivate: context?.isGroup === false && context?.fromMe === false, test, errorNotice, storageMode: this._mode(), simulation: this._mode() === 'simulated' });
     this._trace(delivery.traceId, 'queued', { actorId, deliveryId: delivery.id, target, status: 'pending' }); return delivery;
   }
   async _queueFailureNotice(run, context, error, { deferFlush = false } = {}) {
@@ -361,6 +376,13 @@ class SearchService extends EventEmitter {
   }
   _recipientById(id) { if (typeof id !== 'string') return null; if (id.startsWith('user:')) { const u = this._user(id.slice(5)); return u && phone(u.phone); } const r = this.store.getAlertRecipient?.(id) || this.store.getEntity('alert_recipients', id); return r?.enabled !== false && phone(r?.phone); }
   _targets(settings, actorId, ctx) {
+    // A received private command is a private interaction with its authenticated
+    // requester. Broadcast preferences apply only to groups and application searches.
+    if (ctx?.fromMe === false && ctx.isGroup === false || ctx?.sourceIncomingPrivate === true) {
+      const number = phone(ctx.senderNumber);
+      if (!number || this.authService.findAuthorizedPhone(number)?.id !== actorId || !this._commandLocation(ctx, settings, false)) return [];
+      return [ctx.chatId];
+    }
     if (settings.recipientMode === 'origin') { if (!settings.allowOriginReplies || !ctx || !this._commandLocation(ctx, settings, ctx.sourceTrustedSelf === true || this._trustedSelf(ctx))) return []; return [ctx.chatId]; }
     if (settings.recipientMode === 'requester') { const user = this._assert(actorId, 'search'), sourceNumber = phone(ctx?.senderNumber); const number = sourceNumber && this.authService.findAuthorizedPhone(sourceNumber)?.id === actorId ? sourceNumber : phone(user.phone); return number ? [`${number}@s.whatsapp.net`] : []; }
     if (settings.recipientMode === 'responsibles') { const numbers = settings.responsibleRecipientIds.map(id => this._recipientById(id)); if (numbers.some(n => !n)) fail('Um responsável selecionado não tem telefone válido ou está desativado.', 'SEARCH_RECIPIENT_MISSING'); return [...new Set(numbers.map(n => `${n}@s.whatsapp.net`))]; }
@@ -382,7 +404,7 @@ class SearchService extends EventEmitter {
     const number = this._recipientById(recipientId); if (!number) fail('Selecione um destinatário ativo com telefone válido, incluindo código do país e DDD.', 'SEARCH_RECIPIENT_MISSING');
     const run = this.store.saveSearchRun({ id: randomUUID(), traceId: randomUUID(), actorId, requestedAt: this.now(), source: 'recipient-test', query: '', status: 'completed', resultCount: 0, completedAt: this.now(), storageMode: this._mode() });
     const delivery = this._queueDelivery({ id: `${run.id}:test`, run, actorId, target: `${number}@s.whatsapp.net`, text: `✅ Kenned Code Disparos — teste de envio dos resultados de BUSCAS.\nHorário: ${new Date(this.now()).toLocaleString('pt-BR', { timeZone: this._settings().timezone })}\nRastreamento: ${run.traceId}\nEste teste usa a fila e a confirmação da integração.`, recipientMode: 'test', recipientId, test: true });
-    void this.flushDeliveries().catch(error => this._diagnostic('SEARCH_DELIVERY_PUMP_ERROR', this._safeError(error), error)); this.emit('change'); return this._deliveryView(this.store.getSearchDelivery(delivery.id));
+    this._flushInBackground(); this.emit('change'); return this._deliveryView(this.store.getSearchDelivery(delivery.id));
   }
   async retryDelivery(payload, actorId) {
     const delivery = this.store.getSearchDelivery(payload?.id); if (!delivery) fail('Entrega não encontrada.');
@@ -390,20 +412,60 @@ class SearchService extends EventEmitter {
     if (!['failed', 'pending'].includes(delivery.status) || delivery.status === 'failed' && delivery.safeToRetry !== true) fail('Somente falhas comprovadamente anteriores ao envio podem ser repetidas. Resultados incertos precisam de revisão.', 'SEARCH_RETRY_UNSAFE');
     this.store.updateSearchDelivery(delivery.id, { status: 'pending', nextAttemptAt: 0, attempts: 0, resultAt: null, code: null, error: null }); this._trace(delivery.traceId || delivery.runId, 'retry', { actorId, deliveryId: delivery.id }); await this.flushDeliveries(); this.emit('change'); return this._deliveryView(this.store.getSearchDelivery(delivery.id));
   }
+  stopPending({ actorId = null, reason = 'Envios interrompidos pelo controle global.', at = this.now() } = {}) {
+    let cancelled = 0, records;
+    do { records = page(this.store.listSearchDeliveries({ status: 'pending', limit: 500 })); for (const delivery of records) { this.store.updateSearchDelivery(delivery.id, { status: 'cancelled', resultAt: at, cancelledAt: at, cancelledBy: actorId, code: 'AUTOMATION_STOPPED', error: reason, safeToRetry: false }); cancelled++; this._trace(delivery.traceId || delivery.runId, 'integration', { actorId, deliveryId: delivery.id, status: 'cancelled', code: 'AUTOMATION_STOPPED' }); } } while (records.length);
+    const inFlight = this.store.listSearchDeliveries({ status: 'sending', limit: 0 }).total || 0; this.emit('change'); return { cancelled, inFlight };
+  }
+  _incomingPrivateDelivery(delivery) { return delivery.sourceIncomingPrivate === true || delivery.sourceIncomingPrivate === undefined && delivery.sourceIsGroup === false && delivery.sourceTrustedSelf !== true && !!phone(delivery.sourceSenderNumber) && (delivery.sourceChatId === `${delivery.sourceSenderNumber}@s.whatsapp.net` || /^\d+@lid$/.test(delivery.sourceChatId || '')); }
   _deliveryAuthorized(delivery) {
     if (delivery.storageMode && delivery.storageMode !== this._mode() || !this._can(delivery.actorId, delivery.test ? 'manage' : 'search')) return false;
     const currentSettings = this._settings();
     if (delivery.test) return `${this._recipientById(delivery.recipientId)}@s.whatsapp.net` === delivery.target;
     if (!currentSettings.enabled) return false;
     if (delivery.errorNotice) return this._commandLocation({ chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, selfChat: delivery.sourceSelfChat }, currentSettings, delivery.sourceTrustedSelf) && `${delivery.sourceSenderNumber}@s.whatsapp.net` === delivery.target;
-    return this._targets(currentSettings, delivery.actorId, delivery.sourceChatId ? { chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, sourceTrustedSelf: delivery.sourceTrustedSelf, selfChat: delivery.sourceSelfChat } : null).includes(delivery.target);
+    return this._targets(currentSettings, delivery.actorId, delivery.sourceChatId ? { chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, sourceTrustedSelf: delivery.sourceTrustedSelf, selfChat: delivery.sourceSelfChat, sourceIncomingPrivate: this._incomingPrivateDelivery(delivery) } : null).includes(delivery.target);
   }
-  flushDeliveries() { if (this.deliveryPump) return this.deliveryPump; if (this.closed || this.paused || this.adapter?.status?.state !== 'connected' || this.store.persistenceFailed) return Promise.resolve(); this.deliveryPump = (this.scheduler?.runExternalSubmission ? this.scheduler.runExternalSubmission(() => this._flushDeliveries()) : this._flushDeliveries()).finally(() => { this.deliveryPump = null; if (!this.closed && !this.paused && this.adapter?.status?.state === 'connected' && !this.store.persistenceFailed && page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length) queueMicrotask(() => { void this.flushDeliveries().catch(error => this._diagnostic('SEARCH_DELIVERY_PUMP_ERROR', this._safeError(error), error)); }); }); return this.deliveryPump; }
+  _flushInBackground() {
+    // Status events and maintenance have no caller awaiting their promise.
+    // Catch synchronous setup failures as well as asynchronous queue failures.
+    const report = error => {
+      try { this._diagnostic('SEARCH_DELIVERY_PUMP_ERROR', this._safeError(error), error); }
+      catch { /* An unavailable diagnostic store cannot reject an event handler. */ }
+    };
+    try { void this.flushDeliveries().catch(report); }
+    catch (error) { report(error); }
+  }
+  flushDeliveries() {
+    if (this.deliveryPump) return this.deliveryPump;
+    if (this.closed || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected' || this.store.persistenceFailed) return Promise.resolve();
+    let completed = false, submission;
+    // Acquire the scheduler hold immediately, before another round can start.
+    try { submission = this.scheduler?.runExternalSubmission
+      ? this.scheduler.runExternalSubmission(() => this._flushDeliveries()) : this._flushDeliveries(); }
+    catch (error) { submission = Promise.reject(error); }
+    this.deliveryPump = Promise.resolve(submission)
+      .then(result => { completed = true; return result; })
+      .catch(error => {
+        // The shared scheduler cancels an unstarted submission during global
+        // stop. Nothing was sent: the stop handler owns durable cancellation,
+        // and this is not a provider error or a persistence failure.
+        if (error?.code === 'AUTOMATION_STOPPED' && error.submitted === false) return;
+        throw error;
+      }).finally(() => {
+        this.deliveryPump = null;
+        // Only a completed batch may immediately continue. A rejected pump
+        // must not spin indefinitely in microtasks while pending rows remain.
+        if (completed && !this.closed && !this.paused && this._automationAllowed() && this.adapter?.status?.state === 'connected' && !this.store.persistenceFailed && page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length)
+          queueMicrotask(() => this._flushInBackground());
+      });
+    return this.deliveryPump;
+  }
   async _flushDeliveries() {
     const release = this.scheduler?.holdSubmissions?.() || (() => {}); try { await this.scheduler?.waitForIdle?.();
       const pending = page(this.store.listSearchDeliveries({ status: 'pending', limit: 100 }));
       for (const delivery of pending) {
-        if (this.closed || this.adapter?.status?.state !== 'connected') break;
+        if (this.closed || !this._automationAllowed() || this.adapter?.status?.state !== 'connected') break;
         if (delivery.nextAttemptAt > this.now()) continue;
         if (!this._can(delivery.actorId, delivery.test ? 'manage' : 'search')) { this.store.updateSearchDelivery(delivery.id, { status: 'failed', resultAt: this.now(), code: 'SEARCH_DENIED', safeToRetry: true, error: 'A autorização do solicitante foi removida.' }); continue; }
         let authorizedTarget = false;
@@ -412,24 +474,25 @@ class SearchService extends EventEmitter {
         if (!authorizedTarget) { this.store.updateSearchDelivery(delivery.id, { status: 'failed', resultAt: this.now(), code: 'SEARCH_TARGET_DISABLED', safeToRetry: true, error: 'O destino da entrega deixou de estar habilitado.' }); continue; }
         const minimum = Math.max(3, this.adapter.minimumSpacingSeconds || 3) * 1000, previous = this.scheduler?.lastSubmissionAt;
         if (previous != null) await this.sleep(Math.max(0, minimum - (this.now() - previous)));
-        if (this.closed || this.adapter?.status?.state !== 'connected') break;
+        if (this.closed || !this._automationAllowed() || this.adapter?.status?.state !== 'connected') break;
         const attempt = (delivery.attempts || 0) + 1;
         try {
           const number = phone(delivery.target?.match(/^(\d+)@s\.whatsapp\.net$/)?.[1]);
           const sendingAdapter = this.adapter, sendingMode = this._mode();
-          const resolved = number && sendingAdapter.resolveRecipient ? await sendingAdapter.resolveRecipient(number) : { jid: delivery.target };
+          const replyContext = delivery.sourceIncomingPrivate && delivery.sourceIdentityVerified ? { chatId: delivery.sourceChatId, senderNumber: delivery.sourceSenderNumber, senderId: delivery.sourceSenderId, replyProof: delivery.sourceReplyProof, identityVerified: true, isGroup: false } : null;
+          const resolved = replyContext && sendingAdapter.resolveSearchRecipient ? await sendingAdapter.resolveSearchRecipient(delivery.sourceSenderNumber, replyContext) : number && sendingAdapter.resolveRecipient ? await sendingAdapter.resolveRecipient(number) : { jid: delivery.target }; 
           if (!resolved?.jid) fail('Não foi possível resolver o destinatário.', 'SEARCH_RECIPIENT_MISSING');
-          if (this.closed || this.paused || this.adapter?.status?.state !== 'connected') break;
+          if (this.closed || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected') break;
           if (this.adapter !== sendingAdapter || this._mode() !== sendingMode || !this._deliveryAuthorized(delivery)) fail('A autorização ou o destinatário mudou durante a preparação. Nenhuma mensagem foi enviada.', 'SEARCH_TARGET_DISABLED');
           this.store.updateSearchDelivery(delivery.id, { status: 'sending', attempts: attempt, submittedAt: this.now(), resolvedTarget: resolved.jid });
           this._trace(delivery.traceId || delivery.runId, 'recipient', { actorId: delivery.actorId, target: resolved.jid, deliveryId: delivery.id });
           if (this.scheduler) this.scheduler.lastSubmissionAt = this.now(); this._trace(delivery.traceId || delivery.runId, 'submitted', { actorId: delivery.actorId, deliveryId: delivery.id, attempts: attempt });
-          const result = await this.adapter.sendSearchText(resolved.jid, delivery.text, { clientMessageId: delivery.clientMessageId });
+          const result = await this.adapter.sendSearchText(resolved.jid, delivery.text, { clientMessageId: delivery.clientMessageId, replyContext });
           const current = this.store.getSearchDelivery(delivery.id); const confirmed = current?.status === 'confirmed' || result?.status === 'confirmed';
           this.store.updateSearchDelivery(delivery.id, { status: confirmed ? 'confirmed' : 'uncertain', resultAt: this.now(), messageId: result?.messageId || delivery.clientMessageId, confirmationScope: result?.confirmationScope || current?.confirmationScope || (confirmed ? 'integration-ack' : null), deliveredAt: result?.deliveredAt || current?.deliveredAt || null, readAt: result?.readAt || current?.readAt || null, code: confirmed ? null : 'SEARCH_RESULT_UNCERTAIN', safeToRetry: false, error: confirmed ? null : 'Envio sem confirmação; revisar antes de repetir.' });
           this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status: confirmed ? 'confirmed' : 'uncertain', confirmationScope: result?.confirmationScope, attempts: attempt });
-        } catch (error) { const current = this.store.getSearchDelivery(delivery.id), submitted = current?.status === 'sending', safe = !submitted || error?.safeToRetry === true || error?.definitive === true, temporary = error?.safeToRetry === true, status = safe && temporary && attempt < 3 ? 'pending' : safe ? 'failed' : 'uncertain'; this.store.updateSearchDelivery(delivery.id, { status, attempts: attempt, nextAttemptAt: this.now() + 15_000, resultAt: status === 'pending' ? null : this.now(), code: error?.code || 'SEARCH_DELIVERY_ERROR', safeToRetry: safe, error: status === 'uncertain' ? 'Resultado incerto. Revisão necessária antes de repetir.' : this._safeError(error) }); this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status, code: error?.code || 'SEARCH_DELIVERY_ERROR', reason: this._safeError(error), attempts: attempt }); this._diagnostic(error?.code || 'SEARCH_DELIVERY_ERROR', this._safeError(error), error);
-          if (['failed', 'uncertain'].includes(status) && delivery.sourceChatId && !delivery.errorNotice && !delivery.test) await this._queueFailureNotice(this.store.getSearchRun(delivery.runId), { chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, sourceTrustedSelf: delivery.sourceTrustedSelf, selfChat: delivery.sourceSelfChat }, status === 'uncertain' ? { code: 'SEARCH_RESULT_UNCERTAIN' } : error, { deferFlush: true });
+        } catch (error) { const current = this.store.getSearchDelivery(delivery.id); if (current?.status === 'confirmed' || current?.deliveredAt || current?.readAt) { this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status: 'confirmed', confirmationScope: current.confirmationScope, attempts: attempt }); this.emit('change'); continue; } const submitted = current?.status === 'sending', safe = !submitted || error?.safeToRetry === true || error?.definitive === true, temporary = error?.safeToRetry === true, status = safe && temporary && attempt < 3 ? 'pending' : safe ? 'failed' : 'uncertain'; this.store.updateSearchDelivery(delivery.id, { status, attempts: attempt, nextAttemptAt: this.now() + 15_000, resultAt: status === 'pending' ? null : this.now(), code: error?.code || 'SEARCH_DELIVERY_ERROR', safeToRetry: safe, error: status === 'uncertain' ? 'Resultado incerto. Revisão necessária antes de repetir.' : this._safeError(error) }); this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status, code: error?.code || 'SEARCH_DELIVERY_ERROR', reason: this._safeError(error), attempts: attempt }); this._diagnostic(error?.code || 'SEARCH_DELIVERY_ERROR', this._safeError(error), error);
+          if (['failed', 'uncertain'].includes(status) && delivery.sourceChatId && !delivery.errorNotice && !delivery.test) await this._queueFailureNotice(this.store.getSearchRun(delivery.runId), { chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, sourceTrustedSelf: delivery.sourceTrustedSelf, selfChat: delivery.sourceSelfChat, fromMe: delivery.sourceIncomingPrivate ? false : undefined, identityVerified: delivery.sourceIdentityVerified, senderId: delivery.sourceSenderId, replyProof: delivery.sourceReplyProof }, status === 'uncertain' ? { code: 'SEARCH_RESULT_UNCERTAIN' } : error, { deferFlush: true });
         }
         this.emit('change');
       }
@@ -443,18 +506,38 @@ class SearchService extends EventEmitter {
 }
 
 function formatSearchResults(answer, settings) {
-  const date = value => new Date(value).toLocaleString('pt-BR', { timeZone: settings.timezone });
+  const timezone = settings.timezone || 'America/Sao_Paulo';
+  const date = value => new Date(value).toLocaleString('pt-BR', { timeZone: timezone });
+  const published = value => `${new Date(value).toLocaleDateString('pt-BR', { timeZone: timezone, day: '2-digit', month: '2-digit' })} às ${new Date(value).toLocaleTimeString('pt-BR', { timeZone: timezone, hour: '2-digit', minute: '2-digit' })}`;
   const money = value => (value / 100).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-  const header = answer.guidance || `🔎 Busca: ${answer.query}\n📊 Encontradas ${answer.count} ofertas\n🗓️ Período consultado: ${date(answer.period.from)} a ${date(answer.period.to)}\n💰 Ordem: ${settings.sort === 'recent' ? 'mais recentes' : settings.sort === 'cashDescending' ? 'maior para menor preço' : 'menor para maior preço'}\n${answer.warnings.join('\n')}`;
-  const blocks = answer.results.map((offer, index) => { const realPhone = phone(offer.supplierPhone), informed = phone(offer.contactPhone || offer.offerPhone); const displayed = offer.supplierName || offer.displayName || offer.savedName || 'Nome indisponível'; let names = displayed; if (offer.savedName && offer.displayName && offer.savedName !== offer.displayName) names = `${offer.savedName} (WhatsApp: ${offer.displayName})`; if (offer.forwarded) names = `${names} — republicador; fornecedor original desconhecido`;
-    const condition = offer.condition || 'Condição não informada', battery = Number.isFinite(offer.batteryPercent) ? `; bateria ${offer.batteryPercent}%` : '';
+  const age = answer.period.maxAgeMinutes;
+  const ageLabel = age == null ? 'Sem limite de idade — base capturada e retida' : age % 60 === 0 ? `Ofertas das últimas ${age / 60} hora${age === 60 ? '' : 's'}` : `Ofertas dos últimos ${age} minuto${age === 1 ? '' : 's'}`;
+  const ordering = settings.sort === 'recent' ? 'Ordenadas pelas mais recentes' : settings.sort === 'cashDescending' ? 'Ordenadas pelo maior preço' : 'Ordenadas pelo menor preço';
+  const header = answer.guidance || `🔎 RESULTADO DA BUSCA\n📱 ${answer.query}\n🕒 ${ageLabel}\n🗓️ Período consultado: ${answer.period.from == null ? 'sem início limitado' : date(answer.period.from)} a ${date(answer.period.to)}\n💰 ${ordering}\n📊 Encontradas ${answer.count} oferta${answer.count === 1 ? '' : 's'}${answer.warnings.length ? `\n${answer.warnings.join('\n')}` : ''}`;
+  const indexes = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
+  const blocks = answer.results.map((offer, index) => {
+    const realPhone = phone(offer.supplierPhone), informed = phone(offer.contactPhone || offer.offerPhone);
+    let names = offer.supplierName || offer.displayName || offer.savedName || 'Nome indisponível';
+    if (offer.savedName && offer.displayName && offer.savedName !== offer.displayName) names = `${offer.savedName} (WhatsApp: ${offer.displayName})`;
+    if (offer.forwarded) names += ' — republicador; fornecedor original desconhecido';
     const qualifier = offer.priceKind === 'from' ? 'a partir de' : offer.priceKind === 'lot' ? `preço para lote${offer.minPurchase ? `; mínimo ${offer.minPurchase} unidades` : ''}` : offer.priceQualifier;
-    const old = (answer.period.to - (offer.originalAt || offer.messageAt)) > 86400000 ? '\n⚠️ Oferta com mais de 24 horas' : '';
-    return `${index + 1}. 📱 ${offer.model || offer.modelName || offer.modelKey} — ${offer.storageGB ? `${offer.storageGB}GB` : 'Capacidade não informada'} — ${offer.color || offer.colorName || offer.colorKey || 'Cor não informada'}\n💰 ${money(offer.priceCents)}${qualifier ? ` (${qualifier})` : ''}\n📦 ${condition}${battery}\n👤 ${names}\n📞 ${offer.forwarded ? 'Telefone de quem republicou: ' : ''}${realPhone || 'Número indisponível'}${realPhone && !offer.forwarded ? `\n🔗 https://wa.me/${realPhone}` : ''}${offer.contactInOffer || informed ? `\nContato informado na oferta: ${offer.contactInOffer || informed}${informed ? `\n🔗 https://wa.me/${informed}` : ''}` : ''}\n📝 “${String(offer.snippet || offer.originalText || '').slice(0, 1800)}”\n👥 ${offer.groupName || offer.groupId}\n📅 ${date(offer.originalAt || offer.messageAt)}${old}`;
+    const lines = [`${indexes[index] || `${index + 1}.`} ${money(offer.priceCents)}${qualifier ? ` (${qualifier})` : ''}`, `📱 ${offer.model || offer.modelName || offer.modelKey} • ${offer.storageGB ? `${offer.storageGB}GB` : 'Capacidade não informada'}`];
+    if (offer.color || offer.colorName || offer.colorKey) lines.push(`🎨 Cor: ${offer.color || offer.colorName || offer.colorKey}`);
+    if (offer.condition) lines.push(`📦 Condição: ${offer.condition}`);
+    if (Number.isFinite(offer.batteryPercent)) lines.push(`🔋 Bateria: ${offer.batteryPercent}%`);
+    if (offer.warranty) lines.push(`🛡️ Garantia: ${offer.warranty}`);
+    lines.push(`👤 Fornecedor: ${names}`, `📞 ${offer.forwarded ? 'WhatsApp de quem republicou' : 'WhatsApp'}: ${realPhone || 'Número indisponível'}`);
+    if (realPhone && !offer.forwarded) lines.push(`🔗 https://wa.me/${realPhone}`);
+    if (offer.contactInOffer || informed) lines.push(`Contato informado na oferta: ${offer.contactInOffer || informed}${informed ? `\n🔗 https://wa.me/${informed}` : ''}`);
+    lines.push(`👥 Grupo: ${offer.groupName || offer.groupId || 'Grupo indisponível'}`, `📅 Publicado em: ${published(offer.originalAt || offer.messageAt)}`, `📝 Oferta original: “${String(offer.snippet || offer.originalText || '').slice(0, 1800)}”`);
+    if (answer.period.to - (offer.originalAt || offer.messageAt) > 86400000) lines.push('⚠️ Oferta com mais de 24 horas');
+    return lines.join('\n');
   });
   if (!answer.guidance && !answer.results.length) blocks.push('Não foram encontradas ofertas compatíveis com os filtros informados.');
   blocks.push('Valores conforme anúncios capturados. Confirme disponibilidade e condições com o fornecedor.');
-  const chunks = []; let current = header; for (const block of blocks) { if (current.length + block.length + 2 > 3500) { chunks.push(current); current = block; } else current += `\n\n${block}`; } if (current) chunks.push(current); return chunks;
+  const chunks = []; let current = header;
+  for (const block of blocks) { if (current.length + block.length + 2 > 3500) { chunks.push(current); current = block; } else current += `\n\n${block}`; }
+  if (current) chunks.push(current); return chunks;
 }
 
 module.exports = { SearchService, DEFAULT_SEARCH_SETTINGS, validateSearchSettings, validateFilters, parseZonedTime, formatSearchResults };

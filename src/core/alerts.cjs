@@ -25,9 +25,9 @@ function alertText(incident) {
 // Every network submission has a durable identifier and ambiguous work requires
 // human review, including alerts interrupted while the application was closing.
 class AlertService extends EventEmitter {
-  constructor({ store, scheduler, adapter, now = () => Date.now(), sleep = wait, sendWebhook, secretGet, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  constructor({ store, scheduler, adapter, now = () => Date.now(), sleep = wait, sendWebhook, secretGet, setTimer = setTimeout, clearTimer = clearTimeout, isAutomationStopped = () => false }) {
     super();
-    Object.assign(this, { store, scheduler, adapter, now, sleep, sendWebhook, secretGet, setTimer, clearTimer });
+    Object.assign(this, { store, scheduler, adapter, now, sleep, sendWebhook, secretGet, setTimer, clearTimer, isAutomationStopped });
     this.started = false;
     this.closed = false;
     this.timer = null;
@@ -42,6 +42,7 @@ class AlertService extends EventEmitter {
     this.criticalOccurrence = null;
     this.integrationMode = adapter?.status?.mode === 'simulated' ? 'simulated' : 'whatsapp';
     this.adapterRevision = 0;
+    this.stopRevision = 0;
     this.incidentListener = incident => { try { this.recordIncident(incident); } catch { this.scheduler?.blockOnPersistenceFailure(); } };
     this.changeListener = details => {
       if (details?.error && this.scheduler?.persistenceFailed && !this.storageAlertShown) {
@@ -109,6 +110,25 @@ class AlertService extends EventEmitter {
 
   _mode() {
     return ['simulated', 'whatsapp'].includes(this.adapter?.status?.mode) ? this.adapter.status.mode : this.integrationMode;
+  }
+
+  _stopped() { return this.isAutomationStopped() === true; }
+
+  _requireRunning() {
+    if (this._stopped()) throw Object.assign(new Error('Os envios automáticos estão interrompidos. Retome explicitamente o sistema antes de testar ou reenviar alertas.'), { code: 'AUTOMATION_STOPPED' });
+  }
+
+  stopPending({ userId, reason = 'Interrompido pelo comando parar tudo.' } = {}) {
+    this.stopRevision++;
+    let cancelled = 0;
+    const inFlight = this._list('alerts', { status: 'sending' }).length;
+    for (const alert of this._list('alerts', { status: 'pending' })) {
+      this._save('alerts', { ...alert, status: 'cancelled', cancelledAt: this.now(), cancelledBy: userId || null, resultAt: this.now(), retryEligible: false, errorCode: 'AUTOMATION_STOPPED', error: safeDescription(reason) });
+      this._trace(alert, 'cancelled', 'AUTOMATION_STOPPED', 'Alerta pendente cancelado antes da submissão.', 'Nenhuma nova tentativa automática.');
+      cancelled++;
+    }
+    this.emit('change');
+    return { cancelled, inFlight };
   }
 
   _trace(subject, stage, code, description, action, attempts = 0) {
@@ -192,7 +212,7 @@ class AlertService extends EventEmitter {
     const id = `${incident.id}:${event}`;
     const existing = this._get('notifications', id);
     if (existing) return existing;
-    const notification = this._save('notifications', { id, occurrenceId: incident.id, traceId: incident.traceId || incident.id, event, title, body: safeDescription(body), at: incident.at, reason: safeDescription(incident.reason), code: codeOf(incident.code, 'ALERT_ERROR'), campaignId: incident.campaignId || null, recipientSnapshot: incident.recipientSnapshot || null, integrationMode: this._mode(), simulation: this._mode() === 'simulated', muted: false });
+    const notification = this._save('notifications', { id, occurrenceId: incident.id, traceId: incident.traceId || incident.id, event, title, body: safeDescription(body), at: incident.at, reason: safeDescription(incident.reason), code: codeOf(incident.code, 'ALERT_ERROR'), campaignId: incident.campaignId || null, recipientSnapshot: incident.recipientSnapshot || null, integrationMode: this._mode(), simulation: this._mode() === 'simulated', automationSuppressed: this._stopped(), muted: false });
     this.emit('localAlert', copy(notification));
     this.emit('change');
     return notification;
@@ -200,18 +220,18 @@ class AlertService extends EventEmitter {
 
   recordIncident(incident) {
     if (this.closed || !incident?.id) return;
-    const campaign = this.store.getCampaign(incident.campaignId);
+    const campaign = incident.campaignId ? this.store.getCampaign(incident.campaignId) : null;
     if (!campaign) return this.recordSystemIncident(incident);
-    incident = { ...incident, traceId: incident.traceId || incident.id };
+    incident = { ...incident, traceId: incident.traceId || incident.id, automationSuppressed: incident.automationSuppressed === true || this._stopped() };
     const persisted = campaign.lastError?.id === incident.id ? campaign.lastError : incident;
     const recipientSnapshot = persisted.recipientSnapshot || this._recipients(campaign);
     const webhook = this.store.getSetting('independentAlertChannel', null);
     const independentQueued = persisted.independentQueued ?? Boolean(webhook?.enabled && webhook.url && this.sendWebhook && this.secretGet);
-    if (!persisted.recipientSnapshot && campaign.lastError?.id === incident.id) this.store.saveCampaign({ ...campaign, lastError: { ...campaign.lastError, recipientSnapshot, independentQueued } });
+    if (!persisted.recipientSnapshot && campaign.lastError?.id === incident.id) this.store.saveCampaign({ ...campaign, lastError: { ...campaign.lastError, recipientSnapshot, independentQueued, automationSuppressed: incident.automationSuppressed } });
     if (!campaign.lastError?.localNotified) {
       const alreadyRecorded = this._get('notifications', `${incident.id}:critical`);
       this._local(incident, 'critical', incident.kind === 'uncertain' ? 'Envio precisa de revisão' : 'Campanha interrompida por erro', `${incident.campaignName || campaign.name}: ${incident.reason}`);
-      if (!alreadyRecorded) this._trace(incident, 'occurrence', incident.code || 'CAMPAIGN_ERROR', 'Falha da campanha registrada e notificação local exibida.', recipientSnapshot.length ? 'Destinatários privados definidos para a ocorrência.' : 'Nenhum destinatário ativo com telefone válido está configurado.');
+      if (!alreadyRecorded) this._trace(incident, 'occurrence', incident.code || 'CAMPAIGN_ERROR', 'Falha da campanha registrada e notificação local exibida.', this._stopped() ? 'A automação interrompida bloqueou novos alertas privados.' : recipientSnapshot.length ? 'Destinatários privados definidos para a ocorrência.' : 'Nenhum destinatário ativo com telefone válido está configurado.');
       if (campaign.lastError?.id === incident.id) {
         const latest = this.store.getCampaign(campaign.id);
         this.store.saveCampaign({ ...latest, lastError: { ...latest.lastError, localNotified: true } });
@@ -231,17 +251,18 @@ class AlertService extends EventEmitter {
     const recipients = existing?.recipientSnapshot || value.recipientSnapshot || this._recipients(null);
     const titles = { disconnect: 'WhatsApp desconectado', test: 'Teste de alerta — Kenned Code Disparos', critical: 'Falha crítica — Kenned Code Disparos' };
     const notification = this._local({ ...value, recipientSnapshot: recipients }, value.event, titles[value.event] || titles.critical, value.event === 'disconnect' ? `${value.reason} Envios pausados com segurança. Use Reconectar WhatsApp.` : value.reason || 'Consulte o diagnóstico do sistema.');
-    if (!existing) this._trace(value, 'occurrence', value.code || 'SYSTEM_ERROR', 'Ocorrência registrada e notificação local exibida.', recipients.length ? 'Alertas privados serão processados pela fila.' : 'Nenhum destinatário ativo com telefone válido está configurado.');
+    if (!existing) this._trace(value, 'occurrence', value.code || 'SYSTEM_ERROR', 'Ocorrência registrada e notificação local exibida.', this._stopped() ? 'A automação interrompida bloqueou novos alertas privados.' : recipients.length ? 'Alertas privados serão processados pela fila.' : 'Nenhum destinatário ativo com telefone válido está configurado.');
     const text = alertText({ ...value, timezone: this.store.getSetting('timezone', 'America/Sao_Paulo') });
-    const alerts = recipients.map(recipient => this._queue(value, recipient, 'whatsapp', text));
+    const alerts = recipients.map(recipient => this._queue(value, recipient, 'whatsapp', text)).filter(Boolean);
     const webhook = this.store.getSetting('independentAlertChannel', null);
-    if (webhook?.enabled && webhook.url && this.sendWebhook && this.secretGet) alerts.push(this._queue(value, { id: 'independent-webhook' }, 'webhook', text));
+    if (webhook?.enabled && webhook.url && this.sendWebhook && this.secretGet) { const queued = this._queue(value, { id: 'independent-webhook' }, 'webhook', text); if (queued) alerts.push(queued); }
     this.emit('change');
     queueMicrotask(() => { void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure()); });
     return { occurrenceId: value.id, traceId: value.traceId, notification, alerts };
   }
 
   _queue(incident, recipient, channel, text) {
+    if (this._stopped() || incident.automationSuppressed === true || this._get('notifications', `${incident.id}:${incident.event || 'critical'}`)?.automationSuppressed === true) return null;
     // Deterministic key survives restarts and settings changes. Phone numbers
     // are destinations, never message contents or diagnostic descriptions.
     const id = `${incident.id}:${channel}:${recipient.phone || recipient.id}`;
@@ -253,6 +274,7 @@ class AlertService extends EventEmitter {
   }
 
   async testRecipient(phone, userId, { recipientId } = {}) {
+    this._requireRunning();
     if (!validPhone(phone)) throw new Error('Informe o telefone com código do país e DDD, entre 10 e 15 dígitos.');
     const incident = { id: randomUUID(), at: this.now(), code: 'ALERT_TEST', event: 'test', userId, reason: 'Teste de alerta solicitado. Nenhuma campanha foi ativada.', recipientSnapshot: [{ id: recipientId || 'test', phone }] };
     const occurrence = this.recordSystemIncident(incident);
@@ -263,6 +285,7 @@ class AlertService extends EventEmitter {
   }
 
   async testAlert({ userId, event = 'critical' } = {}) {
+    this._requireRunning();
     if (!['critical', 'disconnect', 'test'].includes(event)) throw new Error('Tipo de alerta de teste inválido.');
     const incident = { id: randomUUID(), at: this.now(), userId, event, code: 'ALERT_TEST', reason: 'Teste do fluxo de alerta solicitado. Nenhuma campanha foi ativada.' };
     const occurrence = this.recordSystemIncident(incident);
@@ -272,6 +295,7 @@ class AlertService extends EventEmitter {
   }
 
   async retryAlert(id, { userId } = {}) {
+    this._requireRunning();
     const alert = this._get('alerts', id);
     if (!alert || alert.status !== 'failed' || alert.retryEligible !== true) throw new Error('O alerta exige falha comprovada ou revisão explícita antes de tentar novamente. Resultados incertos não são repetidos.');
     const retry = this._save('alerts', { ...alert, status: 'pending', messageId: alert.reviewedBy && alert.reviewedConfirmed === false ? randomBytes(16).toString('hex').toUpperCase() : alert.messageId, lifetimeAttempts: (alert.lifetimeAttempts || 0) + (alert.attempts || 0), attempts: 0, nextAttemptAt: this.now(), resultAt: null, error: null, retryEligible: false, retriedAt: this.now(), retriedBy: userId || null });
@@ -298,7 +322,7 @@ class AlertService extends EventEmitter {
 
   flush() {
     if (this.flushing) return this.flushing;
-    if (this.closed || this.store.persistenceFailed || this.scheduler?.persistenceFailed) return Promise.resolve();
+    if (this.closed || this._stopped() || this.store.persistenceFailed || this.scheduler?.persistenceFailed) return Promise.resolve();
     this.flushing = this._flush().finally(() => { this.flushing = null; });
     return this.flushing;
   }
@@ -313,11 +337,21 @@ class AlertService extends EventEmitter {
   }
 
   async _flush() {
-    if (this.scheduler?.runExternalSubmission) return this.scheduler.runExternalSubmission(() => this._flushBatch());
+    if (this.scheduler?.runExternalSubmission) {
+      try { return await this.scheduler.runExternalSubmission(() => this._flushBatch()); }
+      catch (error) {
+        // Cancelling an automatic queue is an intentional operator action,
+        // not a disk fault. Do not latch a persistence failure on stop-all.
+        if (error?.code === 'AUTOMATION_STOPPED') return;
+        throw error;
+      }
+    }
     return this._flushBatch();
   }
 
   async _flushBatch() {
+    if (this._stopped()) return;
+    const stopRevision = this.stopRevision;
     const adapter = this.adapter;
     const adapterRevision = this.adapterRevision;
     const mode = this._mode();
@@ -328,7 +362,7 @@ class AlertService extends EventEmitter {
     try {
       await this.scheduler?.waitForIdle?.();
       for (const snapshot of pending) {
-        if (this.closed || this.store.persistenceFailed || this.scheduler?.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode()) break;
+        if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || this.scheduler?.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode()) break;
         const alert = this._get('alerts', snapshot.id);
         if (alert?.status !== 'pending' || (alert.nextAttemptAt || 0) > this.now()) continue;
         if ((alert.integrationMode && alert.integrationMode !== mode) || (mode === 'whatsapp' && alert.simulation === true)) continue;
@@ -342,7 +376,7 @@ class AlertService extends EventEmitter {
         const minimum = Math.max(3, adapter.minimumSpacingSeconds || 3) * 1000;
         const last = this.scheduler?.lastSubmissionAt;
         if (alert.channel === 'whatsapp' && last != null) await this.sleep(Math.max(0, minimum - (this.now() - last)));
-        if (this.closed || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || (alert.channel === 'whatsapp' && adapter.status.state !== 'connected')) continue;
+        if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || (alert.channel === 'whatsapp' && adapter.status.state !== 'connected')) continue;
         const attempt = (alert.attempts || 0) + 1;
         this._save('alerts', { ...alert, attempts: attempt });
         if (this.store.persistenceFailed || this.scheduler?.persistenceFailed) break;
@@ -354,8 +388,9 @@ class AlertService extends EventEmitter {
             const resolved = adapter.resolveRecipient ? await adapter.resolveRecipient(alert.number) : null;
             const targetId = typeof resolved === 'string' ? resolved : resolved?.jid || null;
             if (resolved && ((resolved.mode && resolved.mode !== mode) || (mode === 'whatsapp' && resolved.simulation === true))) throw Object.assign(new Error('Destinatário pertence a outro modo de execução.'), { code: 'RECIPIENT_MODE_MISMATCH', definitive: true });
-            if (this.closed || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter.status.state !== 'connected') {
-              this._save('alerts', { ...this._get('alerts', alert.id), status: 'pending', attempts: Math.max(0, attempt - 1) });
+            if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter.status.state !== 'connected') {
+              const latest = this._get('alerts', alert.id);
+              if (latest?.status === 'pending') this._save('alerts', { ...latest, attempts: Math.max(0, attempt - 1) });
               continue;
             }
             // Recipient lookup can wait on the network. Permission and contact
@@ -370,6 +405,7 @@ class AlertService extends EventEmitter {
             const config = this.store.getSetting('independentAlertChannel', null);
             if (!config?.enabled || !/^https:\/\//i.test(config.url || '')) throw Object.assign(new Error('Canal independente indisponível.'), { safeToRetry: true, definitive: true });
             const secret = await this.secretGet(config.secretId || 'independentAlertChannel');
+            if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this._get('alerts', alert.id)?.status !== 'pending') continue;
             if (!secret) throw Object.assign(new Error('Credencial do canal ausente.'), { definitive: true });
             this._save('alerts', { ...this._get('alerts', alert.id), status: 'sending', submittedAt: this.now() });
             submitted = true;
@@ -391,7 +427,8 @@ class AlertService extends EventEmitter {
           }
           const safe = !submitted || error?.safeToRetry === true;
           const definitive = safe || error?.definitive === true;
-          const policy = this.store.getCampaign(alert.campaignId)?.retryPolicy || { maxAttempts: 3, delaySeconds: 15 };
+          if (acknowledged?.status === 'cancelled') continue;
+          const policy = (alert.campaignId ? this.store.getCampaign(alert.campaignId)?.retryPolicy : null) || this.store.getSetting('alertRetryPolicy', { maxAttempts: 3, delaySeconds: 15 });
           const max = Math.max(1, Math.min(5, Number.isInteger(policy.maxAttempts) ? policy.maxAttempts : 3));
           // The integration uses definitive=true to mean a *known failed*
           // submission, including transient lookup failures. safeToRetry=true
@@ -418,7 +455,7 @@ class AlertService extends EventEmitter {
       const occurrence = this.disconnectOccurrence;
       this.disconnectOccurrence = null;
       if (this.store.setSetting) this.store.setSetting(`alertDisconnectOccurrence:${this._mode()}`, null);
-      if (occurrence && this.store.getSetting('reconnect', {}).autoResume === true) {
+      if (occurrence && !this._stopped() && this.store.getSetting('reconnect', {}).autoResume === true) {
         for (const [id, revision] of this.activeBeforeDisconnect) {
           const c = this.store.getCampaign(id);
           if (c?.state !== 'paused' || (c.configRevision ?? configurationFingerprint(c)) !== revision || !/^Conexão indisponível/.test(c.pauseReason || '')) continue;

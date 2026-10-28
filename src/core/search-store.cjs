@@ -98,8 +98,8 @@ function attachSearchStore(store,{db,prepared: basePrepared,transaction}) {
       where.push(`${column} IN(${values.map(()=>'?').join(',')})`);params.push(...values);
     }
     const timeColumn=table==='buscas_messages'?'originalAt':table==='buscas_offers'?'o.messageAt':table==='buscas_gaps'?'startedAt':'createdAt';
-    if(filters.from!==undefined&&filters.from!==''){where.push(`${timeColumn}>=?`);params.push(timestamp(filters.from));}
-    if(filters.to!==undefined&&filters.to!==''){where.push(`${timeColumn}<=?`);params.push(timestamp(filters.to));}
+    if(filters.from!==undefined&&filters.from!==null&&filters.from!==''){where.push(`${timeColumn}>=?`);params.push(timestamp(filters.from));}
+    if(filters.to!==undefined&&filters.to!==null&&filters.to!==''){where.push(`${timeColumn}<=?`);params.push(timestamp(filters.to));}
     if(filters.search){where.push("data LIKE ? ESCAPE '\\'");params.push(`%${String(filters.search).slice(0,200).replace(/[\\%_]/g,'\\$&')}%`);}
     let sql=where.length?' WHERE '+where.join(' AND '):'',source=table==='buscas_offers'?'buscas_offers o':table,prefix='';
     if(table==='buscas_offers'&&filters.onePerSupplier){prefix=`WITH selected AS(SELECT o.rowid AS rowid,o.*,ROW_NUMBER() OVER(PARTITION BY COALESCE(o.supplierKey,o.id) ORDER BY ${order}) AS supplierRank FROM buscas_offers o${sql}) `;source='selected o';sql=' WHERE supplierRank=1';}
@@ -154,7 +154,7 @@ function attachSearchStore(store,{db,prepared: basePrepared,transaction}) {
   function queryOffers(filters={}) {
     filters={...filters,minPriceCents:filters.minPriceCents??filters.priceMinCents,maxPriceCents:filters.maxPriceCents??filters.priceMaxCents,minBattery:filters.minBattery??filters.batteryMin,maxBattery:filters.maxBattery??filters.batteryMax};
     const where=[],params=[];
-    if(!filters.includeReview&&filters.confidence===undefined){where.push("o.confidence='confirmed'");where.push('o.priceCents IS NOT NULL');}
+    if(!filters.includeReview){if(filters.confidence===undefined)where.push("o.confidence='confirmed'");where.push('o.priceCents IS NOT NULL AND o.priceCents>0');}
     if(!filters.includeUnavailable&&filters.status===undefined)where.push("o.status='active'");
     for(const [field,column,operator]of [['minPriceCents','priceCents','>='],['maxPriceCents','priceCents','<='],['minBattery','batteryPercent','>='],['maxBattery','batteryPercent','<=']])if(filters[field]!==undefined&&filters[field]!==null){where.push(`o.${column}${operator}?`);params.push(Number(filters[field]));}
     const textLike=value=>`%${foldText(String(value).slice(0,256)).replace(/[\\%_]/g,'\\$&')}%`;
@@ -174,7 +174,7 @@ function attachSearchStore(store,{db,prepared: basePrepared,transaction}) {
     // A later unavailability announcement for the same unequivocal product also
     // invalidates an older price, rather than allowing that stale offer to rank.
     if(filters.latest||filters.latestPerProduct||filters.latestOnly){
-      const hasTo=filters.to!==undefined&&filters.to!=='',blocked=filters.excludedGroupIds?.length?filters.excludedGroupIds:[];
+      const hasTo=filters.to!==undefined&&filters.to!==null&&filters.to!=='',blocked=filters.excludedGroupIds?.length?filters.excludedGroupIds:[];
       where.push(`(o.productKey IS NULL OR o.supplierKey IS NULL OR NOT EXISTS(SELECT 1 FROM buscas_offers newer WHERE newer.supplierKey=o.supplierKey AND newer.productKey=o.productKey AND newer.confidence='confirmed' AND newer.status IN('active','unavailable') AND (newer.messageAt>o.messageAt OR (newer.messageAt=o.messageAt AND newer.rowid>o.rowid))${hasTo?' AND newer.messageAt<=?':''}${blocked.length?` AND newer.chatId NOT IN(${blocked.map(()=>'?').join(',')})`:''}))`);
       if(hasTo)params.push(timestamp(filters.to));
       if(blocked.length)params.push(...blocked);

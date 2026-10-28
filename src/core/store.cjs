@@ -7,11 +7,11 @@ const { DatabaseSync } = require('node:sqlite');
 const { configurationFingerprint } = require('./campaign-version.cjs');
 const { createSearchSchema, attachSearchStore } = require('./search-store.cjs');
 
-const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts']);
+const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts','reminders','reminder_deliveries','contact_pending','contact_intake_events']);
 const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const SHARED_TABLES = new Set(['settings','users','roles','recovery_tokens']);
-const MODE_SETTING = /^(buscas|search)|^recentCommandIds$|^systemAlertRecipientIds$/i;
+const MODE_SETTING = /^(buscas|search)|^recentCommandIds$|^systemAlertRecipientIds$|^automationState$/i;
 const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^mode:|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
 
 function atomicWrite(filename, data) {
@@ -42,7 +42,7 @@ function categories(input) {
 }
 function redacted(value) {
   if(Array.isArray(value))return value.slice(0,100).map(redacted);
-  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).filter(([key])=>!/password|senha|token|secret|session|credential|qr|authorization|base64|private.?key|api.?key|encryption.?key|hash|salt|digest/i.test(key)).map(([key,val])=>[key,redacted(val)]));
+  if(value&&typeof value==='object')return Object.fromEntries(Object.entries(value).filter(([key])=>!/password|senha|token|secret|session|credential|qr|authorization|base64|private.?key|api.?key|encryption.?key|hash|salt|digest|reply.?proof/i.test(key)).map(([key,val])=>[key,redacted(val)]));
   if(typeof value==='string')return value.slice(0,16000).replace(/(Bearer\s+)[\w.\-]+/gi,'$1[omitido]').replace(/((?:password|senha|token|secret|authorization)\s*[:=]\s*)[^\s,;]+/gi,'$1[omitido]');
   return value;
 }
@@ -91,7 +91,7 @@ async function createStore(dir,options={}) {
       const addColumns=(table,columns)=>{const present=new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(r=>r.name));for(const[name,type]of Object.entries(columns))if(!present.has(name))db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);};
       addColumns('rounds',{campaignId:'TEXT',startedAt:'INTEGER',finishedAt:'INTEGER',status:'TEXT',dayKey:'TEXT'});
       addColumns('jobs',{createdAt:'INTEGER',firstAttemptAt:'INTEGER',resultAt:'INTEGER',attempts:'INTEGER NOT NULL DEFAULT 0',messageId:'TEXT',dayKey:'TEXT'});
-      for(const table of ENTITY_TABLES)db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT);
+      for(const table of [...ENTITY_TABLES].filter(t=>!['reminders','reminder_deliveries','contact_pending','contact_intake_events'].includes(t)))db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT);
         CREATE INDEX IF NOT EXISTS ${table}_created ON ${table}(createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_campaign ON ${table}(campaignId,createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_user ON ${table}(userId,createdAt DESC);
@@ -124,6 +124,13 @@ async function createStore(dir,options={}) {
         INSERT INTO group_progress(campaignId,groupId,lastAt,roundCount) SELECT campaignId,groupId,MAX(startedAt),COUNT(*) FROM group_rounds GROUP BY campaignId,groupId ON CONFLICT(campaignId,groupId) DO UPDATE SET lastAt=excluded.lastAt,roundCount=excluded.roundCount;`);
       for(const c of all('campaigns'))if(!Number.isInteger(c.configRevision))prepared('UPDATE campaigns SET data=? WHERE id=?').run(json({...c,configRevision:c.revision||1}),c.id);
       }
+      for(const table of ['reminders','reminder_deliveries','contact_pending','contact_intake_events'])db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp');
+        CREATE INDEX IF NOT EXISTS ${table}_mode_status_time ON ${table}(storageMode,status,createdAt DESC);
+        CREATE INDEX IF NOT EXISTS ${table}_mode_user ON ${table}(storageMode,userId,createdAt DESC);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS reminders_due ON reminders(storageMode,json_extract(data,'$.nextDueAt'));
+        CREATE INDEX IF NOT EXISTS reminder_deliveries_due ON reminder_deliveries(storageMode,status,json_extract(data,'$.nextAttemptAt'));
+        CREATE INDEX IF NOT EXISTS reminder_deliveries_message ON reminder_deliveries(storageMode,json_extract(data,'$.messageId'));
+        CREATE INDEX IF NOT EXISTS contact_pending_phone ON contact_pending(storageMode,json_extract(data,'$.phone'),status);`);
       createSearchSchema(db);
       if(version<6){
         // Mode is provenance, never a guess based on a display name. Existing
@@ -177,6 +184,7 @@ async function createStore(dir,options={}) {
           CREATE TRIGGER audit_immutable_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END;
           CREATE TRIGGER audit_immutable_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END;`);
       }
+      db.exec("CREATE INDEX IF NOT EXISTS contacts_phone_mode ON contacts(storageMode,json_extract(data,'$.phone'));");
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
     });
   }catch(error){db.close();throw error;}
@@ -260,8 +268,9 @@ async function createStore(dir,options={}) {
     clearGroups(){return transaction(()=>{for(const g of all('groups_data'))putRaw('groups_data',{...g,available:false});});},
     replaceGroups(groups){return transaction(()=>{const ids=new Set(groups.map(g=>g.id));store.upsertGroups(groups);for(const g of all('groups_data'))if(!ids.has(g.id))putRaw('groups_data',{...g,available:false});return store.listGroups();});},
     authorizeGroup(id,authorized){const g=one('groups_data',id);if(!g)throw new Error('Grupo não encontrado.');return put('groups_data',{...g,authorized:!!authorized});},
-    listMedia:()=>all('media'),getMedia:id=>one('media',id),saveMedia:m=>put('media',m),
-    listTemplates:()=>all('templates'),saveTemplate:t=>put('templates',t),deleteTemplate:id=>remove('templates',id),
+    listMedia:()=>all('media'),getMedia:id=>one('media',id),getMediaAnyMode:id=>oneRaw('media',id),listMediaAnyMode:()=>parseRows(prepared('SELECT data FROM media ORDER BY rowid').all()),saveMedia:m=>put('media',m),deleteMedia:id=>remove('media',id),
+    listTemplates:()=>all('templates'),getTemplate:id=>one('templates',id),saveTemplate:t=>put('templates',t),deleteTemplate:id=>remove('templates',id),
+    findContactByPhone(number){return parseRows(prepared("SELECT data FROM contacts WHERE storageMode=? AND json_extract(data,'$.phone') IN(?,?) LIMIT 1").all(storageMode(),String(number),'+'+String(number)))[0];},
     insertRound:r=>transaction(()=>roundRaw(r)),
     updateRound(id,patch){const r=one('rounds',id);if(!r)throw new Error('Rodada não encontrada.');return transaction(()=>roundRaw({...r,...patch}));},
     listRounds(id){return parseRows(prepared(`SELECT data FROM rounds WHERE storageMode=?${id?' AND campaignId=?':''} ORDER BY rowid`).all(storageMode(),...(id?[id]:[])));},
@@ -288,7 +297,7 @@ async function createStore(dir,options={}) {
     cleanupPreview(input){const cats=categories(Array.isArray(input)?input:input?.categories),counts=Object.fromEntries(cats.map(c=>[c,Number(prepared('SELECT COUNT(*)AS n FROM history WHERE category=? AND storageMode=?').get(c,storageMode()).n)]));return {categories:cats,counts,total:Object.values(counts).reduce((a,b)=>a+b,0)};},
     clearHistory({categories:input,actor}={}){return transaction(()=>{const preview=store.cleanupPreview(input);for(const category of preview.categories){prepared('DELETE FROM history WHERE category=? AND storageMode=?').run(category,storageMode());if(category==='errors')prepared('DELETE FROM diagnostics WHERE storageMode=?').run(storageMode());if(category==='notifications')prepared('DELETE FROM notifications WHERE storageMode=?').run(storageMode());}const audit=store.addAudit({actorId:typeof actor==='string'?actor:actor?.id??actor?.userId??null,actorName:actor?.name??null,action:'history.clear',at:Date.now(),detail:{categories:preview.categories,counts:preview.counts},preserved:'operational jobs, rounds, alerts, users, campaigns, media and audit'});return {...preview,auditId:audit.id};});},
     applyHistoryRetention:config=>transaction(()=>retentionRaw(config)),applyRetention:config=>transaction(()=>retentionRaw(config)),
-    exportData(){return {format:'mega-disparos',version:1,storageMode:storageMode(),createdAt:new Date().toISOString(),campaigns:all('campaigns'),groups:all('groups_data'),templates:all('templates'),contacts:all('contacts'),alertRecipients:all('alert_recipients'),settings:all('settings').filter(s=>!PRIVATE_SETTING.test(s.id)),media:all('media')};},
+    exportData(){return {format:'mega-disparos',version:1,storageMode:storageMode(),createdAt:new Date().toISOString(),campaigns:all('campaigns'),groups:all('groups_data'),templates:all('templates'),contacts:all('contacts'),alertRecipients:all('alert_recipients'),reminders:all('reminders').map(r=>({id:r.id,...require('./reminders.cjs').normalizeReminder(r)})),settings:all('settings').filter(s=>!PRIVATE_SETTING.test(s.id)),media:all('media')};},
     importData(data){
       data=require('./backup-validation.cjs').validateBackupData(data);
       const targetMode=['simulated','whatsapp'].includes(data.storageMode)?data.storageMode:data.groups.length&&data.groups.every(g=>g.simulation)?'simulated':'whatsapp';
@@ -300,6 +309,20 @@ async function createStore(dir,options={}) {
         for(const c of data.campaigns)putRaw('campaigns',{...c,state:'draft',nextRunAt:null,revision:(c.revision||0)+1,configRevision:(c.configRevision||c.revision||0)+1});
         for(const g of data.groups)putRaw('groups_data',g);for(const t of data.templates||[])putRaw('templates',t);for(const m of data.media||[])putRaw('media',m);
         for(const c of data.contacts||[])entityRaw('contacts',c);for(const r of data.alertRecipients||[])entityRaw('alert_recipients',r);
+        // Portable backups carry configuration only. Existing operational ledgers
+        // remain local, and restored schedules are always paused with a new revision.
+        if(Object.hasOwn(data,'reminders')){
+          const previousReminders=new Map(all('reminders').map(r=>[r.id,r]));
+          prepared('DELETE FROM reminders WHERE storageMode=?').run(targetMode);
+          for(const r of data.reminders){
+            const old=previousReminders.get(r.id);
+            const recipient=r.recipientId.startsWith('user:')?one('users',r.recipientId.slice(5)):one('alert_recipients',r.recipientId);
+            const userRecipient=r.recipientId.startsWith('user:');
+            const available=recipient&&recipient.active!==false&&recipient.enabled!==false&&!recipient.requirePasswordChange&&/^[1-9]\d{9,14}$/.test(recipient.phone||'')&&(!userRecipient||one('roles',recipient.roleId));
+            const lastDeliveryId=old?.lastDeliveryId&&one('reminder_deliveries',old.lastDeliveryId)?old.lastDeliveryId:null;
+            entityRaw('reminders',{...r,state:'paused',enabled:false,nextDueAt:null,scheduleRevision:(old?.scheduleRevision||0)+1,createdAt:old?.createdAt||Date.now(),updatedAt:Date.now(),ownerId:old?.ownerId||null,lastDeliveryId,reviewRequired:!available,error:available?null:'Destinatário indisponível neste computador. Selecione um usuário ativo ou destinatário autorizado antes de ativar o lembrete.'});
+          }
+        }
         for(const s of data.settings||[])if(!PRIVATE_SETTING.test(s.id))putRaw('settings',s);
         putRaw('settings',{id:'initialized',value:true});
       });

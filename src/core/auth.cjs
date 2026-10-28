@@ -26,14 +26,16 @@ const PERMISSIONS = Object.freeze([
   ['search.run', 'Executar buscas de ofertas', 'BUSCAS'],
   ['search.history', 'Consultar histórico de buscas', 'BUSCAS'],
   ['search.filters', 'Alterar filtros e apelidos de BUSCAS', 'BUSCAS'],
-  ['search.manage', 'Gerenciar monitoramento e autorizações de BUSCAS', 'BUSCAS']
+  ['search.manage', 'Gerenciar monitoramento e autorizações de BUSCAS', 'BUSCAS'],
+  ['automation.control', 'Parar e retomar todas as automações', 'Controle do sistema'],
+  ...['view','create','edit','delete','control'].map(action=>[`reminder.${action}`,({view:'Visualizar lembretes',create:'Criar lembretes',edit:'Editar lembretes',delete:'Excluir lembretes',control:'Ativar, pausar e testar lembretes'})[action],'Lembretes'])
 ].map(([id, label, section]) => Object.freeze({ id, label, section })));
 const PERMISSION_IDS = new Set(PERMISSIONS.map(p => p.id));
 const ALL = [...PERMISSION_IDS];
 const DEFAULT_ROLES = Object.freeze([
   { id: 'role-owner', name: 'Dono', permissions: ALL, campaignScope: 'all', isOwner: true, builtIn: true },
   { id: 'role-admin', name: 'Administrador', permissions: ALL.filter(p => p !== 'users.assignOwner' && !p.startsWith('search.')), campaignScope: 'all', isOwner: false, builtIn: true },
-  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !p.startsWith('search.') && !['history.clear', 'settings.edit', 'connection.manage', 'audit.view'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
+  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !p.startsWith('search.') && !['history.clear', 'settings.edit', 'connection.manage', 'audit.view', 'automation.control'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
   { id: 'role-seller', name: 'Vendedor', permissions: ['campaign.view', 'campaign.create', 'campaign.edit', 'campaign.start', 'campaign.pause', 'campaign.stop', 'contacts.view', 'contacts.create', 'contacts.edit', 'groups.view', 'media.view', 'media.create', 'reports.view', 'history.view', 'notifications.view'], campaignScope: 'own', isOwner: false, builtIn: true }
 ]);
 
@@ -94,7 +96,16 @@ class AuthService {
     this.maxFailures = options.maxFailures || 5;
     this.lockMs = options.lockMs || 15 * 60 * 1000;
     this.resetTtlMs = options.resetTtlMs || 30 * 60 * 1000;
-    this._tx(() => { for (const role of DEFAULT_ROLES) if (!this.store.getEntity('roles', role.id)) this.store.saveEntity('roles', structuredClone(role)); });
+    this._tx(() => {
+      for (const role of DEFAULT_ROLES) if (!this.store.getEntity('roles', role.id)) this.store.saveEntity('roles', structuredClone(role));
+      if (!this.store.getSetting('authPermissionSchema230')) {
+        for (const id of ['role-admin','role-manager']) {
+          const role=this.store.getEntity('roles',id);
+          if (role?.builtIn===true) this.store.saveEntity('roles',{...role,permissions:[...new Set([...(role.permissions||[]),...ALL.filter(p=>p.startsWith('reminder.')||id==='role-admin'&&p==='automation.control')])]});
+        }
+        this.store.setSetting('authPermissionSchema230',true);
+      }
+    });
   }
   _tx(fn) { return this.store.transaction ? this.store.transaction(fn) : fn(); }
   _audit(action, targetId, detail, actorId = this.currentUserId) {

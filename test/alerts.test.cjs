@@ -438,3 +438,87 @@ test('a simulation-only receipt never claims a real WhatsApp server confirmation
   f.service.start(); const alert = await f.service.testRecipient('5511999999999', 'owner');
   assert.equal(alert.status, 'confirmed'); assert.equal(alert.confirmationScope, 'simulation-only'); assert.equal(alert.simulation, true); assert.equal(f.calls.length, 1); await f.service.shutdown();
 });
+
+test('parar tudo cancela pendentes, bloqueia novas filas e testes, mas mantém notificações locais', async () => {
+  const f = fixture({ connected: false });
+  let stopped = false; f.service.isAutomationStopped = () => stopped;
+  f.service.recordSystemIncident({ id: 'before-stop', at: f.clock.value, event: 'critical', code: 'CRITICAL_TEST', reason: 'Falha anterior.' });
+  assert.equal(f.store.listEntities('alerts').length, 1);
+  stopped = true;
+  assert.deepEqual(f.service.stopPending({ userId: 'owner' }), { cancelled: 1, inFlight: 0 });
+  const during = { id: 'during-stop', at: f.clock.value, event: 'critical', code: 'CRITICAL_TEST', reason: 'Falha enquanto pausado.' };
+  const occurrence = f.service.recordSystemIncident(during);
+  assert.equal(occurrence.alerts.length, 0); assert.equal(f.local.length, 2);
+  assert.equal(f.store.listEntities('alerts')[0].status, 'cancelled');
+  await assert.rejects(f.service.testAlert({ userId: 'owner' }), error => error.code === 'AUTOMATION_STOPPED');
+  await assert.rejects(f.service.testRecipient('5511888888888', 'owner'), error => error.code === 'AUTOMATION_STOPPED');
+  f.adapter.status = { state: 'connected' }; await f.service.flush(); assert.equal(f.calls.length, 0);
+  stopped = false; f.service.recordSystemIncident(during); await f.service.flush();
+  assert.equal(f.calls.length, 0); // suppressed occurrence does not create a delayed backlog
+  const testAlert = await f.service.testAlert({ userId: 'owner' });
+  assert.equal(testAlert.alerts[0].status, 'confirmed'); assert.equal(f.calls.length, 1);
+  await f.service.shutdown();
+});
+
+test('parar tudo durante resolução privada não deixa o antigo lote enviar após retomada', async () => {
+  const f = fixture();
+  let stopped = false, release, resolveStarted;
+  f.service.isAutomationStopped = () => stopped;
+  const started = new Promise(resolve => { resolveStarted = resolve; });
+  f.adapter.resolveRecipient = async () => { resolveStarted(); await new Promise(resolve => { release = resolve; }); return { jid: '5511999999999@s.whatsapp.net', mode: 'simulated', simulation: true }; };
+  f.service.recordSystemIncident({ id: 'lookup-stop', at: f.clock.value, event: 'critical', code: 'CRITICAL_TEST', reason: 'Falha.' });
+  const flushing = f.service.flush(); await started;
+  stopped = true; assert.equal(f.service.stopPending().cancelled, 1);
+  stopped = false; release(); await flushing;
+  assert.equal(f.calls.length, 0); assert.equal(f.store.listEntities('alerts')[0].status, 'cancelled');
+  await f.service.shutdown();
+});
+
+test('envio já em andamento mantém confirmação e é informado separadamente dos cancelados', async () => {
+  let release, sendStarted;
+  const started = new Promise(resolve => { sendStarted = resolve; });
+  const f = fixture({ privateSend: async ({ options }) => { sendStarted(); await new Promise(resolve => { release = resolve; }); return { status: 'confirmed', messageId: options.clientMessageId }; } });
+  let stopped = false; f.service.isAutomationStopped = () => stopped;
+  f.service.recordSystemIncident({ id: 'in-flight-stop', at: f.clock.value, event: 'critical', code: 'CRITICAL_TEST', reason: 'Falha.' });
+  const flushing = f.service.flush(); await started;
+  stopped = true; assert.deepEqual(f.service.stopPending(), { cancelled: 0, inFlight: 1 });
+  release(); await flushing;
+  assert.equal(f.calls.length, 1); assert.equal(f.store.listEntities('alerts')[0].status, 'confirmed');
+  stopped = false; await f.service.flush(); assert.equal(f.calls.length, 1);
+  await f.service.shutdown();
+});
+
+test('política global de alerta limita tentativas e respeita intervalo configurado com identificador estável', async () => {
+  const f = fixture({ settings: { alertRetryPolicy: { maxAttempts: 2, delaySeconds: 60 } }, privateSend: () => { throw Object.assign(new Error('transport temporary secret=do-not-log'), { safeToRetry: true, code: 'WA_TEMPORARY' }); } });
+  f.service.recordSystemIncident({ id: 'global-retry', at: f.clock.value, event: 'critical', code: 'CRITICAL_TEST', reason: 'Falha.' });
+  await f.service.flush();
+  let alert = f.store.listEntities('alerts')[0]; assert.equal(alert.status, 'pending'); assert.equal(alert.attempts, 1);
+  assert.equal(alert.nextAttemptAt - f.clock.value, 60000);
+  f.clock.value += 59000; await f.service.flush(); assert.equal(f.calls.length, 1);
+  f.clock.value += 1000; await f.service.flush(); alert = f.store.listEntities('alerts')[0];
+  assert.equal(alert.status, 'failed'); assert.equal(alert.attempts, 2);
+  f.clock.value += 600000; await f.service.flush(); assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[0].options.clientMessageId, f.calls[1].options.clientMessageId);
+  assert(!JSON.stringify(f.store.listEntities('diagnostics')).includes('do-not-log'));
+  await f.service.shutdown();
+});
+
+test('desconexão com automação interrompida avisa localmente e não retoma campanhas ou alertas', async () => {
+  const f = fixture({ settings: { reconnect: { autoResume: true } } });
+  f.service.isAutomationStopped = () => true; f.service.start();
+  f.store.saveCampaign({ ...f.store.getCampaign('c1'), state: 'paused', pauseReason: 'Conexão indisponível: disconnected.' });
+  f.adapter.status = { state: 'disconnected', reasonCode: 'internet', at: new Date(f.clock.value).toISOString() };
+  f.adapter.emit('status', f.adapter.status); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.local.length, 1); assert.equal(f.local[0].event, 'disconnect'); assert.equal(f.store.listEntities('alerts').length, 0);
+  f.adapter.status = { state: 'connected' }; f.adapter.emit('status', f.adapter.status); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.resumes, []); assert.equal(f.calls.length, 0); await f.service.shutdown();
+});
+
+test('cancelamento da fila automática é controle operacional e não produz falha de persistência', async () => {
+  const f = fixture();
+  f.scheduler.runExternalSubmission = async () => { throw Object.assign(new Error('Automatic queue stopped'), { code: 'AUTOMATION_STOPPED' }); };
+  f.service.recordSystemIncident({ id: 'queued-stop', at: f.clock.value, code: 'CRITICAL_TEST', reason: 'Falha de teste.' });
+  await f.service.flush(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.scheduler.persistenceFailed, false); assert.equal(f.calls.length, 0);
+  await f.service.shutdown();
+});

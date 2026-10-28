@@ -14,12 +14,13 @@
       <a class="brand" href="#" aria-label="Kenned Code Disparos, painel"><span class="brand-symbol">K</span><span>Kenned Code<span class="brand-second">Disparos</span></span></a>
       <span class="sidebar-label">ÁREA DE TRABALHO</span>
       <nav id="navigation" aria-label="Navegação principal"></nav>
-      <div class="sidebar-bottom"><div class="local-badge"><span class="status-dot"></span> Dados salvos neste computador</div><div class="sidebar-version">Kenned Code Disparos <span id="version">2.2.0</span></div></div>
+      <div class="sidebar-bottom"><div class="local-badge"><span class="status-dot"></span> Dados salvos neste computador</div><div class="sidebar-version">Kenned Code Disparos <span id="version">2.3.0</span></div></div>
     </aside>
     <div class="workspace">
       <header class="topbar"><div><span class="topbar-label">Sua central de campanhas</span><div id="connection-pill" class="connection-pill">Carregando conexão…</div></div><div class="topbar-actions"><div id="user-bar" class="user-bar"></div><button id="theme-toggle" class="icon-button" data-action="toggle-theme" title="Alternar tema" aria-label="Alternar tema"></button><button class="stop-button" data-action="stop-all"><span class="stop-square"></span> PARAR TODOS OS ENVIOS</button></div></header>
       <div id="connection-banner" class="connection-banner" hidden></div>
       <div id="simulation-banner" class="simulation-banner" hidden>SIMULAÇÃO — DADOS FICTÍCIOS <span>Nenhuma mensagem é enviada ao WhatsApp neste modo.</span></div>
+      <div id="automation-banner" class="connection-banner" hidden></div>
       <main id="main" tabindex="-1"><div class="initial-loader">Carregando seus dados…</div></main>
       <footer class="app-footer"><span>O envio depende de computador ligado, conectado e sem suspensão.</span><button class="text-button" data-action="window-minimize">Minimizar</button></footer>
     </div>
@@ -27,6 +28,9 @@
   <div id="modal-root"></div>
   <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
   <script src="searches.js"></script>
+  <script src="library.js"></script>
+  <script src="reminders.js"></script>
+  <script src="contact-intake.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

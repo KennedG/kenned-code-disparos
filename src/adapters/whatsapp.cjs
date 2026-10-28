@@ -3,7 +3,7 @@
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { randomBytes, createHash } = require('node:crypto');
+const { randomBytes, createHash, createHmac, timingSafeEqual } = require('node:crypto');
 
 const AUTH_FILE = 'session.dpapi';
 const ACK_TIMEOUT_MS = 20000;
@@ -196,8 +196,11 @@ class WhatsAppAdapter extends EventEmitter {
     this.captureHistoryQueued = 0;
     this.automaticMessages = new Set();
     this.recipientCache = new Map();
+    this.protocolRecipientHints = new Map();
     this.recipientResolutions = new Map();
     this.deliveryProofs = new Map();
+    this.replyProofKey = null;
+    this.identityHydrations = new Map();
   }
 
   _status(state, detail, extras = {}) {
@@ -244,6 +247,22 @@ class WhatsAppAdapter extends EventEmitter {
       this.authStore ||= new EncryptedAuthStore({ dir: this.credentialsDir, safeStorage: this.safeStorage, library: this.library });
       await this.authStore.writeChain;
       const auth = await this.authStore.load();
+      // Route proofs contain no credentials. Their signing key remains inside
+      // the same Windows-encrypted session, allowing pending replies to survive
+      // a restart without trusting a JID supplied by a renderer or HTTP caller.
+      this.authStore.data.appMetadata ||= {};
+      let proofKey = this.authStore.data.appMetadata.replyProofKey;
+      if (typeof proofKey !== 'string' || !/^[a-f0-9]{64}$/.test(proofKey)) {
+        proofKey = randomBytes(32).toString('hex');
+        this.authStore.data.appMetadata.replyProofKey = proofKey;
+        await this.authStore.persist();
+      }
+      this.replyProofKey = Buffer.from(proofKey, 'hex');
+      this.protocolRecipientHints.clear();
+      for (const hint of (Array.isArray(this.authStore.data.appMetadata.recipientHints) ? this.authStore.data.appMetadata.recipientHints : []).slice(-1000)) {
+        if (hint && /^[1-9]\d{9,14}$/.test(hint.phone || '') && accountJid(hint.jid) && accountJid(hint.accountId) && Number.isFinite(hint.receivedAt) && hint.receivedAt > Date.now() - 7 * 86400000 && hint.receivedAt <= Date.now() + 30000 && (!phoneFromJid(hint.jid) || phoneFromJid(hint.jid) === hint.phone)) this.protocolRecipientHints.set(hint.phone, hint);
+        if (this.protocolRecipientHints.size >= 1000) break;
+      }
       if (generation !== this.generation || this.requestedDisconnect) return this.status;
       const makeSocket = this.library.default || this.library.makeWASocket;
       const socket = makeSocket({
@@ -283,8 +302,7 @@ class WhatsAppAdapter extends EventEmitter {
         });
       });
       socket.ev.on('messages.upsert', event => {
-        this._captureUpsert(event, generation);
-        this._incoming(event, generation);
+        this._handleUpsert(event, generation);
       });
       socket.ev.on('messages.update', updates => {
         if (generation !== this.generation) return;
@@ -421,6 +439,10 @@ class WhatsAppAdapter extends EventEmitter {
     if (this.sessionResetPromise) return this.sessionResetPromise;
     const previous = this.authStore;
     this.authStore = null;
+    this.replyProofKey = null;
+    this.recipientCache.clear();
+    this.contacts.clear();
+    this.protocolRecipientHints.clear();
     this.sessionResetPromise = (async () => {
       if (previous) await previous.clear();
       else if (this.credentialsDir) await fs.unlink(path.join(this.credentialsDir, AUTH_FILE)).catch(error => { if (error.code !== 'ENOENT') throw error; });
@@ -488,13 +510,104 @@ class WhatsAppAdapter extends EventEmitter {
       const previous = this.contacts.get(id) || {};
       const saved = { ...previous, id };
       for (const key of ['name', 'notify', 'verifiedName']) if (typeof contact[key] === 'string') saved[key] = contact[key].slice(0, 500);
-      const phone = phoneFromJid(contact.phoneNumber) || phoneFromJid(id);
+      const phone = phoneFromJid(contact.phoneNumber) || (/^[1-9]\d{9,14}$/.test(String(contact.phoneNumber || '')) ? String(contact.phoneNumber) : null) || phoneFromJid(id);
       if (phone) saved.phoneNumber = phone;
       this.contacts.set(id, saved);
       const lid = accountJid(contact.lid);
       if (lid) this.contacts.set(lid, { ...saved, id: lid });
       while (this.contacts.size > 10000) this.contacts.delete(this.contacts.keys().next().value);
     }
+  }
+
+  _handleUpsert(event, generation) {
+    if (generation !== this.generation) return;
+    // Most events are processed synchronously. Some Baileys private events
+    // carry only a LID; read the authenticated mapping repository before
+    // authorization instead of inventing a telephone from the internal ID.
+    const ready = [];
+    for (const message of event?.messages || []) {
+      const key = message?.key || {};
+      const jid = accountJid(key.remoteJid);
+      const lookup = this.socket?.signalRepository?.lidMapping?.getPNForLID;
+      if (event.type !== 'notify' || key.fromMe || !jid.endsWith('@lid') || phoneFromJid(key.remoteJidAlt) || this.contacts.get(jid)?.phoneNumber || typeof lookup !== 'function') {
+        ready.push(message); continue;
+      }
+      const hydrationId = `${generation}:${jid}:${key.id || ''}`;
+      if (this.identityHydrations.has(hydrationId)) continue;
+      if (this.identityHydrations.size >= 64) { ready.push(message); continue; }
+      const socket = this.socket;
+      let timer;
+      const pending = Promise.race([
+        Promise.resolve().then(() => lookup.call(socket.signalRepository.lidMapping, jid)),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), Math.min(this.controlTimeoutMs, 5000)); })
+      ]).catch(() => null).then(mapping => {
+        if (generation !== this.generation || socket !== this.socket) return;
+        const pn = accountJid(mapping);
+        const phone = phoneFromJid(pn);
+        const hydrated = phone ? { ...message, key: { ...key, remoteJidAlt: pn } } : message;
+        if (phone) this._rememberContacts([{ id: jid, phoneNumber: pn }]);
+        const batch = { ...event, messages: [hydrated] };
+        this._captureUpsert(batch, generation);
+        this._incoming(batch, generation);
+      }).finally(() => { clearTimeout(timer); this.identityHydrations.delete(hydrationId); });
+      this.identityHydrations.set(hydrationId, pending);
+    }
+    if (ready.length) {
+      const batch = { ...event, messages: ready };
+      this._captureUpsert(batch, generation);
+      this._incoming(batch, generation);
+    }
+  }
+
+  _replyProof(context) {
+    if (!this.replyProofKey || context.isGroup || !accountJid(context.chatId) || !context.identityVerified || !accountJid(context.senderId)) return null;
+    const own = this._ownAccount();
+    if (!own.id) return null;
+    const payload = { v: 1, messageId: String(context.messageId), chatId: accountJid(context.chatId), senderId: accountJid(context.senderId), senderNumber: context.senderNumber || '', accountId: own.id, fromMe: context.fromMe === true, timestamp: context.timestamp };
+    const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signature = createHmac('sha256', this.replyProofKey).update(encoded).digest('base64url');
+    if (!context.fromMe && context.verified && /^[1-9]\d{9,14}$/.test(payload.senderNumber)) {
+      const result = { jid: payload.chatId, phone: payload.senderNumber, requestedPhone: payload.senderNumber, isSelf: false, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-private-message' };
+      this.recipientCache.set(payload.senderNumber, { result, generation: this.generation, expiresAt: Date.now() + 600000 });
+      const previous = this.protocolRecipientHints.get(payload.senderNumber);
+      const hint = { phone: payload.senderNumber, jid: payload.chatId, accountId: own.id, receivedAt: payload.timestamp, persistedAt: previous?.persistedAt || previous?.receivedAt || payload.timestamp };
+      this.protocolRecipientHints.set(hint.phone, hint);
+      while (this.protocolRecipientHints.size > 1000) this.protocolRecipientHints.delete(this.protocolRecipientHints.keys().next().value);
+      // Persist only new routes or a daily freshness refresh. AuthStore coalesces
+      // bursts; this is protected account metadata, never a common backup/log.
+      if (this.authStore?.data && (!previous || previous.jid !== hint.jid || previous.accountId !== hint.accountId || hint.receivedAt - (previous.persistedAt || previous.receivedAt) >= 86400000)) {
+        hint.persistedAt = hint.receivedAt;
+        this.authStore.data.appMetadata.recipientHints = [...this.protocolRecipientHints.values()];
+        void this.authStore.persist().catch(() => {
+          if (this.status.state === 'connected') this._status('restricted', 'Falha ao proteger a identificação de destinatários no Windows. Envios pausados.', { errorCode: 'SESSION_PERSISTENCE_FAILED', reasonCode: 'restricted', retryable: false });
+        });
+      }
+      while (this.recipientCache.size > 1000) this.recipientCache.delete(this.recipientCache.keys().next().value);
+    }
+    return `${encoded}.${signature}`;
+  }
+
+  async resolveReplyRecipient(context) {
+    if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado antes de responder ao comando.', true, 'WA_RECIPIENT_OFFLINE');
+    if (!this.replyProofKey || context?.isGroup !== false || typeof context.replyProof !== 'string' || context.replyProof.length > 2500) throw definitiveError('A conversa privada não possui prova de recebimento autenticado. Envie o comando novamente.', false, 'WA_REPLY_CONTEXT_INVALID');
+    const [encoded, signature, extra] = context.replyProof.split('.');
+    let payload;
+    try {
+      const expected = createHmac('sha256', this.replyProofKey).update(encoded).digest();
+      const supplied = Buffer.from(signature || '', 'base64url');
+      if (extra || supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error('invalid');
+      payload = JSON.parse(Buffer.from(encoded, 'base64url').toString());
+    } catch { throw definitiveError('Não foi possível validar a origem privada do comando. Envie o comando novamente.', false, 'WA_REPLY_CONTEXT_INVALID'); }
+    const own = this._ownAccount();
+    if (payload.v !== 1 || !accountJid(payload.chatId) || !accountJid(payload.senderId) || !own.ids.includes(payload.accountId) || payload.chatId !== accountJid(context.chatId) || payload.senderId !== accountJid(context.senderId) || payload.senderNumber !== String(context.senderNumber || '') || !Number.isFinite(payload.timestamp) || payload.timestamp > Date.now() + 30000 || payload.timestamp < Date.now() - 7 * 86400000) throw definitiveError('A origem ou a conta deste comando mudou. Envie o comando novamente na conversa autorizada.', false, 'WA_REPLY_CONTEXT_INVALID');
+    return { jid: payload.chatId, phone: payload.senderNumber, requestedPhone: payload.senderNumber, isSelf: payload.fromMe && payload.senderNumber === own.phone, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-private-message' };
+  }
+
+  async resolveSearchRecipient(number, replyContext) {
+    if (!replyContext) return this.resolveRecipient(number);
+    const resolved = await this.resolveReplyRecipient(replyContext);
+    if (String(number || '') !== resolved.phone && String(number || '') !== resolved.jid) throw definitiveError('O destinatário difere de quem enviou o comando. Nenhuma mensagem foi enviada.', false, 'WA_REPLY_RECIPIENT_MISMATCH');
+    return resolved;
   }
 
   _ownAccount() {
@@ -575,7 +688,7 @@ class WhatsAppAdapter extends EventEmitter {
 
   _captureContext(message, { history = false, edits = false } = {}) {
     const key = message?.key || {};
-    const chatId = key.remoteJid;
+    const chatId = accountJid(key.remoteJid) || key.remoteJid;
     if (!key.id || !this._captureChatAllowed(chatId, { history })) return null;
     const content = messageContent(message.message, { edits });
     if (!content || typeof content.text !== 'string') return null;
@@ -593,6 +706,7 @@ class WhatsAppAdapter extends EventEmitter {
     };
     // An edit timestamp belongs to the edit; never replace the original offer time with it.
     if (!edits) normalized.timestamp = timestamp;
+    if (!history && !edits) normalized.replyProof = this._replyProof(normalized);
     return normalized;
   }
 
@@ -792,6 +906,10 @@ class WhatsAppAdapter extends EventEmitter {
       const ownJid = own.ids.find(id => phoneFromJid(id) === digits) || `${digits}@s.whatsapp.net`;
       return { jid: ownJid, phone: digits, requestedPhone: digits, isSelf: true, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-account' };
     }
+    const hint = this.protocolRecipientHints.get(digits);
+    if (hint && own.ids.includes(hint.accountId) && hint.receivedAt > Date.now() - 7 * 86400000 && (!phoneFromJid(hint.jid) || phoneFromJid(hint.jid) === digits)) {
+      return { jid: hint.jid, phone: digits, requestedPhone: digits, isSelf: false, mode: 'whatsapp', simulation: false, resolutionSource: 'authenticated-private-message' };
+    }
     const cached = this.recipientCache.get(digits);
     if (cached && cached.generation === generation && cached.expiresAt > Date.now()) return { ...cached.result };
     if (this.recipientResolutions.has(digits)) return this.recipientResolutions.get(digits);
@@ -831,11 +949,16 @@ class WhatsAppAdapter extends EventEmitter {
     finally { if (this.recipientResolutions.get(digits) === operation) this.recipientResolutions.delete(digits); }
   }
 
-  async sendSearchText(target, text, { clientMessageId } = {}) {
+  async sendSearchText(target, text, { clientMessageId, replyContext } = {}) {
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Resultado da busca precisa ter de 1 a 16.000 caracteres.');
     if (typeof target !== 'string') throw definitiveError('Destinatário da busca inválido.');
     let targetId;
-    if (/^[1-9]\d{9,14}$/.test(target)) targetId = (await this.resolveRecipient(target)).jid;
+    if (replyContext) {
+      const resolved = await this.resolveReplyRecipient(replyContext);
+      if (![resolved.jid, resolved.phone].includes(target)) throw definitiveError('O destino da resposta difere do comando recebido.', false, 'WA_REPLY_RECIPIENT_MISMATCH');
+      targetId = resolved.jid;
+    }
+    else if (/^[1-9]\d{9,14}$/.test(target)) targetId = (await this.resolveRecipient(target)).jid;
     else if (phoneFromJid(target)) targetId = (await this.resolveRecipient(phoneFromJid(target))).jid;
     else if (accountJid(target) && target.endsWith('@lid')) {
       const normalized = accountJid(target);
@@ -920,7 +1043,7 @@ class WhatsAppAdapter extends EventEmitter {
       if (!key.id || !timestamp || timestamp < Math.max(this.connectStartedAt - 5000, now - 120000) || timestamp > now + 30000 || this.seenIncoming.has(key.id)) continue;
       this.seenIncoming.set(key.id, now);
       while (this.seenIncoming.size > 2000) this.seenIncoming.delete(this.seenIncoming.keys().next().value);
-      const chatId = key.remoteJid;
+      const chatId = accountJid(key.remoteJid) || key.remoteJid;
       const isGroup = typeof chatId === 'string' && chatId.endsWith('@g.us');
       const { contact, ...identity } = this._identityContext(key, isGroup);
       const body = unwrapMessage(message.message);
@@ -932,9 +1055,12 @@ class WhatsAppAdapter extends EventEmitter {
       else if (body.videoMessage) { type = 'video'; text = body.videoMessage.caption || ''; }
       else if (body.documentMessage) { type = 'document'; text = body.documentMessage.caption || ''; }
       else continue;
-      this.emit('incoming', {
+      const context = {
         messageId: key.id,
         ...identity,
+        pushName: typeof message.pushName === 'string' ? message.pushName.slice(0, 500) : contact.notify || '',
+        displayName: typeof message.pushName === 'string' ? message.pushName.slice(0, 500) : contact.notify || '',
+        savedName: contact.name || '',
         isGroup,
         forwarded: hasForwardedMetadata(message.message),
         fromMe: key.fromMe === true,
@@ -943,11 +1069,14 @@ class WhatsAppAdapter extends EventEmitter {
         type,
         raw: message,
         timestamp
-      });
+      };
+      context.replyProof = this._replyProof(context);
+      this.emit('incoming', context);
     }
   }
 
-  async reply(chatId, text) {
+  async reply(chatId, text, { replyContext, clientMessageId } = {}) {
+    if (replyContext) return this.sendSearchText(chatId, String(text), { replyContext, clientMessageId });
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado.', true);
     if (typeof chatId !== 'string' || (!phoneFromJid(chatId) && !/^\d+@lid$/.test(chatId))) throw definitiveError('Conversa de controle inválida.');
     const socket = this.socket;

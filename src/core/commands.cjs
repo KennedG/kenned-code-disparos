@@ -17,18 +17,22 @@ class ControlError extends Error {}
 const fail = message => { throw new ControlError(message); };
 
 class CommandController {
-  constructor({ store, scheduler, adapter, mediaManager, authService, now = () => Date.now() }) {
+  constructor({ store, scheduler, adapter, mediaManager, authService, automationControl, statusProvider, sendAdminReply, now = () => Date.now() }) {
     this.store = store;
     this.scheduler = scheduler;
     this.adapter = adapter;
     this.mediaManager = mediaManager;
     this.authService = authService || null;
+    this.automationControl = automationControl || null;
+    this.statusProvider = statusProvider || null;
+    this.sendAdminReply = sendAdminReply || null;
     this.actorContext = new AsyncLocalStorage();
     this.now = now;
     this.sessions = new Map();
     this.pending = new Map();
     this._tail = Promise.resolve();
     this._waiting = 0;
+    this.replyFailures = new WeakSet();
   }
 
   setAdapter(adapter) {
@@ -56,12 +60,19 @@ class CommandController {
 
   _authorized(context) {
     if (!context || context.verified !== true || context.isGroup !== false ||
-      context.forwarded !== false || context.fromMe !== false || context.historical === true ||
+      context.forwarded !== false || context.historical === true ||
       context.isHistory === true || context.history === true) return false;
+    if (context.automaticMessage === true || context.machineGenerated === true ||
+      this.store.isOutboundMessageId?.(context.messageId)) return false;
+    if (context.fromMe !== false) {
+      if (context.fromMe !== true || context.trustedSelf !== true || context.selfChat !== true ||
+        !this.adapter.isTrustedSelfContext?.(context)) return false;
+    }
     const sender = phone(context.senderNumber);
     if (!sender) return false;
     if (this.authService) {
-      if (!this.authService.findAuthorizedPhone(sender)) return false;
+      const user = this.authService.findAuthorizedPhone(sender);
+      if (!user || (this.automationControl && !this.authService.canFor(user, 'automation.control'))) return false;
     } else {
       // Compatibility for isolated core consumers/tests. Production always injects AuthService.
       const admins = this.store.getSetting('admins', []);
@@ -98,8 +109,35 @@ class CommandController {
     const value = String(text);
     // Listas grandes são divididas, sem transformar conteúdo em comandos.
     for (let offset = 0; offset < value.length; offset += 3500) {
-      await this.adapter.reply(context.chatId, value.slice(offset, offset + 3500));
+      const part = value.slice(offset, offset + 3500);
+      const userId = this.actorContext.getStore()?.id || null;
+      const submission = () => {
+        if (!this._authorized(context)) throw new ControlError('A autorização foi alterada antes do envio da resposta.');
+        this._trace(context, 'envio', 'ADMIN_REPLY_SUBMITTED', 'Resposta administrativa submetida à integração.');
+        return this.adapter.reply(context.chatId, part, { replyContext: context, clientMessageId: randomBytes(16).toString('hex').toUpperCase() });
+      };
+      this._trace(context, 'fila', 'ADMIN_REPLY_QUEUED', 'Resposta administrativa colocada na fila manual.');
+      try {
+        const result = this.sendAdminReply ? await this.sendAdminReply(context, part, { manual: true, userId }) :
+          this.scheduler?.runExternalSubmission ? await this.scheduler.runExternalSubmission(submission, { manual: true }) : await submission();
+        this._trace(context, 'resultado', result?.status === 'confirmed' ? 'ADMIN_REPLY_CONFIRMED' : 'ADMIN_REPLY_UNCONFIRMED',
+          result?.status === 'confirmed' ? 'Resposta confirmada pelo servidor; não implica entrega ao dispositivo.' : 'A integração ainda não confirmou a resposta.');
+      } catch (error) {
+        this._trace(context, 'erro', typeof error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : 'ADMIN_REPLY_FAILED',
+          'Não foi possível enviar a resposta administrativa. Confira a conexão, o destinatário e o diagnóstico.');
+        if (error && (typeof error === 'object' || typeof error === 'function')) this.replyFailures.add(error);
+        throw error;
+      }
     }
+  }
+
+  _trace(context, stage, code, description) {
+    if (!this.store.addDiagnostic) return;
+    try { this.store.addDiagnostic({ id: randomUUID(), traceId: context.commandTraceId || null,
+      at: Number(this.now()), userId: this.actorContext.getStore()?.id || null, campaignId: null,
+      stage: `admin.${stage}`, code, description, attempts: 0, action: 'Controle administrativo pelo WhatsApp.',
+      guidance: 'Use uma conversa privada autorizada. A resposta exige conexão ativa.' }); }
+    catch { this.scheduler?.blockOnPersistenceFailure?.(); }
   }
 
   _expire() {
@@ -112,7 +150,12 @@ class CommandController {
     if (!this._authorized(context)) return false;
     const user = this.authService ? this.authService.findAuthorizedPhone(phone(context.senderNumber)) : { id: null, legacy: true };
     if (!user || !this._fresh(context)) return false;
-    return this.actorContext.run(user, () => this._handleAuthorized(context));
+    context = { ...context, commandTraceId: randomUUID() };
+    this._trace(context, 'recebimento', 'ADMIN_COMMAND_RECEIVED', 'Comando privado recebido com identidade verificada.');
+    return this.actorContext.run(user, () => {
+      this._trace(context, 'autorizacao', 'ADMIN_AUTH_APPROVED', 'Identidade vinculada a usuário ativo com permissão de controle.');
+      return this._handleAuthorized(context);
+    });
   }
 
   _assert(permission, campaign) {
@@ -123,7 +166,7 @@ class CommandController {
 
   _audit(action, campaignId, details = {}) {
     this.store.addAudit?.({ action, actorId: this.actorContext.getStore()?.id || null,
-      campaignId: campaignId || null, source: 'whatsapp', at: new Date(Number(this.now())).toISOString(), ...details });
+      campaignId: campaignId || null, source: 'whatsapp', at: Number(this.now()), ...details });
   }
 
   _visibleCampaigns() {
@@ -154,6 +197,11 @@ class CommandController {
       if (previousSession) await this._reply(context, 'A sessão de configuração expirou. Envie !mega menu para começar outra.');
       return false;
     } catch (error) {
+      // A failed reply may already have reached WhatsApp. Do not submit a
+      // second generic reply with a new ID or repeat the administrative action.
+      if (error && this.replyFailures.has(error)) throw error;
+      this._trace(context, 'erro', error instanceof ControlError ? 'ADMIN_OPERATION_DENIED' : 'ADMIN_OPERATION_FAILED',
+        error instanceof ControlError ? error.message : 'Falha ao concluir a operação administrativa. Confira o diagnóstico no aplicativo.');
       await this._reply(context, error instanceof ControlError ? error.message :
         'Não foi possível concluir a operação. Confira a conexão e os dados da campanha no aplicativo.');
       return true;
@@ -337,7 +385,7 @@ class CommandController {
       '!mega ajuda\n!mega status\n!mega campanhas\n!mega grupos\n!mega menu\n!mega criar NOME\n!mega editar ID\n' +
       '!mega pausar ID\n!mega retomar ID\n!mega ativar ID\n!mega parar tudo\n!mega intervalo ID MINUTOS\n' +
       '!mega adicionar-grupo ID_CAMPANHA ID_GRUPO\n!mega remover-grupo ID_CAMPANHA ID_GRUPO\n!mega previa ID\n' +
-      '!mega confirmar CÓDIGO\n!mega cancelar\n\nAtivação e alterações em campanhas ativas exigem a confirmação do resumo. Sessões de edição expiram após 15 minutos sem uso.';
+      '!mega retomar sistema — reabrir as filas após parar tudo\n!mega confirmar CÓDIGO\n!mega cancelar\n\nAtivação e alterações em campanhas ativas exigem a confirmação do resumo. Sessões de edição expiram após 15 minutos sem uso.';
   }
 
   _campaignList() {
@@ -370,12 +418,16 @@ class CommandController {
     if (campaign) this._assert('campaign.view', campaign);
     return `Menu Kenned Code Disparos${campaign ? ` — ${campaign.name}` : ''}\n` +
       '1 Criar campanha\n2 Editar/selecionar campanha\n3 Selecionar/remover grupos e configurar grupo\n' +
-      '4 Horários, intervalos e limites\n5 Adicionar texto ou mídia\n6 Ordenar/remover conteúdos\n7 Resultados e falhas\n8 Prévia e ativação\n0 Encerrar menu\nResponda com o número. Para retornar de uma etapa: !mega menu.';
+      '4 Horários, intervalos e limites\n5 Adicionar texto ou mídia\n6 Ordenar/remover conteúdos\n7 Resultados e falhas\n8 Prévia e ativação\n' +
+      `${this.statusProvider ? '9 Estado de filas, monitoramento, alertas e lembretes\n' : ''}` +
+      '0 Encerrar menu\nResponda com o número. Para retornar de uma etapa: !mega menu.' +
+      `${this.automationControl ? '\nEmergência: !mega parar tudo. Reabrir as filas: !mega retomar sistema.' : ''}`;
   }
 
   async _command(context, sender, body) {
     const words = body.trim().split(/\s+/);
     const command = fold(words.shift() || 'menu');
+    this._trace(context, 'interpretacao', 'ADMIN_COMMAND_PARSED', `Comando administrativo interpretado: ${['ajuda','menu','cancelar','confirmar','status','campanhas','grupos','parar','criar','editar','previa','pausar','ativar','retomar','intervalo','adicionar-grupo','remover-grupo'].includes(command) ? command : 'não reconhecido'}.`);
     if (command === 'ajuda') return this._reply(context, this._help());
     if (command === 'menu') {
       const old = this.sessions.get(sender);
@@ -394,21 +446,40 @@ class CommandController {
       const campaigns = this._visibleCampaigns();
       const next = campaigns.filter(campaign => campaign.state === 'active' && campaign.nextRunAt)
         .map(campaign => campaign.nextRunAt).sort((a, b) => new Date(a) - new Date(b))[0];
-      return this._reply(context, `Conexão: ${this.adapter.status?.state || 'disconnected'}\n` +
+      const details = this.statusProvider ? await this.statusProvider({ userId: this.actorContext.getStore()?.id || null }) : null;
+      const counts = value => typeof value === 'number' ? String(value) : value && typeof value === 'object' ? Object.entries(value).filter(([,v]) => typeof v === 'number' || typeof v === 'boolean' || (typeof v === 'string' && v.length < 100)).map(([key,v]) => `${key}: ${v}`).join('; ') : 'não informado';
+      const connection = ({ connected: 'conectado', disconnected: 'desconectado', connecting: 'conectando', qr: 'aguardando leitura do QR', restricted: 'restrito' })[this.adapter.status?.state] || 'indisponível';
+      return this._reply(context, `Conexão: ${connection}\n` +
         `Campanhas: ${campaigns.length}; ativas: ${campaigns.filter(campaign => campaign.state === 'active').length}\n` +
         `Próximo envio: ${next ? new Date(next).toLocaleString('pt-BR') : 'não programado'}\n` +
+        `${this.automationControl ? `Automação: ${this.automationControl.isStopped() ? 'INTERROMPIDA — retomada explícita necessária' : 'habilitada'}\n` : ''}` +
+        `${details ? `Filas: ${counts(details.queues || details.queue || details.scheduler)}\nMonitoramento: ${counts(details.monitoring || details.monitor || details.search)}\nAlertas: ${counts(details.alerts)}\nLembretes: ${counts(details.reminders)}\n` : ''}` +
         `${this.adapter.status?.mode === 'simulated' ? 'Modo simulado: nenhuma mensagem real é enviada.' : 'O envio requer computador ligado, internet e conexão ativa.'}`);
     }
     if (command === 'campanhas') return this._reply(context, this._campaignList());
     if (command === 'grupos') return this._reply(context, this._groupList());
     if (command === 'parar' && fold(words.join(' ')) === 'tudo') {
-      this._assert('campaign.stop');
+      this._assert(this.automationControl ? 'automation.control' : 'campaign.stop');
       // A global stop must cover every campaign; a seller's own scope cannot stop others.
-      for (const campaign of this.store.listCampaigns()) this._assert('campaign.stop', campaign);
+      if (!this.automationControl) for (const campaign of this.store.listCampaigns()) this._assert('campaign.stop', campaign);
       this.pending.clear();
+      this.sessions.clear();
+      if (this.automationControl) {
+        const report = await this.automationControl.stop({ actorId: this.actorContext.getStore()?.id || null, source: 'whatsapp' });
+        this._audit('automation.stop-all', null, { report });
+        const count = value => typeof value === 'number' ? value : Number(value?.cancelled ?? value?.stopped ?? value?.campaigns ?? value?.count) || 0;
+        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
+      }
       await this.scheduler.stopAll();
       this._audit('campaign.stop-all');
       return this._reply(context, 'Todas as campanhas foram interrompidas. Um envio já submetido ao WhatsApp pode terminar; a fila restante foi cancelada.');
+    }
+    if (command === 'retomar' && fold(words.join(' ')) === 'sistema') {
+      if (!this.automationControl) fail('A retomada global não está disponível nesta integração.');
+      this._assert('automation.control');
+      await this.automationControl.resume({ actorId: this.actorContext.getStore()?.id || null, source: 'whatsapp' });
+      this._audit('automation.resume');
+      return this._reply(context, '✅ Novas entradas nas filas automáticas foram liberadas. Envios cancelados não serão repetidos e campanhas interrompidas continuam encerradas; ative apenas as que deseja executar.');
     }
     if (command === 'criar') {
       const campaign = this._newCampaign(words.join(' '));
@@ -539,6 +610,7 @@ class CommandController {
     }
     if (session.phase === 'home') {
       if (text === '0') { this.sessions.delete(sender); return this._reply(context, 'Menu encerrado.'); }
+      if (text === '9' && this.statusProvider) return this._command(context, sender, 'status');
       if (text === '1') { this._assert('campaign.create'); session.phase = 'create_name'; return this._reply(context, 'Qual será o nome da campanha? Ela será criada desativada.'); }
       if (text === '2') { session.phase = 'choose_campaign'; return this._reply(context, `${this._campaignList()}\nInforme o número ou ID da campanha.`); }
       const campaign = this._editing(session);

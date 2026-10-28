@@ -13,6 +13,7 @@ class SimulatedAdapter extends EventEmitter {
     this.replies = [];
     this.sent = [];
     this.automaticMessages = new Set();
+    this.replyContexts = new Map();
     this.ownNumber = String(store?.getSetting?.('simulationOwnNumber', '') || '');
     this.searchCapture = { enabled: false, importHistory: false, groupIds: null, commandGroupIds: null };
     this.status = { state: 'disconnected', mode: 'simulated', detail: 'Simulação local: nenhum envio pelo WhatsApp.' };
@@ -67,6 +68,20 @@ class SimulatedAdapter extends EventEmitter {
     if (!/^[1-9]\d{9,14}$/.test(digits)) throw Object.assign(new Error('Telefone privado inválido. Use código do país e DDD.'), { code: 'WA_RECIPIENT_INVALID', safeToRetry: false });
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { code: 'WA_RECIPIENT_OFFLINE', safeToRetry: true });
     return { jid: `${digits}@s.whatsapp.net`, phone: digits, requestedPhone: digits, isSelf: digits === this.ownNumber, mode: 'simulated', simulation: true, resolutionSource: 'simulation-only' };
+  }
+
+  async resolveReplyRecipient(context) {
+    if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { code: 'WA_RECIPIENT_OFFLINE', safeToRetry: true });
+    const saved = this.replyContexts.get(context?.replyProof);
+    if (!saved || context.isGroup !== false || context.chatId !== saved.chatId || context.senderId !== saved.senderId || String(context.senderNumber || '') !== saved.senderNumber) throw Object.assign(new Error('Origem privada simulada inválida.'), { code: 'WA_REPLY_CONTEXT_INVALID', safeToRetry: false, definitive: true });
+    return { jid: saved.chatId, phone: saved.senderNumber, requestedPhone: saved.senderNumber, isSelf: saved.fromMe && saved.senderNumber === this.ownNumber, mode: 'simulated', simulation: true, resolutionSource: 'simulation-inbound' };
+  }
+
+  async resolveSearchRecipient(number, replyContext) {
+    if (!replyContext) return this.resolveRecipient(number);
+    const resolved = await this.resolveReplyRecipient(replyContext);
+    if (![resolved.jid, resolved.phone].includes(String(number || ''))) throw Object.assign(new Error('O destinatário difere do comando simulado.'), { code: 'WA_REPLY_RECIPIENT_MISMATCH', safeToRetry: false, definitive: true });
+    return resolved;
   }
 
   _markAutomatic(messageId, kind = 'simulated') {
@@ -144,10 +159,11 @@ class SimulatedAdapter extends EventEmitter {
     return groupIds === null || groupIds.has(chatId) || (!history && (commandGroupIds === null || commandGroupIds.has(chatId)));
   }
 
-  async sendSearchText(target, text, { clientMessageId } = {}) {
+  async sendSearchText(target, text, { clientMessageId, replyContext } = {}) {
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw Object.assign(new Error('Resultado da busca inválido.'), { safeToRetry: false });
     if (typeof target !== 'string' || !(/^\d{10,15}$/.test(target) || /^\d+(?::\d+)?@(s\.whatsapp\.net|lid)$/.test(target) || /^sim-\d+@simulation$/.test(target))) throw Object.assign(new Error('Destinatário da busca inválido para simulação.'), { safeToRetry: false });
+    if (replyContext) { const resolved = await this.resolveSearchRecipient(target, replyContext); target = resolved.jid; }
     const targetId = /^\d{10,15}$/.test(target) ? `${target}@s.whatsapp.net` : target.replace(/:\d+(?=@)/, '');
     const messageId = clientMessageId || `SIM-SEARCH-${randomUUID()}`;
     const existing = this.sent.find(entry => entry.messageId === messageId);
@@ -175,7 +191,16 @@ class SimulatedAdapter extends EventEmitter {
     return this.status;
   }
 
-  async reply(chatId, text) {
+  async reply(chatId, text, { replyContext, clientMessageId } = {}) {
+    if (replyContext) {
+      const result = await this.sendSearchText(chatId, String(text), { replyContext, clientMessageId });
+      if (!this.replies.some(reply => reply.messageId === result.messageId)) {
+        this.replies.push({ chatId, text: String(text), messageId: result.messageId, status: result.status, at: new Date().toISOString(), simulation: true });
+        if (this.replies.length > 1000) this.replies.splice(0, this.replies.length - 1000);
+        this.emit('reply', this.replies[this.replies.length - 1]);
+      }
+      return result;
+    }
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     const messageId = `SIM-REPLY-${randomUUID()}`;
     this._markAutomatic(messageId, 'simulated-control-reply');
@@ -208,6 +233,11 @@ class SimulatedAdapter extends EventEmitter {
       ...context,
       simulation: true
     }, context.history === true || context.historical === true);
+    if (!event.history && event.isGroup === false) {
+      event.replyProof = `SIM-REPLY-PROOF-${randomUUID()}`;
+      this.replyContexts.set(event.replyProof, { chatId: event.chatId, senderId: event.senderId, senderNumber: event.senderNumber, fromMe: event.fromMe });
+      while (this.replyContexts.size > 10000) this.replyContexts.delete(this.replyContexts.keys().next().value);
+    }
     if (!event.history) this.emit('incoming', event);
     if (this._searchChatAllowed(event.chatId) && !event.history) this.emit('offerMessage', event);
     return event;

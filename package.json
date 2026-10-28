@@ -1,6 +1,6 @@
 {
   "name": "kenned-code-disparos",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Kenned Code Disparos: campanhas autorizadas e buscas de ofertas pelo WhatsApp",
   "main": "src/main.cjs",
   "author": "Kenned Code Disparos",

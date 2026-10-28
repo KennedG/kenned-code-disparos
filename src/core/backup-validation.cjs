@@ -1,4 +1,5 @@
 const validation=require('./validation.cjs');
+const {normalizeReminder}=require('./reminders.cjs');
 const fail=message=>{throw new Error(`Backup inválido: ${message}`);};
 const object=value=>value&&typeof value==='object'&&!Array.isArray(value);
 const id=value=>typeof value==='string'&&value.length>0&&value.length<=512;
@@ -15,6 +16,13 @@ function validateBackupData(input){
   const groups=collection(input.groups,'grupos'),media=collection(input.media,'mídias');
   const campaigns=collection(input.campaigns,'campanhas'),templates=collection(input.templates||[],'modelos'),settings=collection(input.settings||[],'configurações');
   const contacts=collection(input.contacts||[],'contatos'),recipients=collection(input.alertRecipients||[],'destinatários de alertas');
+  // Legacy backups have no reminders field and must leave local schedules intact.
+  const reminders=Object.hasOwn(input,'reminders')?collection(input.reminders,'lembretes'):null;
+  const cleanReminders=[];
+  if(reminders)for(const reminder of reminders.values()){
+    if(typeof reminder.recipientId!=='string'||(reminder.recipientId.startsWith('user:')?!id(reminder.recipientId.slice(5)):!recipients.has(reminder.recipientId)))fail('Destinatário do lembrete inválido ou ausente no cadastro exportado.');
+    try{cleanReminders.push({id:reminder.id,...normalizeReminder(reminder)});}catch(error){fail(error.message);}
+  }
   for(const value of [...contacts.values(),...recipients.values()]){
     if(typeof value.name!=='string'||!value.name.trim()||value.name.length>120||typeof value.phone!=='string'||!/^\+?\d{10,15}$/.test(value.phone))fail('Contato ou destinatário de alerta inválido.');
     if(value.userId!==undefined&&value.userId!==null&&!id(value.userId))fail('Usuário do destinatário inválido.');
@@ -47,6 +55,7 @@ function validateBackupData(input){
     if(key==='closeBehavior'&&!['ask','tray','quit'].includes(value))fail('Preferência de fechamento inválida.');
     if(['launchAtLogin','minimizeToTray','unofficialAcknowledged','initialized'].includes(key)&&typeof value!=='boolean')fail('Preferência inválida.');
     if(key==='reconnect'&&(!object(value)||!optionalBool(value,'enabled')||!optionalBool(value,'autoResume')||!bounded(value.maxAttempts??3,0,10,true)||!bounded(value.delaySeconds??15,3,3600)))fail('Reconexão inválida.');
+    if(key==='alertRetryPolicy'&&(!object(value)||!bounded(value.maxAttempts??3,1,5,true)||!bounded(value.delaySeconds??15,3,3600)))fail('Tentativas de alerta inválidas.');
     if(key==='notifications'&&(!object(value)||!optionalBool(value,'nativeEnabled')))fail('Notificações inválidas.');
     if(key==='retention'&&(!object(value)||!bounded(value.days??90,1,3650,true)||!bounded(value.maxEntries??20000,100,1000000,true)||!bounded(value.maxMegabytes??64,1,1024)))fail('Retenção de registros inválida.');
     if(key==='sound'){
@@ -59,6 +68,6 @@ function validateBackupData(input){
       if(value.url)try{const parsed=new URL(value.url);if(parsed.protocol!=='https:'||parsed.username||parsed.password||parsed.hash)fail('Canal independente inválido.');}catch{fail('Canal independente inválido.');}
     }
   }
-  return {...input,groups:[...groups.values()],campaigns:cleanCampaigns,templates:cleanTemplates,contacts:[...contacts.values()],alertRecipients:[...recipients.values()]};
+  return {...input,groups:[...groups.values()],campaigns:cleanCampaigns,templates:cleanTemplates,contacts:[...contacts.values()],alertRecipients:[...recipients.values()],...(reminders?{reminders:cleanReminders}:{})};
 }
 module.exports={validateBackupData};

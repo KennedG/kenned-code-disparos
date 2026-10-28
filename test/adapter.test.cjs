@@ -467,3 +467,111 @@ test('falha tardia do transporte antigo não restringe a nova conexão', async t
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.adapter.status.state, 'connected');
 });
+
+test('resposta privada usa chat recebido autenticado sem USYNC e rejeita contexto fabricado', async t => {
+  const f = await fixture(t);
+  const pn = '5562998887777';
+  let lookups = 0, sends = 0, incoming;
+  f.socket.onWhatsApp = async () => { lookups++; throw new Error('lookup unavailable despite inbound chat'); };
+  f.adapter.on('incoming', context => { incoming = context; });
+  f.setSendBehavior(async (jid, _content, options) => { sends++; assert.equal(jid, `${pn}@s.whatsapp.net`); return { key: { id: options.messageId }, status: 2 }; });
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'PRIVATE_PN_COMMAND', remoteJid: `${pn}:5@s.whatsapp.net`, fromMe: false }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: '!busca iPhone 15 Pro Max 256GB' } }] });
+  assert.equal(incoming.chatId, `${pn}@s.whatsapp.net`);
+  assert.equal(incoming.senderNumber, pn);
+  assert(incoming.replyProof);
+  const context = { chatId: incoming.chatId, senderNumber: incoming.senderNumber, senderId: incoming.senderId, isGroup: false, replyProof: incoming.replyProof };
+  const resolved = await f.adapter.resolveSearchRecipient(pn, context);
+  assert.equal(resolved.resolutionSource, 'authenticated-private-message');
+  const result = await f.adapter.sendSearchText(resolved.jid, 'Nenhuma oferta compatível.', { clientMessageId: 'REPLY_PRIVATE_PN', replyContext: context });
+  assert.equal(result.status, 'confirmed'); assert.equal(lookups, 0); assert.equal(sends, 1);
+  assert.equal((await f.adapter.resolveRecipient(pn)).jid, resolved.jid);
+  await assert.rejects(f.adapter.resolveReplyRecipient({ ...context, replyProof: null }), error => error.code === 'WA_REPLY_CONTEXT_INVALID');
+  await assert.rejects(f.adapter.resolveReplyRecipient({ ...context, senderNumber: '5562998880000' }), error => error.code === 'WA_REPLY_CONTEXT_INVALID');
+  await assert.rejects(f.adapter.sendSearchText('5562998880000', 'Proibido', { replyContext: context }), error => error.code === 'WA_REPLY_RECIPIENT_MISMATCH');
+  assert.equal(sends, 1);
+});
+
+test('chat privado LID usa PN alternativo autenticado e mantém o JID original na resposta', async t => {
+  const f = await fixture(t);
+  const pn = '5562998887777', lid = '8123456789@lid';
+  let incoming, sends = 0;
+  f.socket.onWhatsApp = async () => { throw new Error('must not query a known private chat'); };
+  f.adapter.on('incoming', value => { incoming = value; });
+  f.setSendBehavior(async (jid, _text, options) => { sends++; assert.equal(jid, lid); return { key: { id: options.messageId }, status: 2 }; });
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'LID_PRIVATE_COMMAND', remoteJid: lid, remoteJidAlt: `${pn}@s.whatsapp.net`, fromMe: false }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: '!busca' } }] });
+  assert.equal(incoming.senderNumber, pn); assert.equal(incoming.senderId, lid);
+  const recipient = await f.adapter.resolveSearchRecipient(pn, incoming);
+  assert.equal(recipient.jid, lid);
+  assert.equal((await f.adapter.sendSearchText(lid, 'Como pesquisar: !busca iPhone 15 128GB', { replyContext: incoming, clientMessageId: 'LID_PRIVATE_REPLY' })).status, 'confirmed');
+  assert.equal(sends, 1);
+});
+
+test('LID sem telefone no evento consulta mapeamento autenticado antes da autorização, sem número fictício', async t => {
+  const f = await fixture(t);
+  const pn = '5562998887777', lid = '8234567890@lid';
+  let incoming, mappings = 0;
+  f.socket.signalRepository = { lidMapping: { getPNForLID: async id => { mappings++; assert.equal(id, lid); return `${pn}@s.whatsapp.net`; } } };
+  f.adapter.on('incoming', context => { incoming = context; });
+  const message = { key: { id: 'PRIVATE_MAPPING_COMMAND', remoteJid: lid, fromMe: false }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: '!mega status' } };
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [message] });
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [message] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(mappings, 1); assert.equal(incoming.senderNumber, pn); assert.equal(incoming.verified, true);
+  assert.equal((await f.adapter.resolveReplyRecipient(incoming)).jid, lid);
+  f.socket.signalRepository.lidMapping.getPNForLID = async () => undefined;
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ ...message, key: { ...message.key, id: 'MAPPING_UNAVAILABLE', remoteJid: '9999999999@lid' } }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(incoming.senderNumber, ''); assert.equal(incoming.verified, false);
+  assert.equal((await f.adapter.resolveReplyRecipient(incoming)).phone, '');
+});
+
+test('prova da conversa privada persiste protegida na sessão e resiste a reinício sem confiar em chamadas externas', async t => {
+  const f = await fixture(t);
+  let incoming;
+  f.adapter.on('incoming', value => { incoming = value; });
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'PERSISTED_PRIVATE_COMMAND', remoteJid: '5562998887777@s.whatsapp.net', fromMe: false }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: '!busca iphone' } }] });
+  const secret = f.adapter.replyProofKey.toString('hex');
+  assert.equal((await fs.readFile(path.join(f.dir, 'session.dpapi'))).includes(secret), false);
+  await f.adapter.disconnect();
+  const restarted = new WhatsAppAdapter({ store: f.adapter.store, credentialsDir: f.dir, safeStorage: f.safeStorage, loadLibrary: async () => f.library, runtimePlatform: 'win32' });
+  t.after(() => restarted.disconnect());
+  await restarted.connect(); f.socket.ev.emit('connection.update', { connection: 'open' });
+  assert.equal((await restarted.resolveReplyRecipient(incoming)).jid, incoming.chatId);
+  f.socket.user = { id: '5562998880000@s.whatsapp.net' };
+  await assert.rejects(restarted.resolveReplyRecipient(incoming), error => error.code === 'WA_REPLY_CONTEXT_INVALID');
+});
+
+test('resposta administrativa com prova usa confirmação da integração e eco automático é identificado', async t => {
+  const f = await fixture(t);
+  let incoming;
+  f.adapter.on('incoming', value => { incoming = value; });
+  f.setSendBehavior(async (_jid, _text, options) => ({ key: { id: options.messageId }, status: 2 }));
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'ADMIN_PRIVATE_COMMAND', remoteJid: '5562998887777@s.whatsapp.net', fromMe: false }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: '!mega menu' } }] });
+  const result = await f.adapter.reply(incoming.chatId, 'Menu administrativo', { replyContext: incoming, clientMessageId: 'ADMIN_REPLY' });
+  assert.equal(result.status, 'confirmed');
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: result.messageId, remoteJid: '5562998887777@s.whatsapp.net', fromMe: true }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: '!mega menu' } }] });
+  assert.equal(incoming.automaticMessage, true);
+  assert.equal(incoming.senderNumber, '5511999999999');
+});
+
+test('identificação privada factual sobrevive à reconexão e reinício protegidos sem depender de USYNC', async t => {
+  const f = await fixture(t);
+  const pn = '5562998887777', lid = '8987654321@lid';
+  f.socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ key: { id: 'RECIPIENT_HINT_RECEIVED', remoteJid: lid, remoteJidAlt: pn + '@s.whatsapp.net', fromMe: false }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: 'Olá' } }] });
+  await f.adapter.authStore.writeChain;
+  await f.adapter.disconnect();
+  await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' });
+  f.socket.onWhatsApp = async () => { throw new Error('must not query known recipient after reconnect'); };
+  assert.equal((await f.adapter.resolveRecipient(pn)).jid, lid);
+  await f.adapter.disconnect();
+  const restarted = new WhatsAppAdapter({ store: f.adapter.store, credentialsDir: f.dir, safeStorage: f.safeStorage, loadLibrary: async () => f.library, runtimePlatform: 'win32' });
+  t.after(() => restarted.disconnect());
+  await restarted.connect(); f.socket.ev.emit('connection.update', { connection: 'open' });
+  f.socket.onWhatsApp = async () => { throw new Error('must not query known recipient after restart'); };
+  assert.equal((await restarted.resolveRecipient(pn)).jid, lid);
+  restarted.protocolRecipientHints.get(pn).receivedAt = Date.now() - 8 * 86400000;
+  await assert.rejects(restarted.resolveRecipient(pn), error => error.code === 'WA_RECIPIENT_LOOKUP_TEMPORARY');
+  restarted.protocolRecipientHints.get(pn).receivedAt = Date.now();
+  f.socket.user = { id: '5562998880000@s.whatsapp.net' };
+  await assert.rejects(restarted.resolveRecipient(pn), error => error.code === 'WA_RECIPIENT_LOOKUP_TEMPORARY');
+});

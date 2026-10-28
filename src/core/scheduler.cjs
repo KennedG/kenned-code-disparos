@@ -99,6 +99,10 @@ class Scheduler extends EventEmitter {
     this.closed = false;
     this.submissionHolds = 0;
     this.externalSubmissions = Promise.resolve();
+    this.externalPending = new Set();
+    this.externalInFlight = 0;
+    this.campaignInFlight = 0;
+    this.automationBlocked = store.getSetting?.('automationState', {})?.stopped === true;
     this.receipts = new Map();
     // Defense in depth: constructing a worker never replays an old queue.
     const interrupted = new Set();
@@ -125,6 +129,7 @@ class Scheduler extends EventEmitter {
       this._pauseActive('Integração alterada; retome após conferir a conexão.');
     }
     this.adapter = adapter;
+    this.setAutomationBlocked(this.store.getSetting?.('automationState', {})?.stopped === true);
     this.receipts.clear();
     this.lastSubmissionAt=null;
     this.statusListener = status => {
@@ -279,6 +284,7 @@ class Scheduler extends EventEmitter {
 
   async activate(id) {
     if (this.closed) throw new Error('O agendador está encerrado.');
+    if (this._automationStopped()) throw this._automationError();
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
     if (this.persistenceFailed) throw new Error('O agendador foi bloqueado após uma falha de persistência. Reinicie o aplicativo e confira o histórico.');
     const campaign = this.store.getCampaign(id);
@@ -322,11 +328,14 @@ class Scheduler extends EventEmitter {
     // Stop the current worker before touching any campaign on disk, including
     // a different campaign that happens to appear first in the database.
     this.currentRound?.controller.abort();
+    let campaigns = 0, jobs = 0;
     for (const campaign of this.store.listCampaigns()) {
-      if (['active', 'paused'].includes(campaign.state)) this._persist('saveCampaign', { ...campaign, state: 'stopped', nextRunAt: null });
+      if (['active', 'paused'].includes(campaign.state)) { this._persist('saveCampaign', { ...campaign, state: 'stopped', nextRunAt: null }); campaigns++; }
+      jobs += this.store.listJobs({ campaignId: campaign.id, status: 'queued', limit: 1000000 }).length;
       this._cancelQueued(campaign.id, 'Todos os envios foram interrompidos.');
     }
     this.emit('change');
+    return { campaigns, cancelled: jobs, jobs, inFlight: this.campaignInFlight };
   }
 
   async waitForIdle() {
@@ -344,22 +353,52 @@ class Scheduler extends EventEmitter {
     return () => { if (!released) { released = true; this.submissionHolds = Math.max(0, this.submissionHolds - 1); } };
   }
 
-  runExternalSubmission(task) {
+  _automationStopped() { return this.automationBlocked || this.store.getSetting?.('automationState', {})?.stopped === true; }
+
+  _automationError() { return Object.assign(new Error('Envios automáticos bloqueados: o sistema foi interrompido. Use !mega retomar sistema ou a retomada explícita no aplicativo.'), { code: 'AUTOMATION_STOPPED', safeToRetry: false, definitive: true, submitted: false }); }
+
+  setAutomationBlocked(blocked) {
+    this.automationBlocked = blocked === true;
+    if (!this.automationBlocked) return;
+    this.currentRound?.controller.abort();
+    for (const entry of this.externalPending || []) {
+      if (entry.manual || entry.started || entry.cancelled) continue;
+      entry.cancelled = true;
+      entry.reject(this._automationError());
+    }
+  }
+
+  getInFlightCount() { return this.externalInFlight + this.campaignInFlight; }
+  getCampaignInFlightCount() { return this.campaignInFlight; }
+
+  runExternalSubmission(task, { manual = false } = {}) {
     // All private alerts and search results share this queue. Holding the
     // scheduler immediately prevents a new campaign round taking their slot.
+    if (!manual && this._automationStopped()) return Promise.reject(this._automationError());
     const release = this.holdSubmissions();
+    let resolve, reject;
+    const result = new Promise((done, fail) => { resolve = done; reject = fail; });
+    const entry = { manual: manual === true, started: false, cancelled: false, resolve, reject };
+    this.externalPending.add(entry);
     const operation = this.externalSubmissions.catch(() => {}).then(async () => {
+      if (entry.cancelled) return;
       await this.waitForIdle();
+      if (entry.cancelled) return;
       if (this.closed || this.persistenceFailed || this.store.persistenceFailed) throw new Error('Envios externos bloqueados: processamento indisponível.');
-      return task();
+      if (!entry.manual && this._automationStopped()) throw this._automationError();
+      entry.started = true;
+      this.externalInFlight++;
+      try { return await task(); }
+      finally { this.externalInFlight--; }
     });
     this.externalSubmissions = operation.catch(() => {});
-    return operation.finally(release);
+    operation.then(resolve, reject).finally(() => this.externalPending.delete(entry));
+    return result.finally(release);
   }
 
   tick() {
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
-    if (this.closed || this.persistenceFailed || this.submissionHolds) return Promise.resolve();
+    if (this.closed || this.persistenceFailed || this.submissionHolds || this._automationStopped()) return Promise.resolve();
     // Lock before invoking _tick: an adapter may synchronously emit an event
     // that calls tick again, before the worker promise has been assigned.
     if (this.busy) return this.worker || Promise.resolve();
@@ -380,7 +419,7 @@ class Scheduler extends EventEmitter {
     if (!this._connected()) { this._pauseActive('Conexão indisponível.'); return; }
     const candidates = this.store.listCampaigns().filter(c => c.state === 'active' && (c.nextRunAt ?? 0) <= this.now()).sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
     for (const snapshot of candidates) {
-      if (this.closed || !this._connected()) break;
+      if (this.closed || this._automationStopped() || !this._connected()) break;
       const campaign = this.store.getCampaign(snapshot.id);
       if (campaign?.state !== 'active') continue;
       try { this._validateCampaign(campaign); }
@@ -399,7 +438,7 @@ class Scheduler extends EventEmitter {
     if (this.store.persistenceFailed) { this.blockOnPersistenceFailure(); return false; }
     const campaign = this.store.getCampaign(campaignId);
     const group = this.store.getGroup(groupId);
-    return !this.closed && !this.persistenceFailed && this._connected() && campaign?.state === 'active' && campaign.groupIds.includes(groupId) && group?.authorized && Boolean(group.simulation) === (this.adapter.status.mode === 'simulated');
+    return !this.closed && !this.persistenceFailed && !this._automationStopped() && this._connected() && campaign?.state === 'active' && campaign.groupIds.includes(groupId) && group?.authorized && Boolean(group.simulation) === (this.adapter.status.mode === 'simulated');
   }
 
   async _wait(ms, signal) {
@@ -428,7 +467,10 @@ class Scheduler extends EventEmitter {
       // irreversible network request, including the shared storage fault flag.
       if (signal.aborted || !this._maySend(job.campaignId, job.groupId)) return 'cancelled';
       try {
-        const result = await this.adapter.send(job.groupId, { ...job.itemSnapshot, clientMessageId: job.messageId }, job.itemSnapshot.mediaId ? this.store.getMedia(job.itemSnapshot.mediaId) : null);
+        this.campaignInFlight++;
+        let result;
+        try { result = await this.adapter.send(job.groupId, { ...job.itemSnapshot, clientMessageId: job.messageId }, job.itemSnapshot.mediaId ? this.store.getMedia(job.itemSnapshot.mediaId) : null); }
+        finally { this.campaignInFlight--; }
         const confirmed = result?.status === 'confirmed' || this.receipts.has(result?.messageId || job.messageId);
         this._persist('updateJob', job.id, {
           status: confirmed ? 'confirmed' : 'uncertain', messageId: result?.messageId || job.messageId, resultAt: this.now(),
