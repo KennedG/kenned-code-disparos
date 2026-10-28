@@ -335,6 +335,14 @@ class OpportunityService extends EventEmitter {
   }
   evaluate(id, { automatic = false, offers } = {}) {
     const op = this.store.getOpportunity(id); if (!op) throw error('Oportunidade não encontrada.', 'OPPORTUNITY_NOT_FOUND');
+    // The campaign-destination workflow owns dispatch and its durable outbox.
+    // Never let a refresh of the legacy panel reserve a private response to the
+    // interested person after the destination policy has been upgraded.
+    if (this.workflow && this._config().campaignDestinations === true) {
+      if (automatic) Promise.resolve(this.workflow.consider(id)).catch(e => this._failure(e));
+      const current = this.store.getOpportunity(id), candidates = this._candidates(current, offers);
+      return { opportunity: this._present(current, candidates), candidates, reservation: null, blockers: this._blockers(current, candidates, null, !candidates.length) };
+    }
     const candidates = this._candidates(op, offers), eligible = candidates.filter(v => v.eligible), c = this._config();
     if (eligible.length && !isClosed(op.status) && !op.needsReview) this._notify(op);
     let reservation = null;
@@ -363,7 +371,7 @@ class OpportunityService extends EventEmitter {
     const origins=this.store.listOpportunityOrigins(op.id),groups=new Set(origins.map(v=>v.chatId||v.groupId)),origin=origins.find(v=>!v.deleted)||origins[0],blockers=this._blockers(op,candidates,null,!candidates.length);
     const matched=candidates.find(v=>v.compatible===true),campaign=matched&&this.store.getCampaign(matched.campaignId),item=campaign?.items?.find(v=>v.id===matched.itemId);
     const matchPreview=matched&&campaign&&item?{offerId:matched.id,campaignId:campaign.id,campaignName:campaign.name,itemId:item.id,mediaId:item.mediaId||null,mediaType:item.type,model:matched.model,storageGB:matched.storageGB??null,color:matched.color??null,condition:matched.condition??null,priceCents:matched.priceCents,text:matched.originalExcerpt||matched.excerpt||matched.rawText||'',available:matched.available,availabilityConfirmedAt:matched.availabilityConfirmedAt,sentBefore:matched.sentBefore===true}:null;
-    return {...op,senderPhone:op.senderPhone||op.recipient||null,senderName:op.senderName||'',originalAt:op.originalAt||op.firstAt,requests:op.request?.models||[],intentConfidence:op.request?.intentConfidence||null,intentReasons:op.request?.intentReasons||[],originalText:origin?.text||'',originPreview:origin?{messageId:origin.messageId,groupId:origin.groupId||origin.chatId,groupName:origin.groupName||this.store.getGroup?.(origin.groupId||origin.chatId)?.name||'',originalAt:origin.originalAt,text:origin.text||''}:null,matchPreview,blockers,reason:blockers[0]?.reason||op.reviewReason||op.lastResponseReason||'',originCount:origins.length,groupCount:groups.size,groupedLabel:groups.size>1?`Pedido repetido em ${groups.size} grupos.`:null};
+    return {...op,...(this.workflow && this._config().campaignDestinations === true ? {workflow:this.workflow.detail(op.id)} : {}),senderPhone:op.senderPhone||op.recipient||null,senderName:op.senderName||'',originalAt:op.originalAt||op.firstAt,requests:op.request?.models||[],intentConfidence:op.request?.intentConfidence||null,intentReasons:op.request?.intentReasons||[],originalText:origin?.text||'',originPreview:origin?{messageId:origin.messageId,groupId:origin.groupId||origin.chatId,groupName:origin.groupName||this.store.getGroup?.(origin.groupId||origin.chatId)?.name||'',originalAt:origin.originalAt,text:origin.text||''}:null,matchPreview,blockers,reason:blockers[0]?.reason||op.reviewReason||op.lastResponseReason||'',originCount:origins.length,groupCount:groups.size,groupedLabel:groups.size>1?`Pedido repetido em ${groups.size} grupos.`:null};
   }
   _blockers(op, candidates = [], reservation, summary = false) {
     const reasons = []; if ((op.request?.models?.length || 0) > this._config().multiModelMax) reasons.push({ code: 'REQUEST_TOO_MANY_MODELS', reason: 'Pedido com vários modelos requer revisão.' }); const currentCheck = this.store.checkOpportunitySend?.({ opportunityId: op.id, offerIds: [], now: this.now(), automatic: true, evaluationOnly: true, automationAllowed: !this.isAutomationStopped() });
@@ -379,7 +387,7 @@ class OpportunityService extends EventEmitter {
     return [...new Map(reasons.map(value => [value.code, value])).values()];
   }
   list(filters = {}, actorId) { this._assert(actorId, 'view'); this._expire(); const page = this.store.listOpportunities(filters),offers=this._syncOffers(); return { ...page, items: list(page).map(op => this._present(op,this._candidates(op,offers))) }; }
-  invalidateCampaign(id) { this.previewGeneration=(this.previewGeneration||0)+1; const result=this.store.cancelOpportunityCampaign?.(id,this.now())||{cancelled:0,inProgress:0}; this.emit('change'); return result; }
+  invalidateCampaign(id) { this.previewGeneration=(this.previewGeneration||0)+1; this.workflow?.invalidateCampaign?.(id); const result=this.store.cancelOpportunityCampaign?.(id,this.now())||{cancelled:0,inProgress:0}; this.emit('change'); return result; }
   getDetail(id, actorId) { this._assert(actorId, 'view'); const result = this.evaluate(typeof id === 'object' ? id.id : id); return { ...result, origins: this.store.listOpportunityOrigins(result.opportunity.id), tasks: list(this.store.listOpportunityTasks({ opportunityId: result.opportunity.id, limit: 100 })) }; }
   getState(actorId) { this._assert(actorId, 'view'); const config = this._config(), catalog = this.listCampaignOffers(), queue = list(this.store.listOpportunityTasks({ status: 'queued', limit: 20 })); return { config, metrics: this.store.getOpportunityMetrics?.() || {}, campaignOffers: catalog.items, campaignOfferTotal: catalog.total, monitor: { enabled: config.enabled, mode: config.mode, connection: this.adapter?.status?.state || 'disconnected', suspended: this.suspended, blockedReason: this.blockedReason || null, lastMessageAt: this.lastMessageAt || null, lastProcessedAt: this.lastProcessedAt || null }, queue, queueState: { connected: this.adapter?.status?.state === 'connected', busy: Boolean(this.pump), nextAttemptAt: this.store.getNextOpportunityTaskAt?.() ?? (queue.length ? Math.min(...queue.map(task => task.nextAttemptAt || this.now())) : null), minSpacingMs: Math.max(3, this.adapter?.minimumSpacingSeconds || 3) * 1000, blockedReason: this.blockedReason || null }, index: { indexedAt: this.offerIndex?.indexedAt || null, parsedItems: this.offerParseCount } }; }
   _previewData(id, offerIds, actorId, expiresAt, options = {}) {
@@ -393,6 +401,11 @@ class OpportunityService extends EventEmitter {
   }
   preview(input, actorId) { this._assert(actorId, 'respond'); const id = typeof input === 'string' ? input : input.id; if (input.manualCampaignSelection) return this._manualPreviewData(id, input.manualCampaignSelection, actorId, this.now() + 5 * 60000, input); const details = this.evaluate(id); const ids = input.offerIds || details.candidates.filter(v => v.eligible).slice(0, 1).map(v => v.id); return this._previewData(id, ids, actorId, this.now() + 5 * 60000, input); }
   respondManual(input, actorId) {
+    if (this.workflow && this._config().campaignDestinations === true) {
+      const selection = input.manualCampaignSelection;
+      if (!selection) throw error('Selecione o anúncio da campanha para enviar aos destinos cadastrados nela.', 'OPPORTUNITY_SELECTION_INVALID');
+      return this.workflow.dispatch({ opportunityId: input.id, ...selection }, actorId);
+    }
     this._assert(actorId, 'respond'); if (input.confirm !== true) throw error('Confirme a prévia antes de enviar.', 'OPPORTUNITY_CONFIRM_REQUIRED');
     const token = String(input.previewToken || ''), at = Number(token.split(':')[0]); if (!Number.isSafeInteger(at) || at < this.now() || at > this.now() + 5 * 60000) throw error('Prévia vencida; confira uma nova prévia.', 'OPPORTUNITY_PREVIEW_STALE');
     const preview = this._previewData(input.id, input.offerIds || [], actorId, at, input);
@@ -408,6 +421,7 @@ class OpportunityService extends EventEmitter {
     else if (action === 'mute') { result = this.store.setOpportunityContactMute(op.senderKey, { muted: true, at: this.now(), actorId }); for (const task of list(this.store.listOpportunityTasks({ senderKey: op.senderKey, status: 'queued', limit: 1000 }))) this.store.updateOpportunityTask(task.id, { status: 'cancelled', code: 'CONTACT_MUTED', reason: 'Contato silenciado.', resultAt: this.now() }); }
     else if (action === 'reactivate') { this.store.setOpportunityContactMute(op.senderKey, { muted: false, at: this.now(), actorId }); result = this.store.reactivateOpportunity(id, { now: this.now(), actorId }); }
     else throw error('Ação inválida.', 'OPPORTUNITY_ACTION_INVALID');
+    if (['close', 'outsideAnswer', 'mute'].includes(action)) this.workflow?.cancel?.(id, action);
     this._trace(id, 'manual', `OPPORTUNITY_${action.toUpperCase()}`, 'Ação manual registrada; controles anteriores preservados.', { opportunityId: id }); this.emit('change'); return result;
   }
   close(id, actorId) { return this.action({ id, action: 'close' }, actorId); }
@@ -423,7 +437,7 @@ class OpportunityService extends EventEmitter {
     if (next == null) return;
     this.dueTimer = setTimeout(() => { this.dueTimer = null; this._schedulePump(); }, Math.max(1, Math.min(2147483647, next - this.now()))); this.dueTimer.unref?.();
   }
-  _schedulePump() { if (this.pump) { this.pumpAgain = true; return this.pump; } if (!this.started || this.closed || this.suspended || this.store.persistenceFailed || this.adapter?.status?.state !== 'connected' || this.isAutomationStopped()) return this.pump; clearTimeout(this.dueTimer); this.dueTimer = null; this.pump = Promise.resolve().then(() => this._drain()).catch(e => this._failure(e)).finally(() => { this.pump = null; const again = this.pumpAgain; this.pumpAgain = false; if (again) queueMicrotask(() => this._schedulePump()); else this._armPump(); }); return this.pump; }
+  _schedulePump() { if (this.workflow && this._config().campaignDestinations === true) return this.pump; if (this.pump) { this.pumpAgain = true; return this.pump; } if (!this.started || this.closed || this.suspended || this.store.persistenceFailed || this.adapter?.status?.state !== 'connected' || this.isAutomationStopped()) return this.pump; clearTimeout(this.dueTimer); this.dueTimer = null; this.pump = Promise.resolve().then(() => this._drain()).catch(e => this._failure(e)).finally(() => { this.pump = null; const again = this.pumpAgain; this.pumpAgain = false; if (again) queueMicrotask(() => this._schedulePump()); else this._armPump(); }); return this.pump; }
   async waitForIdle() { await this.pump; if (!this.closed && !this.suspended && !this.isAutomationStopped() && this.adapter?.status?.state === 'connected') { this._schedulePump(); await this.pump; } }
   async _drain() {
     this._expire();

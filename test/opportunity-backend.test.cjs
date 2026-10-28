@@ -44,7 +44,16 @@ test('unauthenticated and own-scope users cannot read global opportunities or mu
 test('availability and stable unit reference survive campaign RPC validation and duplication',async t=>{
  const f=await fixture(t);assert.equal(f.campaign.items[0].unitReference,'real-reference-test-001');assert.deepEqual(f.campaign.items[0].availability,{available:true,confirmedAt:f.clock.now,quantity:1});
  const copy=await f.service.call('duplicateCampaign',{id:f.campaign.id});assert.notEqual(copy.items[0].id,f.campaign.items[0].id);assert.equal(copy.items[0].unitReference,f.campaign.items[0].unitReference);
- await f.config({campaignIds:[f.campaign.id,copy.id]});f.event('COPY');const op=f.store.listOpportunities().items[0],detail=await f.service.call('opportunityDetail',{id:op.id});assert.equal(detail.candidates.length,1);assert.equal(detail.candidates[0].identityConfidence,'verified');
+ await f.config({campaignIds:[f.campaign.id,copy.id]});f.event('COPY');const op=f.store.listOpportunities().items[0];
+ const detail=await f.service.call('opportunityDetail',{id:op.id});assert.equal(detail.candidates.length,1);assert.equal(detail.candidates[0].identityConfidence,'verified');assert.equal(detail.reservation,null);assert.equal(detail.workflow.jobs.length,0);
+ // The campaign catalog retains the stable unit reference across copies. The
+ // upgraded panel selects campaign items directly instead of the legacy private
+ // requester projection, and must not reserve a private response as a side effect.
+ const catalog=await f.service.call('opportunityCampaignOffersPage',{});assert.equal(catalog.total,1);assert.equal(catalog.items.length,1);
+ const offer=f.store.getOpportunityOffer(catalog.items[0].offerId);assert.equal(offer.identityConfidence,'verified');assert.equal(offer.identityReason,'explicit_unit_reference');assert.match(offer.explicitUnitReference,/^[a-f0-9]{64}$/);
+ const selectable=await f.service.call('opportunityCampaignItemsPage',{});assert.equal(selectable.total,2);
+ assert.deepEqual(new Set(selectable.items.map(item=>item.campaignId)),new Set([f.campaign.id,copy.id]));assert.ok(selectable.items.every(item=>item.manualEligible&&item.text===f.campaign.items[0].text));
+ assert.equal(f.store.listOpportunityTasks().length,0);assert.equal(f.adapter.sent.length,0);
  await assert.rejects(f.service.call('saveCampaign',{campaign:{...f.campaign,items:[{...f.campaign.items[0],availability:{available:true,confirmedAt:f.clock.now,quantity:-1}}]}}),/quantidade/i);assert.equal(f.store.getCampaign(f.campaign.id).items[0].availability.quantity,1);
 });
 test('outside reply through RPC cancels pending task and still blocks repetitions after reopen',async t=>{
@@ -53,12 +62,31 @@ test('outside reply through RPC cancels pending task and still blocks repetition
  await f.close();await f.open();await f.service.call('login',{username:OWNER.username,password:PASSWORD});f.clock.now+=1000;f.event('OUTSIDE-B',{chatId:'sim-02@simulation'});
  assert.equal(f.store.listOpportunities().total,1);assert.equal(f.store.listOpportunityOrigins(op.id).length,2);const detail=await f.service.call('opportunityDetail',{id:op.id});assert.ok(detail.blockers.some(x=>/respond/i.test(x.reason)));assert.equal(f.adapter.sent.length,0);
 });
-test('global STOP cancels opportunity automation, blocks capture and requires explicit resume',async t=>{
- const f=await fixture(t);await f.config();f.event('STOP-A');const op=f.store.listOpportunities().items[0],offer=(await f.service.call('opportunityDetail',{id:op.id})).candidates[0];
- await f.service.call('disconnect');await f.config({mode:'automatic'});const reservation=f.store.reserveOpportunitySend({opportunityId:op.id,offerIds:[offer.id],recipient:op.recipient,automatic:true,clientId:'STOP-CONTROLLED',now:f.clock.now});assert.equal(reservation.ok,true);
- const stopped=await f.service.call('stopAll');assert.equal(stopped.opportunities,1);assert.equal(f.store.getOpportunityTask(reservation.task.id).status,'cancelled');assert.equal(f.service.snapshot().automation.stopped,true);
- f.event('STOP-B',{senderNumber:'5562999990003',senderId:'5562999990003@s.whatsapp.net'});assert.equal(f.store.listOpportunities().total,1);assert.equal(f.adapter.sent.length,0);
- await f.service.call('resumeAutomation');assert.equal(f.service.snapshot().automation.stopped,false);assert.equal(f.store.getOpportunityTask(reservation.task.id).status,'cancelled');
+test('global STOP cancels campaign destinations and notices, blocks capture and requires explicit resume',async t=>{
+ const f=await fixture(t),destinations=['sim-03@simulation','sim-04@simulation'];
+ for(const id of destinations)await f.service.call('authorizeGroup',{id,authorized:true});
+ await f.service.call('saveCampaign',{campaign:{...f.store.getCampaign(f.campaign.id),groupIds:destinations}});
+ // Keep the transport offline while reserving durable work so STOP is tested
+ // against actual queued campaign jobs and administrator notices, not an old
+ // private-requester task or an already accepted simulation.
+ await f.service.call('disconnect');await f.config({mode:'automatic'});f.event('STOP-A');
+ const op=f.store.listOpportunities().items[0],batch=f.store.getOpportunityWorkflow(op.id);
+ assert.ok(batch);assert.equal(batch.status,'queued');
+ const reserved=f.store.listOpportunityWorkflowJobs({opportunityId:op.id,limit:100});
+ const campaignJobs=reserved.filter(job=>job.type==='campaign-ad'),notices=reserved.filter(job=>job.type==='admin-notice');
+ assert.equal(campaignJobs.length,2);assert.deepEqual(new Set(campaignJobs.map(job=>job.recipient)),new Set(destinations));assert.equal(notices.length,1);
+ assert.ok(reserved.every(job=>job.status==='queued'));assert.equal(f.store.listOpportunityTasks().length,0);assert.equal(f.adapter.sent.length,0);
+ const stopped=await f.service.call('stopAll');assert.equal(stopped.opportunities,reserved.length);assert.equal(f.service.snapshot().automation.stopped,true);
+ assert.ok(reserved.every(job=>f.store.getOpportunityWorkflowJob(job.id).status==='cancelled'));
+ f.event('STOP-B',{senderNumber:'5562999990003',senderId:'5562999990003@s.whatsapp.net',senderIds:['5562999990003@s.whatsapp.net']});
+ assert.equal(f.store.listOpportunities().total,1);assert.equal(f.adapter.sent.length,0);
+ await f.service.call('resumeAutomation');assert.equal(f.service.snapshot().automation.stopped,false);
+ assert.ok(reserved.every(job=>f.store.getOpportunityWorkflowJob(job.id).status==='cancelled'));assert.equal(f.store.listOpportunityTasks().length,0);
+ // Explicit resume restores capture for new requests only. Cancelled jobs,
+ // including administrator notices, stay cancelled instead of being revived.
+ f.clock.now+=1000;f.event('STOP-C',{senderNumber:'5562999990003',senderId:'5562999990003@s.whatsapp.net',senderIds:['5562999990003@s.whatsapp.net']});
+ assert.equal(f.store.listOpportunities().total,2);const fresh=f.store.listOpportunities().items.find(item=>item.id!==op.id);assert.ok(f.store.getOpportunityWorkflow(fresh.id));
+ assert.ok(reserved.every(job=>f.store.getOpportunityWorkflowJob(job.id).status==='cancelled'));assert.equal(f.adapter.sent.length,0);
 });
 test('confirmed expired licence preserves records but blocks opportunity reading, configuration and response',async t=>{
  const f=await fixture(t);await f.config();f.event('LICENSE-A');const op=f.store.listOpportunities().items[0];

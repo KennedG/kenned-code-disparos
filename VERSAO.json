@@ -1,8 +1,8 @@
 {
-  "tag": "v2.3.2-r5",
-  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Estabilidade-x64.exe",
-  "installerSha256": "58abfa962ac907f04b6bc86f1e758b1b253dbef536b12e2e3d3fce51f14f9d51",
+  "tag": "v2.3.2-r7",
+  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Oportunidades-Automatico-x64.exe",
+  "installerSha256": "00fc2a9cf4d39b09bd0ea0c21630a7c4838b34c5569e18feea975a4fa1b12001",
   "sourceRecoveredFromInstaller": false,
-  "packagedSourceFilesAudited": 118,
+  "packagedSourceFilesAudited": 122,
   "latestRecommended": false
 }

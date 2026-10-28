@@ -1,3 +1,5 @@
+> Revisão atual de entrega: **2.3.2 — Oportunidades Automático R7**. Alteração restrita a OPORTUNIDADES, com regras fixas e destinos das campanhas. Consulte [o guia de configuração e recuperação](docs/OPORTUNIDADES-AUTOMATICO-R7.md).
+
 # Kenned Code Disparos 2.3.2
 
 **Entrega atual: 2.3.2, revisão estabilidade-r5.** Veja [correções das filas, painel e Oportunidades](docs/ESTABILIDADE-R5.md). Instale **Kenned-Code-Disparos-Setup-2.3.2-Estabilidade-x64.exe**. Base exclusiva: revisão Imediato-R4, preservada para recuperação. Dados, identidade do aplicativo, licenciamento e funcionalidades anteriores permanecem preservados, sem módulos de vendas ou financeiro. Testes controlados e execução do pacote em Electron/Linux não comprovam recebimento no WhatsApp nem instalação física no Windows.
