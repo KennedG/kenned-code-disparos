@@ -1,8 +1,8 @@
 {
-  "tag": "v2.3.2-r4",
-  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Imediato-x64.exe",
-  "installerSha256": "640cabc0c2e4a64b770faa4ff99eefa9c10be90b1c7b3c74e424982ba8066926",
-  "sourceRecoveredFromInstaller": true,
-  "packagedSourceFilesAudited": 117,
+  "tag": "v2.3.2-r5",
+  "installer": "Kenned-Code-Disparos-Setup-2.3.2-Estabilidade-x64.exe",
+  "installerSha256": "58abfa962ac907f04b6bc86f1e758b1b253dbef536b12e2e3d3fce51f14f9d51",
+  "sourceRecoveredFromInstaller": false,
+  "packagedSourceFilesAudited": 118,
   "latestRecommended": false
 }

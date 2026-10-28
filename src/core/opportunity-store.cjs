@@ -52,6 +52,16 @@ function attachOpportunityStore(store, { db, prepared, transaction }) {
   const decode = row => row ? JSON.parse(row.data) : undefined;
   const key = (value, name = 'Identificador') => { if (typeof value !== 'string' || !value || value.length > 512 || value.includes('\0')) throw new Error(`${name} inválido.`); return value; };
   const stamp = value => { if (!Number.isSafeInteger(value) || value < 0) throw new Error('Data de oportunidade inválida.'); return value; };
+  const selection = value => {
+    if(value===undefined||value===null)return null;
+    if(typeof value!=='object'||Array.isArray(value))throw new Error('Seleção manual de campanha inválida.');
+    return {campaignId:key(value.campaignId,'Campanha'),itemId:key(value.itemId,'Item')};
+  };
+  const isManualSelection = (task,offer) => task.automatic===false && !!task.manualCampaignSelection && offer?.manualOnly===true &&
+    task.manualCampaignSelection.campaignId===offer.campaignId && task.manualCampaignSelection.itemId===offer.itemId &&
+    offer.manualCampaignSelection?.campaignId===offer.campaignId && offer.manualCampaignSelection?.itemId===offer.itemId;
+  const offerReferences = offer => new Set([offer?.id,offer?.canonicalOfferId,...(Array.isArray(offer?.canonicalOfferIds)?offer.canonicalOfferIds.slice(0,100):[])].filter(value=>typeof value==='string'&&value&&value.length<=512));
+
   const safe = value => { const inspect = (v, depth = 0) => { if (depth > 20) throw new Error('Registro muito profundo.'); if (v && typeof v === 'object') for (const [name, child] of Object.entries(v)) { if (/^(raw|protectedContext|password|token|accessToken|refreshToken|session|mediaKey|credentials|secret|privateKey)$/i.test(name)) throw new Error('Dados operacionais de oportunidades não podem conter credenciais.'); inspect(child, depth + 1); } }; inspect(value); return JSON.parse(JSON.stringify(value)); };
   const get = (table, id) => decode(prepared(`SELECT data FROM ${table} WHERE storageMode=? AND id=?`).get(mode(), key(id)));
   const config = () => normalizeOpportunityConfig(decode(prepared('SELECT data FROM op_config WHERE storageMode=?').get(mode())) || {});
@@ -77,7 +87,7 @@ function attachOpportunityStore(store, { db, prepared, transaction }) {
     const source = item.sourcePublicationId ? store.getSourcePublication?.(item.sourcePublicationId) : undefined;
     const media = item.mediaId ? store.getMedia?.(item.mediaId) : undefined;
     const { assessCampaignItem, campaignItemFingerprint } = require('./opportunity-campaign.cjs');
-    const assessment = assessCampaignItem(item, campaign, { source, media, availabilityMode: cfg.availabilityMode, now });
+    const assessment = assessCampaignItem(item, campaign, { source, media, availabilityMode: cfg.availabilityMode, now, manualSelection: isManualSelection(task,offer) });
     if (!assessment.eligible) return blocked('OP_AVAILABILITY', { offerId: offer.id, matchCode: assessment.blocker?.code, reason: assessment.blocker?.reason || REASONS.OP_AVAILABILITY });
     const fingerprint = campaignItemFingerprint(item, campaign, { source, media });
     if (!offer.campaignItemFingerprint || offer.campaignItemFingerprint !== fingerprint) return blocked('OP_REVIEW', { offerId: offer.id, reason: 'O item da campanha mudou; confira a oferta novamente.' });
@@ -87,19 +97,23 @@ function attachOpportunityStore(store, { db, prepared, transaction }) {
     return { ok: true };
   }
   function checkOffers(opportunity, offers, task, now) {
-    const cfg = config();
+    const baseConfig = config();
+    if(task.manualCampaignSelection&&(task.automatic!==false||offers.length!==1))return blocked('OP_OFFER_UNSAFE',{reason:'A seleção de anúncio pertence somente à resposta manual revisada.'});
     for (const offer of offers) {
       if (!offer) return blocked('OP_OFFER_MISSING');
+      const manual=isManualSelection(task,offer);
+      if((task.manualCampaignSelection||offer.manualOnly)&&!manual)return blocked('OP_OFFER_UNSAFE',{offerId:offer.id,reason:'O anúncio manual não corresponde à seleção revisada.'});
+      const cfg=manual?{...baseConfig,availabilityMode:'campaign'}:baseConfig;
       const current = checkCurrentCampaign(offer, task, cfg, now); if (!current.ok) return current;
       const { matchOffer } = require('./opportunity-matcher.cjs');
       const models = opportunity.request?.models || [], matches = models.map(spec => matchOffer(spec, offer, { now, availabilityMode: cfg.availabilityMode, availabilityMaxAgeMinutes: cfg.availabilityMaxAgeMinutes }));
-      if (!matches.some(result => result.eligible)) return blocked('OP_OFFER_UNSAFE', { offerId: offer.id, reason: matches[0]?.reason || REASONS.OP_OFFER_UNSAFE, matchCode: matches[0]?.code });
+      if (!manual && !matches.some(result => result.eligible)) return blocked('OP_OFFER_UNSAFE', { offerId: offer.id, reason: matches[0]?.reason || REASONS.OP_OFFER_UNSAFE, matchCode: matches[0]?.code });
       if (offer.available !== true || cfg.availabilityMode === 'confirmed' && (!Number.isSafeInteger(offer.availabilityConfirmedAt) || offer.availabilityConfirmedAt > now || now - offer.availabilityConfirmedAt > cfg.availabilityMaxAgeMinutes * 60000)) return blocked('OP_AVAILABILITY', { offerId: offer.id });
       const required = opportunity.request?.quantity || 1;
-      if (required > 1 && (!Number.isInteger(offer.quantityAvailable) || offer.quantityAvailable < required)) return blocked('OP_QUANTITY', { offerId: offer.id });
+      if (!manual && required > 1 && (!Number.isInteger(offer.quantityAvailable) || offer.quantityAvailable < required)) return blocked('OP_QUANTITY', { offerId: offer.id });
       const previous = sentRecords(opportunity.senderKey, offer.id).filter(record => record.taskId !== task.id);
       if (previous.length && !(!task.automatic && task.duplicateRiskAcknowledged)) return blocked(previous.some(record => record.offerRevision !== (offer.offerRevision || offer.revision)) ? 'OP_OFFER_UPDATED' : 'OP_OFFER_SENT', { offerId: offer.id });
-      if (task.automatic) {
+      if (task.automatic || manual && !task.duplicateRiskAcknowledged) {
         const unitReference = value => value.explicitUnitReference || value.unitReference || value.serial || value.imei;
         const sameVariant = value => ['model','modelKey','storageGB','colorKey','condition'].every(field => (value[field] ?? null) === (offer[field] ?? null));
         const history = prepared('SELECT data FROM op_sent_offers WHERE storageMode=? AND senderKey=?').all(mode(), opportunity.senderKey).map(decode);
@@ -107,6 +121,8 @@ function attachOpportunityStore(store, { db, prepared, transaction }) {
           if (sent.taskId === task.id || sent.offerId === offer.id) continue;
           const priorTask = get('op_tasks', sent.taskId); if (!priorTask || !countsAsResponse(priorTask)) continue;
           const prior = priorTask.offerSnapshots?.find(row => row.id === sent.offerId) || get('op_offers', sent.offerId); if (!prior) continue;
+          const references=offerReferences(offer),priorReferences=offerReferences(prior);
+          if([...references].some(value=>priorReferences.has(value)))return blocked('OP_OFFER_SENT',{offerId:offer.id,previousOfferId:prior.id});
           if (unitReference(offer) && unitReference(prior) && unitReference(offer) !== unitReference(prior)) continue;
           const materialMatches = offer.contentFingerprint && prior.contentFingerprint === offer.contentFingerprint || offer.mediaFingerprint && prior.mediaFingerprint === offer.mediaFingerprint && sameVariant(prior);
           if (materialMatches) return blocked('OP_OFFER_REPOST', { offerId: offer.id, previousOfferId: prior.id });
@@ -191,15 +207,15 @@ function attachOpportunityStore(store, { db, prepared, transaction }) {
   function checkOpportunitySend(input = {}) {
     const now = Math.max(stamp(input.now ?? Date.now()), Number(prepared('SELECT lastAt FROM op_clock WHERE storageMode=?').get(mode())?.lastAt || 0));
     const opportunity = get('op_requests', input.opportunityId);
-    const task = { id: input.taskId || 'evaluation-only', automatic: input.automatic !== false, status: 'reserving', offerIds: [...new Set(input.offerIds || [])].map(id => key(id)), manualOverride: input.manualOverride === true, duplicateRiskAcknowledged: input.duplicateRiskAcknowledged === true, reviewed: input.reviewed === true, allowExpired: input.allowExpired === true };
+    const task = { id: input.taskId || 'evaluation-only', automatic: input.automatic !== false, status: 'reserving', offerIds: [...new Set(input.offerIds || [])].map(id => key(id)), manualOverride: input.manualOverride === true, duplicateRiskAcknowledged: input.duplicateRiskAcknowledged === true, reviewed: input.reviewed === true, allowExpired: input.allowExpired === true, manualCampaignSelection:selection(input.manualCampaignSelection) };
     return { ...guard(opportunity, task, now, { ...input, readOnly: true }), repetition: opportunity ? limits(opportunity, task, now) : null };
   }
   function reserveOpportunitySend(input) {
     return transaction(() => {
       const now = clock(input.now ?? Date.now()), clientId = key(input.clientId || input.clientMessageId || randomUUID());
       const existing = decode(prepared('SELECT data FROM op_tasks WHERE storageMode=? AND clientId=?').get(mode(), clientId)); if (existing) {
-        const fields = { opportunityId: input.opportunityId, offerIds: [...new Set(input.offerIds || [])], recipient: input.recipient || existing.senderKey, automatic: input.automatic !== false, retryOf: input.retryOf || null };
-        for (const [field,value] of Object.entries(fields)) if (JSON.stringify(existing[field]) !== JSON.stringify(value)) throw Object.assign(new Error('Identificador de envio reutilizado com outra operação.'), { code:'OP_CLIENT_ID_CONFLICT' });
+        const fields = { opportunityId: input.opportunityId, offerIds: [...new Set(input.offerIds || [])], recipient: input.recipient || existing.senderKey, automatic: input.automatic !== false, retryOf: input.retryOf || null, manualCampaignSelection:selection(input.manualCampaignSelection) };
+        for (const [field,value] of Object.entries(fields)) if (JSON.stringify(field==='manualCampaignSelection'?existing[field]||null:existing[field]) !== JSON.stringify(value)) throw Object.assign(new Error('Identificador de envio reutilizado com outra operação.'), { code:'OP_CLIENT_ID_CONFLICT' });
         return { ok: true, duplicate: true, task: existing };
       }
       const opportunity = get('op_requests', input.opportunityId); if (!opportunity) return blocked('OP_NOT_FOUND');
@@ -208,13 +224,13 @@ function attachOpportunityStore(store, { db, prepared, transaction }) {
       const automatic = input.automatic !== false; if (automatic && offerIds.length > config().autoMaxOffers) return blocked('OP_TOO_MANY');
       if (input.retryOf) {
         const parent = get('op_tasks', key(input.retryOf)), child = decode(prepared("SELECT data FROM op_tasks WHERE storageMode=? AND json_extract(data,'$.retryOf')=? LIMIT 1").get(mode(), input.retryOf));
-        if (!parent || parent.opportunityId !== opportunity.id || parent.senderKey !== opportunity.senderKey || JSON.stringify(parent.offerIds) !== JSON.stringify(offerIds) || parent.recipient !== input.recipient || automatic || input.duplicateRiskAcknowledged !== true) return blocked('OP_TASK_STATE', { reason: 'Reenvio não corresponde à tarefa original revisada.' });
+        if (!parent || parent.opportunityId !== opportunity.id || parent.senderKey !== opportunity.senderKey || JSON.stringify(parent.offerIds) !== JSON.stringify(offerIds) || JSON.stringify(parent.manualCampaignSelection||null)!==JSON.stringify(selection(input.manualCampaignSelection)) || parent.recipient !== input.recipient || automatic || input.duplicateRiskAcknowledged !== true) return blocked('OP_TASK_STATE', { reason: 'Reenvio não corresponde à tarefa original revisada.' });
         if (child) return { ok: true, duplicate: true, task: child };
         if (parent.status !== 'uncertain') return blocked('OP_TASK_STATE', { reason: 'O envio original não está mais incerto; verifique o resultado.' });
       }
-      const task = { id: randomUUID(), clientId, clientMessageId: input.clientMessageId || createHash('sha256').update(`${mode()}\0${clientId}`).digest('hex').slice(0, 32).toUpperCase(), opportunityId: opportunity.id, senderKey: opportunity.senderKey, intentKey: opportunity.intentKey, familyKey: opportunity.familyKey, offerIds, recipient: key(input.recipient || opportunity.senderKey), automatic, manualOverride: input.manualOverride === true, duplicateRiskAcknowledged: input.duplicateRiskAcknowledged === true, reviewed: input.reviewed === true, allowExpired: input.allowExpired === true, actorId: input.actorId || null, retryOf: input.retryOf || null, status: 'reserving', createdAt: now, dayKey: day(now, config().timezone), attempts: 0, traceId: input.traceId || randomUUID() };
+      const task = { id: randomUUID(), clientId, clientMessageId: input.clientMessageId || createHash('sha256').update(`${mode()}\0${clientId}`).digest('hex').slice(0, 32).toUpperCase(), opportunityId: opportunity.id, senderKey: opportunity.senderKey, intentKey: opportunity.intentKey, familyKey: opportunity.familyKey, offerIds, recipient: key(input.recipient || opportunity.senderKey), automatic, manualOverride: input.manualOverride === true, duplicateRiskAcknowledged: input.duplicateRiskAcknowledged === true, reviewed: input.reviewed === true, allowExpired: input.allowExpired === true, actorId: input.actorId || null, retryOf: input.retryOf || null, manualCampaignSelection:selection(input.manualCampaignSelection), status: 'reserving', createdAt: now, dayKey: day(now, config().timezone), attempts: 0, traceId: input.traceId || randomUUID() };
       const check = guard(opportunity, task, now, input); if (!check.ok) { recordBlock(opportunity.id,check,now);trace({ at: now, opportunityId: opportunity.id, stage: 'bloqueado', ...check }); return check; }
-      task.status = 'queued'; task.availabilityMode = config().availabilityMode; task.offerSnapshots = offerIds.map(id => { const offer = get('op_offers', id); return safe({ ...offer, offerRevision: offer.offerRevision || offer.revision }); });
+      task.status = 'queued'; task.availabilityMode = task.manualCampaignSelection ? 'campaign' : config().availabilityMode; task.offerSnapshots = offerIds.map(id => { const offer = get('op_offers', id); return safe({ ...offer, offerRevision: offer.offerRevision || offer.revision }); });
       const saved = saveTask(task);
       for (const offer of saved.offerSnapshots) prepared('INSERT INTO op_sent_offers(storageMode,senderKey,offerId,taskId,data)VALUES(?,?,?,?,?)').run(mode(), opportunity.senderKey, offer.id, saved.id, JSON.stringify({ senderKey: opportunity.senderKey, offerId: offer.id, offerRevision: offer.offerRevision, taskId: saved.id, reservedAt: now, status: 'queued' }));
       saveRequest({ ...opportunity, status: 'queued', taskId: saved.id, lastBlocker:null, deliveryStatus:'queued', updatedAt: now }); trace({ at: now, opportunityId: opportunity.id, taskId: saved.id, traceId: saved.traceId, stage: 'na_fila', recipient: saved.recipient });
@@ -237,7 +253,7 @@ function attachOpportunityStore(store, { db, prepared, transaction }) {
       if (old.status === 'cancelled' && ['queued', 'sending'].includes(status)) return old;
       if (['accepted', 'delivered'].includes(status) && !patch.messageId && !old.messageId && patch.proofAccepted !== true && patch.deliveryConfirmed !== true) throw new Error('Confirmação de envio exige evidência da integração.');
       if (status === 'sending' && old.status === 'queued') return claimOpportunityTask(id, { now: patch.lastAttemptAt ?? patch.startedAt ?? Date.now() }).task || old;
-      const immutable = ['id', 'clientId', 'clientMessageId', 'senderKey', 'opportunityId', 'intentKey', 'familyKey', 'offerIds', 'recipient', 'createdAt', 'offerSnapshots', 'automatic', 'retryOf', 'availabilityMode']; for (const field of immutable) if (patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(old[field])) throw new Error('Identidade operacional da tarefa não pode ser alterada.');
+      const immutable = ['id', 'clientId', 'clientMessageId', 'senderKey', 'opportunityId', 'intentKey', 'familyKey', 'offerIds', 'recipient', 'createdAt', 'offerSnapshots', 'automatic', 'retryOf', 'availabilityMode', 'manualCampaignSelection']; for (const field of immutable) if (patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(old[field])) throw new Error('Identidade operacional da tarefa não pode ser alterada.');
       const value = saveTask({ ...old, ...safe(patch), status });
       for (const row of prepared('SELECT data FROM op_sent_offers WHERE storageMode=? AND taskId=?').all(mode(), id)) { const record = decode(row); prepared('UPDATE op_sent_offers SET data=? WHERE storageMode=? AND senderKey=? AND offerId=? AND taskId=?').run(JSON.stringify({ ...record, status, messageId: value.messageId || null, resultAt: value.resultAt || value.acceptedAt || value.deliveredAt || Date.now() }), mode(), value.senderKey, record.offerId, id); }
       const opportunity = get('op_requests', value.opportunityId); if (opportunity && !['closed', 'expired'].includes(opportunity.status)) saveRequest({ ...opportunity, status: ['accepted', 'delivered', 'outside'].includes(status) ? 'responded' : status === 'uncertain' ? 'uncertain' : status === 'cancelled' || status === 'failed' ? 'open' : status, deliveryStatus:status,lastResponseReason:value.reason||value.error||null,lastResponseAt:value.acceptedAt||value.deliveredAt||value.resultAt||null,lastBlocker:['failed','cancelled','uncertain'].includes(status) ? {code:value.code||'OP_UNCERTAIN',reason:value.reason||value.error||REASONS.OP_UNCERTAIN,at:value.resultAt||Date.now()} : null,updatedAt: value.resultAt || Date.now() });

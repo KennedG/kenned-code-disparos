@@ -173,7 +173,7 @@ class SearchService extends EventEmitter {
   async suspendCapture(reason = 'maintenance') { this.paused = true; if (this._settings().enabled) this._openGap(reason); this._configure(); await this.capturePump?.catch(() => {}); await this.commandTail.catch(() => {}); await this.deliveryPump?.catch(() => {}); }
   resumeCapture() { this.paused = false; this._configure(); this._onStatus(this.adapter?.status || { state: 'disconnected' }); this._drain(); }
   async _waitCaptureIdle() { while (!this.closed && !this.paused) { const running = this._drain(); if (running) await running; if (!page(this.store.listSearchInbox({ status: 'queued', limit: 1 })).length) break; } }
-  async waitForIdle() { await this._waitCaptureIdle(); await this.commandTail; await this._waitCaptureIdle(); do { await this.deliveryPump; if (this.closed || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected' || !page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length) break; await this.flushDeliveries(); } while (!this.closed); }
+  async waitForIdle() { await this._waitCaptureIdle(); await this.commandTail; await this._waitCaptureIdle(); do { await this.deliveryPump; if (this.closed || this.scheduler?.closed || this.scheduler?.closing || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected' || !page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length) break; await this.flushDeliveries(); } while (!this.closed); }
   _onStatus(status) { if (this.closed || !this._settings().enabled) return; if (status?.state === 'connected' && status.ready !== false && !this.paused) { this._configure(); this._closeGap(); this._drain(); this._flushInBackground(); } else this._openGap(status?.reasonCode || 'disconnected'); this.emit('change'); }
   getState(actorId) {
     this.groups = new Map(this.store.listGroups().map(group => [group.id, group]));
@@ -601,19 +601,35 @@ class SearchService extends EventEmitter {
     // Status events and maintenance have no caller awaiting their promise.
     // Catch synchronous setup failures as well as asynchronous queue failures.
     const report = error => {
+      if (error?.code === 'SUBMISSION_SERVICE_CLOSED' && (this.closed || this.scheduler?.closed || this.scheduler?.closing)) return;
       try { this._diagnostic('SEARCH_DELIVERY_PUMP_ERROR', this._safeError(error), error); }
       catch { /* An unavailable diagnostic store cannot reject an event handler. */ }
     };
-    try { void this.flushDeliveries().catch(report); }
+    try {
+      const pump = Promise.resolve(this.flushDeliveries());
+      this.backgroundDeliveryPumps ||= new WeakSet();
+      if (this.backgroundDeliveryPumps.has(pump)) return;
+      this.backgroundDeliveryPumps.add(pump);
+      void pump.catch(report);
+    }
     catch (error) { report(error); }
   }
   flushDeliveries() {
     if (this.deliveryPump) return this.deliveryPump;
-    if (this.closed || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected' || this.store.persistenceFailed) return Promise.resolve();
+    if (this.closed || this.scheduler?.closed || this.scheduler?.closing || this.paused || !this._automationAllowed() || this.adapter?.status?.state !== 'connected' || this.store.persistenceFailed) return Promise.resolve();
     let completed = false, submission;
     // Acquire the scheduler hold immediately, before another round can start.
-    try { submission = this.scheduler?.runExternalSubmission
-      ? this.scheduler.runExternalSubmission(context => this._flushDeliveries(context), { timeoutMs: 100 * (2 * this._deliveryTimeoutMs() + Math.max(3, this.adapter.minimumSpacingSeconds || 3) * 1000) + 5000 }) : this._flushDeliveries(); }
+    try {
+      if (this.scheduler?.runExternalSubmission) {
+        const submit = () => this.scheduler.runExternalSubmission(context => this._flushDeliveries({ ...context, managedSubmission: true, singleDelivery: true }), { timeoutMs: 2 * this._deliveryTimeoutMs() + Math.max(3, this.adapter.minimumSpacingSeconds || 3) * 1000 + 5000 });
+        // Each durable delivery gets its own transport turn. Never wait for a
+        // campaign while owning the turn that the campaign is waiting for.
+        const first = submit();
+        submission = Promise.resolve(first).then(async () => {
+          for (let count = 1; count < 100 && !this.closed && !this.scheduler.closed && !this.scheduler.closing && !this.paused && this._automationAllowed() && this.adapter?.status?.state === 'connected' && !this.store.persistenceFailed && page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length; count++) await submit();
+        });
+      } else submission = this._flushDeliveries();
+    }
     catch (error) { submission = Promise.reject(error); }
     this.deliveryPump = Promise.resolve(submission)
       .then(result => { completed = true; return result; })
@@ -622,12 +638,13 @@ class SearchService extends EventEmitter {
         // stop. Nothing was sent: the stop handler owns durable cancellation,
         // and this is not a provider error or a persistence failure.
         if (error?.code === 'AUTOMATION_STOPPED' && error.submitted === false) return;
+        if (error?.code === 'SUBMISSION_SERVICE_CLOSED' && (this.closed || this.scheduler?.closed || this.scheduler?.closing)) return;
         throw error;
       }).finally(() => {
         this.deliveryPump = null;
         // Only a completed batch may immediately continue. A rejected pump
         // must not spin indefinitely in microtasks while pending rows remain.
-        if (completed && !this.closed && !this.paused && this._automationAllowed() && this.adapter?.status?.state === 'connected' && !this.store.persistenceFailed && page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length)
+        if (completed && !this.closed && !this.scheduler?.closed && !this.scheduler?.closing && !this.paused && this._automationAllowed() && this.adapter?.status?.state === 'connected' && !this.store.persistenceFailed && page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: 1 })).length)
           queueMicrotask(() => this._flushInBackground());
       });
     return this.deliveryPump;
@@ -652,8 +669,8 @@ class SearchService extends EventEmitter {
     this.emit('change'); return true;
   }
   async _flushDeliveries(outer = {}) {
-    const release = this.scheduler?.holdSubmissions?.() || (() => {}); try { await this.scheduler?.waitForIdle?.();
-      const pending = page(this.store.listSearchDeliveries({ status: 'pending', limit: 100 }));
+    const release = outer.managedSubmission ? (() => {}) : this.scheduler?.holdSubmissions?.() || (() => {}); try { if (!outer.managedSubmission) await this.scheduler?.waitForIdle?.();
+      const pending = page(this.store.listSearchDeliveries({ status: 'pending', dueAt: this.now(), limit: outer.singleDelivery ? 1 : 100 }));
       for (const delivery of pending) {
         if (outer.signal?.aborted || this.closed || !this._automationAllowed() || this.adapter?.status?.state !== 'connected') break;
         if (delivery.nextAttemptAt > this.now()) continue;
@@ -699,7 +716,12 @@ class SearchService extends EventEmitter {
           const current = this.store.getSearchDelivery(delivery.id); const confirmed = current?.status === 'confirmed' || (['confirmed', 'delivered'].includes(result?.status) || result?.status === 'accepted' && !!result.messageId);
           this.store.updateSearchDelivery(delivery.id, { status: confirmed ? 'confirmed' : 'uncertain', resultAt: this.now(), messageId: result?.messageId || delivery.clientMessageId, confirmationScope: result?.confirmationScope || current?.confirmationScope || (confirmed ? 'integration-ack' : null), deliveredAt: result?.deliveredAt || current?.deliveredAt || null, readAt: result?.readAt || current?.readAt || null, code: confirmed ? null : 'SEARCH_RESULT_UNCERTAIN', safeToRetry: false, error: confirmed ? null : 'Envio sem confirmação; revisar antes de repetir.' });
           this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status: confirmed ? 'confirmed' : 'uncertain', confirmationScope: result?.confirmationScope, attempts: attempt });
-        } catch (error) { const current = this.store.getSearchDelivery(delivery.id); if (current?.status === 'cancelled') continue; if (current?.status === 'confirmed' || current?.deliveredAt || current?.readAt) { this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status: 'confirmed', confirmationScope: current.confirmationScope, attempts: attempt }); this.emit('change'); continue; } const submitted = current?.status === 'sending', safe = !submitted || error?.confirmedFailure === true || error?.safeToRetry === true && error?.submitted !== true && error?.submitted !== 'unknown' || error?.definitive === true && error?.submitted !== true && error?.submitted !== 'unknown', temporary = error?.safeToRetry === true, status = safe && temporary && attempt < 3 ? 'pending' : safe ? 'failed' : 'uncertain'; this.store.updateSearchDelivery(delivery.id, { status, attempts: attempt, nextAttemptAt: this.now() + Math.min(3600000, 15_000 * 2 ** (attempt - 1)), resultAt: status === 'pending' ? null : this.now(), code: error?.code || 'SEARCH_DELIVERY_ERROR', safeToRetry: safe, error: status === 'uncertain' ? 'Resultado incerto. Revisão necessária antes de repetir.' : this._safeError(error) }); this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status, code: error?.code || 'SEARCH_DELIVERY_ERROR', reason: this._safeError(error), attempts: attempt }); this._diagnostic(error?.code || 'SEARCH_DELIVERY_ERROR', this._safeError(error), error);
+        } catch (error) { const current = this.store.getSearchDelivery(delivery.id); if (current?.status === 'cancelled') continue; if (current?.status === 'confirmed' || current?.deliveredAt || current?.readAt) { this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status: 'confirmed', confirmationScope: current.confirmationScope, attempts: attempt }); this.emit('change'); continue; }
+          if (error?.code === 'SUBMISSION_SERVICE_CLOSED' && error.submitted === false && (this.closed || this.scheduler?.closed || this.scheduler?.closing)) {
+            this.store.updateSearchDelivery(delivery.id, { status: 'pending', attempts: delivery.attempts || 0, submittedAt: null, resultAt: null, code: null, error: null, safeToRetry: false });
+            break;
+          }
+          const submitted = current?.status === 'sending', safe = !submitted || error?.confirmedFailure === true || error?.safeToRetry === true && error?.submitted !== true && error?.submitted !== 'unknown' || error?.definitive === true && error?.submitted !== true && error?.submitted !== 'unknown', temporary = error?.safeToRetry === true, status = safe && temporary && attempt < 3 ? 'pending' : safe ? 'failed' : 'uncertain'; this.store.updateSearchDelivery(delivery.id, { status, attempts: attempt, nextAttemptAt: this.now() + Math.min(3600000, 15_000 * 2 ** (attempt - 1)), resultAt: status === 'pending' ? null : this.now(), code: error?.code || 'SEARCH_DELIVERY_ERROR', safeToRetry: safe, error: status === 'uncertain' ? 'Resultado incerto. Revisão necessária antes de repetir.' : this._safeError(error) }); this._trace(delivery.traceId || delivery.runId, 'integration', { actorId: delivery.actorId, deliveryId: delivery.id, status, code: error?.code || 'SEARCH_DELIVERY_ERROR', reason: this._safeError(error), attempts: attempt }); this._diagnostic(error?.code || 'SEARCH_DELIVERY_ERROR', this._safeError(error), error);
           if (['failed', 'uncertain'].includes(status) && delivery.sourceChatId && !delivery.errorNotice && !delivery.test) await this._queueFailureNotice(this.store.getSearchRun(delivery.runId), { chatId: delivery.sourceChatId, isGroup: delivery.sourceIsGroup, senderNumber: delivery.sourceSenderNumber, sourceTrustedSelf: delivery.sourceTrustedSelf, selfChat: delivery.sourceSelfChat, fromMe: delivery.sourceIncomingPrivate ? false : undefined, identityVerified: delivery.sourceIdentityVerified, senderId: delivery.sourceSenderId, replyProof: delivery.sourceReplyProof }, status === 'uncertain' ? { code: 'SEARCH_RESULT_UNCERTAIN' } : error, { deferFlush: true });
         }
         this.emit('change');

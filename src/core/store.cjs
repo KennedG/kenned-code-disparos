@@ -15,7 +15,7 @@ const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
 const SCHEMA_VERSION = 7;
 const SHARED_TABLES = new Set(['settings','users','roles','recovery_tokens']);
 const MODE_SETTING = /^(buscas|search)|^recentCommandIds$|^systemAlertRecipientIds$|^automationState$/i;
-const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^mode:|^licenseConfirmedExpired$|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
+const PRIVATE_SETTING = /^outboundProof:|secret|cred|session|qr|recentCommand|^mode:|^licenseConfirmedExpired$|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
 
 function atomicWrite(filename, data) {
   fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -217,6 +217,35 @@ async function createStore(dir,options={}) {
   const remove=(table,id)=>transaction(()=>prepared(`DELETE FROM ${table} WHERE id=?${modeClause(table)}`).run(id,...modeParams(table)));
   const settingKey=id=>MODE_SETTING.test(id)?`mode:${storageMode()}:${id}`:id;
   const getSetting=(id,fallback)=>one('settings',settingKey(id))?.value??fallback;
+  // Receipt rank is operational state, not a visual history row. Reusing the
+  // existing settings PK avoids schema changes and keeps confirmations across
+  // cache eviction/restart without exposing them in ordinary backups/settings.
+  const outboundRanks = { 'whatsapp-server': 1, 'whatsapp-delivered': 2, 'whatsapp-read': 3 };
+  const outboundProofKey = id => {
+    if(typeof id!=='string'||!id||id.length>512||id.includes('\0'))throw new Error('Identificador de comprovante inválido.');
+    return `outboundProof:${storageMode()}:${createHash('sha256').update(id).digest('hex')}`;
+  };
+  function sanitizeOutboundProof(id,input) {
+    if(!input||typeof input!=='object'||Array.isArray(input)||!outboundRanks[input.confirmationScope])throw new Error('Confirmação da integração inválida.');
+    if(input.messageId!==undefined&&input.messageId!==id)throw new Error('Comprovante pertence a outra mensagem.');
+    const value={messageId:id,confirmationScope:input.confirmationScope};
+    for(const field of ['acceptedAt','deliveredAt','readAt'])if(input[field]!==undefined&&input[field]!==null){if(!Number.isSafeInteger(input[field])||input[field]<0)throw new Error('Horário do comprovante inválido.');value[field]=input[field];}
+    if(input.targetId!==undefined&&input.targetId!==null){if(typeof input.targetId!=='string'||!/^\d[\d:-]{0,127}@(s\.whatsapp\.net|lid|g\.us)$/.test(input.targetId))throw new Error('Conversa do comprovante inválida.');value.targetId=input.targetId;}
+    return value;
+  }
+  function advanceOutboundProof(id,input) {
+    const key=outboundProofKey(id),incoming=sanitizeOutboundProof(id,input),read=()=>one('settings',key)?.value;
+    const unchanged=old=>old&&(outboundRanks[old.confirmationScope]>=outboundRanks[incoming.confirmationScope]||old.targetId&&incoming.targetId&&old.targetId!==incoming.targetId);
+    // Repeated participant receipts do not acquire a write transaction at all.
+    const current=read();if(unchanged(current))return {changed:false,proof:current};
+    return transaction(()=>{
+      const old=read();if(unchanged(old))return {changed:false,proof:old};
+      const proof={...old,...incoming};
+      for(const field of ['acceptedAt','deliveredAt','readAt','targetId'])if(old?.[field]!==undefined)proof[field]=old[field];
+      putRaw('settings',{id:key,value:proof});return {changed:true,proof};
+    });
+  }
+
   function projection(category,sourceId,value) {
     const data={...value,category,storageMode:value.storageMode??storageMode()},time=Number(value.at??value.resultAt??value.createdAt??value.startedAt??Date.now());
     prepared(`INSERT INTO history(id,category,sourceId,campaignId,userId,createdAt,status,data,storageMode)VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(category,sourceId)DO UPDATE SET campaignId=excluded.campaignId,userId=excluded.userId,createdAt=excluded.createdAt,status=excluded.status,data=excluded.data`).run(`${category}:${sourceId}`,category,sourceId,value.campaignId??null,value.userId??value.actorId??null,time,value.status??null,json(data),data.storageMode);
@@ -292,6 +321,7 @@ async function createStore(dir,options={}) {
       fs.mkdirSync(path.dirname(destination),{recursive:true,mode:0o700});
       try{db.prepare('VACUUM INTO ?').run(destination);fs.chmodSync(destination,0o600);const saved=new DatabaseSync(destination,{readOnly:true});try{if(saved.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('A cópia de recuperação não passou na verificação.');}finally{saved.close();}return {path:destination,bytes:fs.statSync(destination).size,schemaVersion:databaseSchemaVersion};}catch(error){try{fs.unlinkSync(destination);}catch{}throw error;}
     },
+    getOutboundProof:id=>one('settings',outboundProofKey(id))?.value,advanceOutboundProof,
     getSetting,getStorageMode:storageMode,setSetting:(id,value)=>{const key=settingKey(id);return put('settings',{id:key,value});},
     listCampaigns(filter={}){const where=['storageMode=?'],params=[storageMode()];if(filter.ownerId){where.push("json_extract(data,'$.ownerId')=?");params.push(filter.ownerId);}if(filter.ids){if(!filter.ids.length)return [];where.push(`id IN(${filter.ids.map(()=>'?').join(',')})`);params.push(...filter.ids);}return parseRows(prepared(`SELECT data FROM campaigns${where.length?' WHERE '+where.join(' AND '):''} ORDER BY rowid`).all(...params));},
     getCampaign:id=>one('campaigns',id),
@@ -323,6 +353,12 @@ async function createStore(dir,options={}) {
         const entry=get(row.campaignId);entry.counts[row.status]=(entry.counts[row.status]||0)+Number(row.count);const group=entry.groups[row.groupId]||(entry.groups[row.groupId]={counts:{}});group.counts[row.status]=Number(row.count);
       }
       for(const row of prepared(`SELECT data FROM rounds WHERE rowid IN(SELECT MAX(rowid)FROM rounds WHERE storageMode=?${clause} GROUP BY campaignId)`).all(...params)){const round=JSON.parse(row.data);get(round.campaignId).round=round;}
+      const roundIds=Object.values(result).map(entry=>entry.round?.id).filter(Boolean);
+      const campaignByRound=new Map(Object.entries(result).filter(([,entry])=>entry.round?.id).map(([id,entry])=>[entry.round.id,id]));
+      for(const entry of Object.values(result))entry.roundCounts={};
+      if(roundIds.length)for(const row of prepared(`SELECT roundId,status,COUNT(*)AS count FROM jobs WHERE storageMode=? AND roundId IN(${roundIds.map(()=>'?').join(',')}) GROUP BY roundId,status`).all(mode,...roundIds)){
+        const entry=result[campaignByRound.get(row.roundId)];if(entry)entry.roundCounts[row.status]=Number(row.count);
+      }
       for(const row of prepared(`SELECT data FROM jobs WHERE storageMode=?${clause} AND status='uncertain' ORDER BY resultAt DESC LIMIT 200`).all(...params)){const job=JSON.parse(row.data);const entry=get(job.campaignId);if(entry.uncertainJobs.length<20)entry.uncertainJobs.push({id:job.id,groupId:job.groupId,itemId:job.itemId,status:job.status,operationId:job.operationId,messageId:job.messageId,error:job.error,errorCode:job.errorCode,resultAt:job.resultAt,manualResendJobId:job.manualResendJobId||null});}
       if(operationCache.size>16)operationCache.clear();operationCache.set(cacheKey,{at:Date.now(),revision:operationRevision,value:result});return result;
     },

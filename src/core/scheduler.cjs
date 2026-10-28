@@ -171,23 +171,29 @@ class Scheduler extends EventEmitter {
     };
     this.receiptListener = receipt => {
       if (receipt.status === 'failed' && receipt.messageId && receipt.confirmedFailure === true) {
+        let changed = false;
         try {
           for (const job of this.store.listJobs({ messageId: receipt.messageId, limit: 1000000 })) {
             if (!['sending', 'uncertain'].includes(job.status)) continue;
             this._persist('updateJob', job.id, { status: 'failed', resultAt: this.now(), errorCode: receipt.code || 'SEND_CONFIRMED_REJECTION', error: 'A integração confirmou que a mensagem não foi aceita.' });
+            changed = true;
             if (receipt.groupScoped === true || receipt.destinationUnavailable === true) this._destinationFailure(job, receipt);
           }
         } catch { this._failClosed(); }
-        this.emit('change');
+        if (changed) this.emit('change');
         return;
       }
       if (!['confirmed', 'accepted', 'delivered'].includes(receipt.status) || !receipt.messageId) return;
-      this.receipts.set(receipt.messageId, receipt);
+      const level = proof => Number.isFinite(proof?.readAt) ? 3 : proof?.status === 'delivered' || proof?.delivered === true || Number.isFinite(proof?.deliveredAt) ? 2 : 1;
+      const previous = this.receipts.get(receipt.messageId);
+      if (!previous || level(receipt) > level(previous)) this.receipts.set(receipt.messageId, receipt);
       if (this.receipts.size > 1000) this.receipts.delete(this.receipts.keys().next().value);
       try {
         for (const job of this.store.listJobs({ messageId: receipt.messageId, limit: 1000000 })) this._recordProof(job, receipt, { reconciled: true });
       } catch { this._failClosed(); }
-      this.emit('change');
+      // _recordProof emits only when a durable milestone changed. Repeated
+      // group-participant read receipts must not repeatedly rewrite a job or
+      // re-render every screen while the next campaign message waits.
     };
     adapter.on('status', this.statusListener);
     adapter.on('receipt', this.receiptListener);
@@ -229,7 +235,31 @@ class Scheduler extends EventEmitter {
   getCampaignTiming(id) {
     const c = this.store.getCampaign(id);
     if (!c) throw new Error('Campanha não encontrada.');
-    return { computerClock: this.getClockStatus(), nextRoundAt: c.nextRunAt ?? null, lastRoundAt: c.lastRoundAt ?? null, lastRoundScheduledAt: c.lastRoundScheduledAt ?? null, state: c.state, recoveryStatus: c.executionRecovery?.status || null, pendingRoundId: c.executionPendingRoundId || null };
+    return { computerClock: this.getClockStatus(), nextRoundAt: c.nextRunAt ?? null, lastRoundAt: c.lastRoundAt ?? null, lastRoundScheduledAt: c.lastRoundScheduledAt ?? null, state: c.state, recoveryStatus: c.executionRecovery?.status || null, pendingRoundId: c.executionPendingRoundId || null, runtime: this.getExecutionState(id) };
+  }
+
+  getExecutionState(id) {
+    const campaign = this.store.getCampaign(id);
+    if (!campaign) throw new Error('Campanha não encontrada.');
+    const current = this.currentRound?.campaignId === id ? this.currentRound : null;
+    const roundId = current?.id || campaign.executionPendingRoundId || null;
+    const round = current || (roundId ? this.store.listRounds(id).find(value => value.id === roundId) : null);
+    let nextRoundEstimateAt = null;
+    // A running round deliberately owns nextRunAt=null until its immutable
+    // jobs settle. That is not an interruption. Show a read-only future-slot
+    // forecast without allowing another timer to start an overlapping round.
+    if (current && campaign.state === 'active' && !current.controller.signal.aborted) {
+      const candidate = this._nextEligibleAt(campaign, this.now(), { afterRound: true, strictlyFuture: true });
+      if (Number.isFinite(candidate)) nextRoundEstimateAt = candidate;
+    }
+    return {
+      runningRound: Boolean(current), stoppingRound: Boolean(current?.controller.signal.aborted),
+      roundId, roundStatus: current ? 'running' : round?.status || null,
+      startedAt: round?.startedAt ?? null,
+      nextRoundAt: campaign.state === 'active' && Number.isFinite(campaign.nextRunAt) ? campaign.nextRunAt : null,
+      nextRoundEstimateAt, estimate: nextRoundEstimateAt !== null,
+      waitingPrivate: this.getSubmissionQueueState().waitingPrivate
+    };
   }
 
   _authorizedOnIncidentDay(campaign, at) {
@@ -512,6 +542,12 @@ class Scheduler extends EventEmitter {
     if (typeof requestId !== 'string' || !requestId || requestId.length > 128) throw new Error('Identificador da solicitação imediata inválido.');
     const campaign = this.store.getCampaign(id); this._validateCampaign(campaign);
     if (this.hasImmediateRequest(id, requestId)) return campaign;
+    if (this.currentRound?.campaignId === id && campaign.state === 'active' && !this.currentRound.controller.signal.aborted) {
+      // The user is already getting the requested campaign. Repeated clicks
+      // must not restart its round, rebase its interval, or present a generic
+      // queue error while confirmed submissions continue in the background.
+      return { ...campaign, immediateStatus: 'already-running', executionAlreadyRunning: true, runningRoundId: this.currentRound.id };
+    }
     if (this.busy || this.submissionHolds || this.currentRound) throw Object.assign(new Error('Há um envio em andamento. Aguarde sua conclusão antes de enviar uma rodada imediata.'), { code: 'SCHEDULER_BUSY' });
     if (!this._connected()) throw new Error('Conecte o WhatsApp antes de enviar agora.');
     if (this.store.persistenceFailed || this.persistenceFailed) throw new Error('Persistência indisponível. Reinicie e revise os registros antes de enviar.');
@@ -711,6 +747,7 @@ class Scheduler extends EventEmitter {
     // All private alerts and search results share this queue. Holding the
     // scheduler immediately prevents a new campaign round taking their slot.
     try{if(!controlOnly)this.licenseGuard();}catch(error){return Promise.reject(error);}
+    if (this.closed || this.closing) return Promise.reject(Object.assign(new Error('O aplicativo está encerrando; o envio permanece pendente.'), { code: 'SUBMISSION_SERVICE_CLOSED', definitive: true, submitted: false, safeToRetry: false }));
     if (!manual && this._automationStopped()) return Promise.reject(this._automationError());
     const release = this.holdSubmissions();
     let resolve, reject;
@@ -722,7 +759,8 @@ class Scheduler extends EventEmitter {
       const releaseTurn = await this._acquireSubmissionTurn('private', entry.controller.signal);
       try {
       if (entry.cancelled) return;
-      if (this.closed || this.persistenceFailed || this.store.persistenceFailed) throw new Error('Envios externos bloqueados: processamento indisponível.');
+      if (this.closed || this.closing) throw Object.assign(new Error('O aplicativo está encerrando; o envio permanece pendente.'), { code: 'SUBMISSION_SERVICE_CLOSED', definitive: true, submitted: false, safeToRetry: false });
+      if (this.persistenceFailed || this.store.persistenceFailed) throw Object.assign(new Error('Envios externos bloqueados: processamento indisponível.'), { code: 'SUBMISSION_PERSISTENCE_FAILED', definitive: true, submitted: false, safeToRetry: false });
       if(!controlOnly)this.licenseGuard();
       if (!entry.manual && this._automationStopped()) throw this._automationError();
       entry.started = true;
@@ -731,7 +769,8 @@ class Scheduler extends EventEmitter {
       try { return await this.runBoundedAttempt(context => {
         const beforeSubmit = () => {
           context.beforeSubmit();
-          if (this.closed || this.persistenceFailed || this.store.persistenceFailed) throw Object.assign(new Error('Envios externos bloqueados: processamento indisponível.'), { code: 'SUBMISSION_SERVICE_CLOSED', definitive: true, submitted: false, safeToRetry: false });
+          if (this.closed || this.closing) throw Object.assign(new Error('O aplicativo está encerrando; o envio permanece pendente.'), { code: 'SUBMISSION_SERVICE_CLOSED', definitive: true, submitted: false, safeToRetry: false });
+          if (this.persistenceFailed || this.store.persistenceFailed) throw Object.assign(new Error('Envios externos bloqueados: processamento indisponível.'), { code: 'SUBMISSION_PERSISTENCE_FAILED', definitive: true, submitted: false, safeToRetry: false });
           if (!controlOnly) this.licenseGuard();
           if (!entry.manual && this._automationStopped()) throw this._automationError();
         };
@@ -828,6 +867,10 @@ class Scheduler extends EventEmitter {
     if (messageId !== live.messageId && messageId !== live.clientMessageId && live.messageId !== job.messageId) return false;
     const delivered = proof.status === 'delivered' || proof.delivered === true || Number.isFinite(proof.deliveredAt);
     const status = delivered || live.status === 'delivered' ? 'delivered' : 'accepted';
+    const alreadyAccepted = ['accepted', 'delivered', 'confirmed'].includes(live.status) && live.proofAccepted === true;
+    const newDelivery = delivered && (!Number.isFinite(live.deliveredAt) || live.status !== 'delivered');
+    const newRead = Number.isFinite(proof.readAt) && !Number.isFinite(live.readAt);
+    if (alreadyAccepted && !newDelivery && !newRead && messageId === live.messageId) return true;
     const patch = {
       status, messageId, clientMessageId: live.clientMessageId || job.messageId,
       acceptedAt: live.acceptedAt || proof.acceptedAt || this.now(), resultAt: this.now(),
@@ -836,7 +879,7 @@ class Scheduler extends EventEmitter {
       confirmationScope: proof.confirmationScope || live.confirmationScope || (proof.simulation ? 'simulation-only' : 'integration-accepted')
     };
     if (delivered) patch.deliveredAt = live.deliveredAt || proof.deliveredAt || this.now();
-    if (Number.isFinite(proof.readAt)) patch.readAt = proof.readAt;
+    if (Number.isFinite(proof.readAt)) patch.readAt = Number.isFinite(live.readAt) ? live.readAt : proof.readAt;
     this._persist('updateJob', live.id, patch);
     this.emit('change');
     return true;

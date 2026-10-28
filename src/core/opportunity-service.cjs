@@ -3,7 +3,7 @@
 const { EventEmitter } = require('node:events');
 const { randomUUID, createHash, timingSafeEqual } = require('node:crypto');
 const { normalizePhone } = require('./phone.cjs');
-const { parseRequest, parseCampaignOffer, matchOffer } = require('./opportunity-matcher.cjs');
+const { parseRequest, parseCampaignOffer, matchOffer, stableOfferIdentity, materialFingerprint } = require('./opportunity-matcher.cjs');
 const { assessCampaignItem, campaignItemFingerprint } = require('./opportunity-campaign.cjs');
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -75,7 +75,7 @@ class OpportunityService extends EventEmitter {
   _assert(actorId, action = 'manage') { if (this.assertCanOperate(actorId, action) === false) throw error('Sem permissão para oportunidades.', 'OPPORTUNITY_FORBIDDEN'); }
   _trace(id, stage, code, description, detail = {}) {
     const entry = { id: randomUUID(), traceId: id || randomUUID(), at: this.now(), stage: `opportunities.${stage}`, operationType: 'opportunity', code,
-      description: String(description).slice(0, 500), detail: Object.fromEntries(Object.entries(detail).filter(([key]) => ['opportunityId', 'taskId', 'messageId', 'senderKey', 'recipient', 'attempts', 'status', 'reason'].includes(key))) };
+      description: String(description).slice(0, 500), detail: Object.fromEntries(Object.entries(detail).filter(([key]) => ['opportunityId', 'taskId', 'messageId', 'senderKey', 'recipient', 'attempts', 'status', 'reason', 'selectedCampaignCount', 'campaignCount', 'campaignItemCount', 'indexedOfferCount', 'matchingModelCount', 'blockerCounts', 'availabilityMode'].includes(key))) };
     this.store.addOpportunityTrace?.({ ...entry, opportunityId: detail.opportunityId || null, taskId: detail.taskId || null }); this.store.addDiagnostic?.(entry);
   }
   _failure(e) { try { this._trace(null, 'failure', e?.code || 'OPPORTUNITY_ERROR', e?.message || 'Falha ao processar oportunidade.'); } catch { this.blockedReason = 'Falha no banco de dados.'; } this.emit('change'); }
@@ -199,7 +199,8 @@ class OpportunityService extends EventEmitter {
       if (!old || ['offerRevision', 'available', 'availabilityConfirmedAt', 'quantityAvailable', 'identityConfidence', 'explicitUnitReference', 'contentFingerprint', 'mediaFingerprint', 'eligible', 'campaignId', 'itemId', 'copyConflict', 'campaignReferences', 'sourceBlocker', 'campaignItemFingerprint', 'availabilitySource', 'campaignEligible', 'opportunityAvailable'].some(key => JSON.stringify(old[key] ?? null) !== JSON.stringify(candidate[key] ?? null))) this.store.saveOpportunityOffer(candidate);
     }
     const offers = [...all.keys()].map(id => this.store.getOpportunityOffer(id));
-    this.offerIndex = { signature, offers, indexedAt: this.now() }; return offers;
+    this.offerIndex = { signature, offers, indexedAt: this.now(), stats: { selectedCampaignCount: c.campaignIds.length,
+      campaignCount: campaigns.filter(campaign => c.campaignIds.includes(campaign.id)).length, campaignItemCount: frames.length, indexedOfferCount: offers.length, availabilityMode: c.availabilityMode } }; return offers;
   }
   invalidateCampaignOffers({ reevaluate = false } = {}) {
     this.offerIndex = null; const offers = this._syncOffers(); let evaluated = 0;
@@ -219,8 +220,85 @@ class OpportunityService extends EventEmitter {
       text: offer.originalExcerpt || offer.excerpt || offer.rawText || '', priceCents: offer.priceCents ?? null, available: offer.available,
       mediaId: offer.mediaId || null, opportunityAvailable: offer.opportunityAvailable, availabilityReason: offer.sourceBlocker?.reason || (offer.availabilitySource === 'campaign' ? 'Disponibilidade declarada pelo anúncio na campanha.' : 'Exige confirmação manual atualizada.'), availabilitySource: offer.availabilitySource })) };
   }
+  listCampaignItems({ limit = 30, offset = 0, campaignId } = {}) {
+    const c = this._config();
+    if (campaignId !== undefined && (typeof campaignId !== 'string' || !c.campaignIds.includes(campaignId))) throw error('Selecione uma campanha habilitada nas Oportunidades.', 'OPPORTUNITY_CAMPAIGN_INVALID');
+    const items = [];
+    for (const campaign of this.store.listCampaigns()) {
+      if (!c.campaignIds.includes(campaign.id) || campaignId && campaign.id !== campaignId) continue;
+      for (const item of campaign.items || []) {
+        const source = item.sourcePublicationId ? this.store.getSourcePublication?.(item.sourcePublicationId) : undefined, media = item.mediaId ? this.store.getMedia?.(item.mediaId) : undefined;
+        const assessment = assessCampaignItem(item, campaign, { source, media, availabilityMode: 'campaign', manualSelection: true });
+        const text = item.type === 'text' ? String(item.text || '') : String(item.caption || '');
+        const blocker = assessment.blocker || (!text.trim() && item.type === 'text' ? { code: 'OFFER_TEXT_EMPTY', reason: 'O anúncio não possui texto para enviar.' } : null);
+        items.push({ campaignId: campaign.id, itemId: item.id, campaignName: campaign.name, type: item.type, mediaId: item.mediaId || null, text,
+          manualEligible: assessment.eligible && !blocker, blocker, availabilityConditional: assessment.availabilityConditional === true });
+      }
+    }
+    const start = Math.max(0, Number(offset) || 0), size = Math.min(100, Math.max(1, Number(limit) || 30));
+    return { total: items.length, offset: start, limit: size, items: items.slice(start, start + size) };
+  }
+  _manualOffer(selection) {
+    const c = this._config();
+    if (!selection || typeof selection !== 'object' || Array.isArray(selection) || !['campaignId', 'itemId'].every(key => typeof selection[key] === 'string' && selection[key] && selection[key].length <= 512)) throw error('Selecione um anúncio de campanha válido.', 'OPPORTUNITY_SELECTION_INVALID');
+    const { campaignId, itemId } = selection;
+    if (!c.campaignIds.includes(campaignId)) throw error('A campanha não está selecionada nas Oportunidades.', 'OPPORTUNITY_CAMPAIGN_INVALID');
+    const campaign = this.store.getCampaign(campaignId), item = campaign?.items?.find(row => row.id === itemId);
+    if (!campaign || !item) throw error('O anúncio foi removido ou a campanha não existe mais.', 'OPPORTUNITY_OFFER_CHANGED');
+    const source = item.sourcePublicationId ? this.store.getSourcePublication?.(item.sourcePublicationId) : undefined, media = item.mediaId ? this.store.getMedia?.(item.mediaId) : undefined;
+    const assessment = assessCampaignItem(item, campaign, { source, media, availabilityMode: 'campaign', manualSelection: true });
+    const text = item.type === 'text' ? String(item.text || '') : String(item.caption || '');
+    if (!assessment.eligible) throw error(assessment.blocker?.reason || 'O anúncio não pode ser enviado.', assessment.blocker?.code || 'OPPORTUNITY_OFFER_CHANGED');
+    if (text.length > 16000 || item.type === 'text' && !text.trim()) throw error('Revise o texto do anúncio: informe até 16.000 caracteres.', 'OPPORTUNITY_TEXT_INVALID');
+    const fingerprint = campaignItemFingerprint(item, campaign, { source, media }), indexed = this._syncOffers().filter(offer => offer.campaignId === campaignId && offer.itemId === itemId);
+    const parsed = indexed.length === 1 ? indexed[0] : null, identity = stableOfferIdentity(item, campaign, media || {});
+    const id = `manual-campaign-item:${hash([campaignId, itemId])}`;
+    const result = { ...(parsed || {}), id, offerId: id, offerKey: id, manualOnly: true, manualCampaignSelection: { campaignId, itemId },
+      model: parsed?.model || null, modelKey: parsed?.modelKey || null, storageGB: parsed?.storageGB ?? null, color: parsed?.color || null, colorKey: parsed?.colorKey || null,
+      condition: parsed?.condition || null, batteryPercent: parsed?.batteryPercent ?? null, priceCents: parsed?.confidence === 'confirmed' ? parsed.priceCents ?? null : null,
+      canonicalOfferId: parsed?.id || identity.offerKey, canonicalOfferIds: indexed.length ? indexed.map(value => value.id) : [identity.offerKey], campaignId, itemId, campaignName: campaign.name, mediaId: item.mediaId || null, mediaType: item.type,
+      originalExcerpt: text, excerpt: text, rawText: text, originalAt: source?.originalAt || item.sourceOriginalAt || item.originalAt || null,
+      available: true, availabilitySource: 'campaign', availabilityDeclared: true, campaignEligible: true, opportunityAvailable: item.opportunityAvailable !== false,
+      availabilityConditional: assessment.availabilityConditional === true, availabilityConfirmedAt: null, quantityAvailable: assessment.quantityAvailable,
+      campaignItemFingerprint: fingerprint, offerRevision: hash([fingerprint, text, item.type]), contentFingerprint: materialFingerprint(text), mediaFingerprint: media?.sha256 || media?.hash || null,
+      explicitUnitReference: parsed?.explicitUnitReference || identity.explicitUnitReference || null, identityConfidence: 'manual', sourceBlocker: null };
+    const old = this.store.getOpportunityOffer(id);
+    if (!old || old.offerRevision !== result.offerRevision || old.canonicalOfferId !== result.canonicalOfferId || JSON.stringify(old.canonicalOfferIds) !== JSON.stringify(result.canonicalOfferIds)) this.store.saveOpportunityOffer(result);
+    return this.store.getOpportunityOffer(id);
+  }
+  _manualPreviewData(id, selection, actorId, expiresAt, options = {}) {
+    const op = this.store.getOpportunity(id); if (!op) throw error('Oportunidade não encontrada.', 'OPPORTUNITY_NOT_FOUND');
+    const offer = this._manualOffer(selection), reviewed = options.reviewed === true, risk = options.duplicateRiskAcknowledged === true;
+    const check = this.store.checkOpportunitySend({ opportunityId: id, offerIds: [offer.id], now: this.now(), automatic: false, evaluationOnly: true,
+      manualCampaignSelection: selection, reviewed, allowExpired: reviewed, duplicateRiskAcknowledged: risk, manualOverride: risk, automationAllowed: !this.isAutomationStopped() });
+    const blockers = check?.ok ? [] : [{ code: check?.code || 'OPPORTUNITY_SEND_BLOCKED', reason: check?.reason || 'Revise a oportunidade antes de enviar.' }];
+    if (this.isAutomationStopped()) blockers.push({ code: 'OP_STOPPED', reason: 'Parada geral ativa. Retome o sistema antes de enviar.' });
+    if (!op.recipient) blockers.push({ code: 'RECIPIENT_UNAVAILABLE', reason: 'Número real do interessado indisponível.' });
+    const warnings = [{ code: 'MANUAL_CAMPAIGN_SELECTION', reason: 'Anúncio escolhido manualmente: confira o conteúdo completo, as condições e o destinatário. Não houve inferência automática de compatibilidade nem consulta de estoque.' }];
+    if (offer.availabilityConditional) warnings.push({ code: 'MANUAL_CONDITIONAL_OFFER', reason: 'O anúncio contém condições de disponibilidade ou encomenda; elas serão preservadas integralmente.' });
+    const payload = [this._mode(), actorId, id, op.request?.intentKey, op.status, op.needsReview, op.expiresAt, offer.id, offer.offerRevision, configHash(this._config()), selection.campaignId, selection.itemId, reviewed, risk, expiresAt];
+    return { opportunity: this._present(op, []), offers: [offer], offerIds: [offer.id], manualCampaignSelection: { campaignId: selection.campaignId, itemId: selection.itemId },
+      text: offer.rawText, canSend: !blockers.length, blockers, warnings, reviewed, duplicateRiskAcknowledged: risk, previewToken: `${expiresAt}:${hash(payload)}` };
+  }
   _candidates(op, offers = this._syncOffers()) {
     const c = this._config(), models = op.request?.models || op.requests || [];
+    // A manually selected announcement is a projection of its original campaign
+    // item, not a new physical offer. Reuse the durable canonical references for
+    // the panel as well as the final database guard, so a prior manual response
+    // does not appear eligible (or sound the siren) when the same item matches
+    // automatically later. Resolve each projection task once per evaluation.
+    const canonicalHistory = new Map(), historyTasks = new Map(), sentHistory = this.store.getOpportunitySentOffers?.(op.senderKey) || [];
+    for (const record of sentHistory) {
+      if (!String(record.offerId || '').startsWith('manual-campaign-item:')) continue;
+      if (!historyTasks.has(record.taskId)) historyTasks.set(record.taskId, this.store.getOpportunityTask?.(record.taskId));
+      const task = historyTasks.get(record.taskId);
+      if (!task || !(['queued', 'sending', 'accepted', 'delivered', 'uncertain', 'outside'].includes(task.status) || task.startedAt != null)) continue;
+      const snapshot = task.offerSnapshots?.find(value => value.id === record.offerId);
+      if (!snapshot?.manualOnly) continue;
+      for (const reference of [snapshot.canonicalOfferId, ...(snapshot.canonicalOfferIds || [])]) {
+        if (typeof reference === 'string' && reference) canonicalHistory.set(reference, { ...record, sourceSnapshot: snapshot });
+      }
+    }
     const candidates = offers.map(offer => {
       const matches = models.map(spec => {
         const sameModel = spec.modelKey && spec.modelKey === offer.modelKey;
@@ -228,14 +306,32 @@ class OpportunityService extends EventEmitter {
         return { spec, match: blocker ? { eligible: false, needsReview: true, ...blocker } : matchOffer(spec, offer, { now: this.now(), availabilityMaxAgeMinutes: c.availabilityMaxAgeMinutes, availabilityMode: c.availabilityMode }) };
       });
       const best = matches.find(v => v.match.eligible) || matches.find(v => v.match.needsReview) || matches[0];
-      const response = this.store.getOpportunityOfferSent?.(op.senderKey, offer.id) || (this.store.getOpportunitySentOffers?.(op.senderKey) || []).filter(v => v.offerId === offer.id && ['queued', 'sending', 'accepted', 'delivered', 'uncertain', 'outside'].includes(v.status)).at(-1);
-      const sentBefore = Boolean(response), updatedSinceSent = Boolean(response && typeof response === 'object' && response.offerRevision && response.offerRevision !== offer.offerRevision);
+      const response = this.store.getOpportunityOfferSent?.(op.senderKey, offer.id) || canonicalHistory.get(offer.id) || sentHistory.filter(v => v.offerId === offer.id && ['queued', 'sending', 'accepted', 'delivered', 'uncertain', 'outside'].includes(v.status)).at(-1);
+      const sentBefore = Boolean(response), updatedSinceSent = Boolean(response?.sourceSnapshot
+        ? response.sourceSnapshot.campaignItemFingerprint !== offer.campaignItemFingerprint
+        : response && typeof response === 'object' && response.offerRevision && response.offerRevision !== offer.offerRevision);
       const blockers = sentBefore ? [{ code: updatedSinceSent ? 'OFFER_UPDATED_SENT' : 'OFFER_ALREADY_SENT', reason: updatedSinceSent ? 'Oferta atualizada — já enviada anteriormente.' : 'Oferta já enviada para este contato.' }] : best?.match?.eligible ? [] : [{ code: best?.match?.code || 'OFFER_NOT_COMPATIBLE', reason: best?.match?.reason || 'A oferta não corresponde com segurança à procura.' }];
       return { ...offer, eligible: Boolean(best?.match?.eligible) && !sentBefore, compatible: Boolean(best?.match?.eligible), match: best?.match, modelMatches: matches, sentBefore, updatedSinceSent, blockers };
     });
     const compatible = candidates.filter(v => v.compatible || v.match?.needsReview);
     compatible.sort((a, b) => c.priority === 'recent' ? (b.originalAt || 0) - (a.originalAt || 0) : c.priority === 'campaign' ? c.campaignIds.indexOf(a.campaignId) - c.campaignIds.indexOf(b.campaignId) : (a.priceCents ?? Infinity) - (b.priceCents ?? Infinity));
     return compatible;
+  }
+  _noSafeOffer(op, candidates, offers = this._syncOffers()) {
+    const c = this._config(), stats = { ...(this.offerIndex?.stats || {}), matchingModelCount: 0, blockerCounts: [] };
+    if (!c.campaignIds.length) return { code: 'OP_NO_CAMPAIGNS', reason: 'Nenhuma campanha foi selecionada nas Oportunidades. Selecione as campanhas com seus anúncios.', detail: stats };
+    if (!stats.campaignCount) return { code: 'OP_CAMPAIGNS_MISSING', reason: 'As campanhas selecionadas não estão disponíveis. Revise a seleção de campanhas.', detail: stats };
+    if (!offers.length) return { code: 'OP_CAMPAIGNS_NO_INDEXED_OFFERS', reason: stats.campaignItemCount ? 'Há anúncios nas campanhas, mas nenhum pôde ser interpretado com segurança para resposta automática. Você pode escolher o anúncio e conferir o envio manualmente.' : 'As campanhas selecionadas ainda não possuem anúncios. Adicione conteúdo ou escolha outra campanha.', detail: stats };
+    const models = op.request?.models || [], matching = offers.filter(offer => models.some(spec => spec.modelKey && spec.modelKey === offer.modelKey));
+    stats.matchingModelCount = matching.length;
+    if (!matching.length) return { code: 'OP_MODEL_NOT_IN_CAMPAIGNS', reason: 'Não há anúncio do modelo e versão procurados nas campanhas selecionadas. Escolha manualmente apenas se o anúncio atender ao pedido.', detail: stats };
+    const counts = new Map(); let first;
+    for (const offer of matching) {
+      const candidate = candidates.find(value => value.id === offer.id), match = candidate?.blockers?.[0] || offer.sourceBlocker || models.map(spec => matchOffer(spec, offer, { now: this.now(), availabilityMode: c.availabilityMode, availabilityMaxAgeMinutes: c.availabilityMaxAgeMinutes })).find(value => value.code !== 'MODEL_MISMATCH');
+      if (match && !match.eligible) { counts.set(match.code, (counts.get(match.code) || 0) + 1); first ||= match; }
+    }
+    stats.blockerCounts = [...counts].map(([code, count]) => ({ code, count }));
+    return { code: first?.code || 'NO_SAFE_OFFER', reason: first?.reason || 'Os anúncios do modelo encontrado precisam de revisão antes da resposta automática.', detail: stats };
   }
   evaluate(id, { automatic = false, offers } = {}) {
     const op = this.store.getOpportunity(id); if (!op) throw error('Oportunidade não encontrada.', 'OPPORTUNITY_NOT_FOUND');
@@ -247,11 +343,11 @@ class OpportunityService extends EventEmitter {
         const models = op.request?.models || [];
         if (models.length > c.multiModelMax) reservation = { ok: false, code: 'REQUEST_TOO_MANY_MODELS', reason: 'Pedido com vários modelos requer revisão.' };
         else if (eligible.length && op.recipient) reservation = this.store.reserveOpportunitySend({ opportunityId: id, offerIds: eligible.slice(0, c.automaticOfferLimit).map(v => v.id), recipient: op.recipient, clientId: `OPP-${randomUUID()}`, automatic: true, now: this.now() });
-        else reservation = { ok: false, code: eligible.length ? 'RECIPIENT_UNAVAILABLE' : 'NO_SAFE_OFFER', reason: eligible.length ? 'Número real indisponível; revise o destinatário.' : candidates[0]?.blockers?.[0]?.reason || 'Nenhuma oferta compatível com disponibilidade confirmada.' };
+        else reservation = { ok: false, ...(eligible.length ? { code: 'RECIPIENT_UNAVAILABLE', reason: 'Número real indisponível; revise o destinatário.' } : this._noSafeOffer(op, candidates, offers)) };
       } catch (e) { reservation = { ok: false, code: e.code, reason: e.message }; }
       if (reservation) { const blocker = reservation.ok ? null : { code: reservation.code, reason: reservation.reason }; const current = this.store.getOpportunity(id); if (JSON.stringify(current.lastBlocker || null) !== JSON.stringify(blocker)) this.store.updateOpportunity(id, { lastBlocker: blocker }); }
       if (reservation?.ok) { this._trace(reservation.task.id, 'queued', 'OPPORTUNITY_QUEUED', 'Resposta única reservada e colocada na fila persistente.', { opportunityId: id, taskId: reservation.task.id, recipient: op.recipient }); this._schedulePump(); }
-      else if (reservation) this._trace(id, 'blocked', reservation.code, reservation.reason, { opportunityId: id, reason: reservation.reason });
+      else if (reservation) this._trace(id, 'blocked', reservation.code, reservation.reason, { opportunityId: id, reason: reservation.reason, ...(reservation.detail || {}) });
     }
     const current = this.store.getOpportunity(id);
     return { opportunity: this._present(current,candidates), candidates, reservation, blockers: this._blockers(current, candidates, reservation) };
@@ -274,12 +370,12 @@ class OpportunityService extends EventEmitter {
     if (currentCheck && !currentCheck.ok) reasons.push({ code: currentCheck.code, reason: currentCheck.reason, nextEligibleAt: currentCheck.nextEligibleAt || null });
     if (currentCheck?.repetition && !currentCheck.repetition.ok) reasons.push({ code: currentCheck.repetition.code, reason: currentCheck.repetition.reason, nextEligibleAt: currentCheck.repetition.nextEligibleAt || null });
     const dynamicCodes = new Set(['OP_MUTED', 'OP_CLOSED', 'OP_EXPIRED', 'OP_REVIEW', 'OP_ALREADY_RESPONDED', 'OP_PENDING', 'OP_UNCERTAIN', 'OP_REPEAT', 'OP_INTERVAL', 'OP_DAILY_LIMIT', 'OP_AUTOMATIC_DISABLED', 'OP_STOPPED']);
-    if (op.lastBlocker && !dynamicCodes.has(op.lastBlocker.code)) reasons.push(op.lastBlocker); if (op.status === 'uncertain') reasons.push({ code: 'OP_UNCERTAIN', reason: 'Envio anterior com resultado incerto.' }); if (op.outsideAnsweredAt) reasons.push({ code: 'OP_ALREADY_RESPONDED', reason: 'Já respondido por fora.' }); if (op.needsReview) reasons.push({ code: 'REQUEST_CHANGED_REVIEW', reason: 'Pedido alterado; revisão necessária.' });
+    if (op.lastBlocker && !dynamicCodes.has(op.lastBlocker.code) && !candidates.some(value => value.eligible)) reasons.push(op.lastBlocker); if (op.status === 'uncertain') reasons.push({ code: 'OP_UNCERTAIN', reason: 'Envio anterior com resultado incerto.' }); if (op.outsideAnsweredAt) reasons.push({ code: 'OP_ALREADY_RESPONDED', reason: 'Já respondido por fora.' }); if (op.needsReview) reasons.push({ code: 'REQUEST_CHANGED_REVIEW', reason: 'Pedido alterado; revisão necessária.' });
     if (op.expiresAt <= this.now() || op.status === 'expired') reasons.push({ code: 'REQUEST_EXPIRED', reason: 'Pedido expirado.' });
     if (isClosed(op.status)) reasons.push({ code: 'REQUEST_CLOSED', reason: 'Oportunidade encerrada.' });
     if (this.store.getOpportunityContactMute?.(op.senderKey)?.muted) reasons.push({ code: 'CONTACT_MUTED', reason: 'Contato silenciado.' });
     if (reservation && !reservation.ok) reasons.push({ code: reservation.code, reason: reservation.reason });
-    if (!summary && !candidates.some(v => v.eligible)) reasons.push(...(candidates[0]?.blockers || [{ code: 'NO_SAFE_OFFER', reason: 'Disponibilidade ou correspondência precisa de confirmação.' }]));
+    if (!summary && !candidates.some(v => v.eligible)) reasons.push(...(candidates[0]?.blockers || [this._noSafeOffer(op, candidates)]));
     return [...new Map(reasons.map(value => [value.code, value])).values()];
   }
   list(filters = {}, actorId) { this._assert(actorId, 'view'); this._expire(); const page = this.store.listOpportunities(filters),offers=this._syncOffers(); return { ...page, items: list(page).map(op => this._present(op,this._candidates(op,offers))) }; }
@@ -287,6 +383,7 @@ class OpportunityService extends EventEmitter {
   getDetail(id, actorId) { this._assert(actorId, 'view'); const result = this.evaluate(typeof id === 'object' ? id.id : id); return { ...result, origins: this.store.listOpportunityOrigins(result.opportunity.id), tasks: list(this.store.listOpportunityTasks({ opportunityId: result.opportunity.id, limit: 100 })) }; }
   getState(actorId) { this._assert(actorId, 'view'); const config = this._config(), catalog = this.listCampaignOffers(), queue = list(this.store.listOpportunityTasks({ status: 'queued', limit: 20 })); return { config, metrics: this.store.getOpportunityMetrics?.() || {}, campaignOffers: catalog.items, campaignOfferTotal: catalog.total, monitor: { enabled: config.enabled, mode: config.mode, connection: this.adapter?.status?.state || 'disconnected', suspended: this.suspended, blockedReason: this.blockedReason || null, lastMessageAt: this.lastMessageAt || null, lastProcessedAt: this.lastProcessedAt || null }, queue, queueState: { connected: this.adapter?.status?.state === 'connected', busy: Boolean(this.pump), nextAttemptAt: this.store.getNextOpportunityTaskAt?.() ?? (queue.length ? Math.min(...queue.map(task => task.nextAttemptAt || this.now())) : null), minSpacingMs: Math.max(3, this.adapter?.minimumSpacingSeconds || 3) * 1000, blockedReason: this.blockedReason || null }, index: { indexedAt: this.offerIndex?.indexedAt || null, parsedItems: this.offerParseCount } }; }
   _previewData(id, offerIds, actorId, expiresAt, options = {}) {
+    if (options.manualCampaignSelection) return this._manualPreviewData(id, options.manualCampaignSelection, actorId, expiresAt, options);
     const { opportunity: op, candidates } = this.evaluate(id), c = this._config(), selected = offerIds.map(offerId => candidates.find(v => v.id === offerId));
     if (!offerIds.length || offerIds.length > c.multiModelMax || new Set(offerIds).size !== offerIds.length || selected.some(v => !v)) throw error('Selecione ofertas existentes e compatíveis.', 'OPPORTUNITY_SELECTION_INVALID');
     const warnings = [], blockers = this._blockers({ ...op, lastBlocker: null }, selected).filter(v => { if (options.reviewed === true && (v.code === 'REQUEST_CHANGED_REVIEW' || v.code === 'OP_REVIEW' || v.code === 'OP_EXPIRED' || v.code === 'REQUEST_EXPIRED' || v.code === 'REQUEST_CLOSED' && op.status === 'expired')) { warnings.push(v); return false; } return !['OFFER_ALREADY_SENT', 'OFFER_UPDATED_SENT', 'OP_OFFER_UPDATED', 'OP_OFFER_SENT', 'OP_OFFER_REPOST', 'OP_ALREADY_RESPONDED', 'OP_REPEAT', 'OP_UNCERTAIN', 'OP_PENDING', 'OP_INTERVAL', 'OP_DAILY_LIMIT'].includes(v.code) || options.duplicateRiskAcknowledged !== true; }); for (const offer of selected) if (!offer.eligible) { if (offer.compatible && offer.sentBefore && options.duplicateRiskAcknowledged === true) warnings.push(...offer.blockers); else blockers.push(...offer.blockers); }
@@ -294,14 +391,14 @@ class OpportunityService extends EventEmitter {
     const payload = [this._mode(), actorId, op.id, op.request?.intentKey, op.expiresAt, op.status, op.needsReview, selected.map(v => [v.id, v.offerRevision, v.availabilityConfirmedAt, v.quantityAvailable, v.available, v.campaignItemFingerprint, v.availabilitySource]), configHash(c), options.reviewed === true, options.duplicateRiskAcknowledged === true, expiresAt];
     return { opportunity: op, offers: selected, text: formatOpportunityResponse(op, selected), offerIds, blockers, warnings, reviewed: options.reviewed === true, duplicateRiskAcknowledged: options.duplicateRiskAcknowledged === true, canSend: !blockers.length, previewToken: `${expiresAt}:${hash(payload)}` };
   }
-  preview(input, actorId) { this._assert(actorId, 'respond'); const id = typeof input === 'string' ? input : input.id; const details = this.evaluate(id); const ids = input.offerIds || details.candidates.filter(v => v.eligible).slice(0, 1).map(v => v.id); return this._previewData(id, ids, actorId, this.now() + 5 * 60000, input); }
+  preview(input, actorId) { this._assert(actorId, 'respond'); const id = typeof input === 'string' ? input : input.id; if (input.manualCampaignSelection) return this._manualPreviewData(id, input.manualCampaignSelection, actorId, this.now() + 5 * 60000, input); const details = this.evaluate(id); const ids = input.offerIds || details.candidates.filter(v => v.eligible).slice(0, 1).map(v => v.id); return this._previewData(id, ids, actorId, this.now() + 5 * 60000, input); }
   respondManual(input, actorId) {
     this._assert(actorId, 'respond'); if (input.confirm !== true) throw error('Confirme a prévia antes de enviar.', 'OPPORTUNITY_CONFIRM_REQUIRED');
     const token = String(input.previewToken || ''), at = Number(token.split(':')[0]); if (!Number.isSafeInteger(at) || at < this.now() || at > this.now() + 5 * 60000) throw error('Prévia vencida; confira uma nova prévia.', 'OPPORTUNITY_PREVIEW_STALE');
     const preview = this._previewData(input.id, input.offerIds || [], actorId, at, input);
     const a = Buffer.from(token), b = Buffer.from(preview.previewToken); if (a.length !== b.length || !timingSafeEqual(a, b)) throw error('A oferta ou o pedido mudou; confira a nova prévia.', 'OPPORTUNITY_PREVIEW_STALE');
     if (!preview.canSend) throw error(preview.blockers[0]?.reason || 'Resposta bloqueada.', 'OPPORTUNITY_SEND_BLOCKED');
-    const result = this.store.reserveOpportunitySend({ opportunityId: input.id, offerIds: preview.offerIds, recipient: preview.opportunity.recipient, clientId: `OPP-${randomUUID()}`, automatic: false, now: this.now(), actorId, reviewed: input.reviewed === true, allowExpired: input.reviewed === true, manualOverride: input.duplicateRiskAcknowledged === true, duplicateRiskAcknowledged: input.duplicateRiskAcknowledged === true });
+    const result = this.store.reserveOpportunitySend({ opportunityId: input.id, offerIds: preview.offerIds, recipient: preview.opportunity.recipient, clientId: `OPP-${randomUUID()}`, automatic: false, now: this.now(), actorId, reviewed: input.reviewed === true, allowExpired: input.reviewed === true, manualOverride: input.duplicateRiskAcknowledged === true, duplicateRiskAcknowledged: input.duplicateRiskAcknowledged === true, ...(preview.manualCampaignSelection ? { manualCampaignSelection: preview.manualCampaignSelection } : {}) });
     if (!result.ok) throw error(result.reason, result.code); this._schedulePump(); this.emit('change'); return result;
   }
   action(input, actorId) {
@@ -339,7 +436,13 @@ class OpportunityService extends EventEmitter {
   _finalGuard(task, adapter, mode, beforeSubmit) {
     try { beforeSubmit?.(); if (this.closed || this.suspended || this.store.persistenceFailed || adapter !== this.adapter || mode !== this._mode() || this.isAutomationStopped() || adapter.status?.state !== 'connected') throw error('Envio interrompido por mudança de conexão ou controles.', 'OPPORTUNITY_SEND_BLOCKED', { definitive: true, submitted: false, safeToRetry: false });
     const config = this._config(); this._assert(task.actorId || config.ownerId, 'respond'); if (task.automatic && this.assertOwnerPermissions(config.ownerId, 'automatic') === false) throw error('Permissão automática removida.', 'OPPORTUNITY_FORBIDDEN', { definitive: true, submitted: false });
+    const manualOffer = task.automatic === false && task.manualCampaignSelection ? this._manualOffer(task.manualCampaignSelection) : null;
     const guarded = this.store.finalGuardOpportunitySend(task.id, { now: this.now(), automationAllowed: !this.isAutomationStopped(), allowExpired: task.allowExpired === true && task.reviewed === true, reviewed: task.reviewed === true }); if (!guarded.ok) throw error(guarded.reason, guarded.code, { definitive: true, submitted: false, safeToRetry: false });
+    if (manualOffer) {
+      const snapshot = task.offerSnapshots?.find(row => row.id === manualOffer.id);
+      if (task.offerIds?.length !== 1 || task.offerIds[0] !== manualOffer.id || !snapshot || snapshot.offerRevision !== manualOffer.offerRevision) throw error('O anúncio mudou depois da prévia; revise antes de enviar.', 'OPPORTUNITY_OFFER_CHANGED', { definitive: true, submitted: false });
+      return guarded;
+    }
     const op = this.store.getOpportunity(task.opportunityId), candidates = this._candidates(op);
     for (const id of task.offerIds || []) { const offer = candidates.find(v => v.id === id); if (!offer?.compatible || offer.offerRevision !== task.offerSnapshots?.find(v => v.id === id)?.offerRevision && task.offerSnapshots) throw error('A oferta mudou ou não está mais elegível; revise.', 'OPPORTUNITY_OFFER_CHANGED', { definitive: true, submitted: false }); }
     return guarded; } catch (e) { e.definitive = true; e.submitted = false; e.safeToRetry = false; throw e; }
@@ -366,13 +469,13 @@ class OpportunityService extends EventEmitter {
       if (!claim) this.store.updateOpportunityTask(task.id, { status: 'sending', attempts: (task.attempts || 0) + 1, submittedAt: this.now(), resolvedRecipient: resolved.jid });
       if (claim?.ok) this.store.updateOpportunityTask(task.id, { resolvedRecipient: resolved.jid });
       enteredSending = true; task = this.store.getOpportunityTask(task.id); const op = this.store.getOpportunity(task.opportunityId), offers = (task.offerIds || []).map(id => this.store.getOpportunityOffer(id));
-      const text = formatOpportunityResponse(op, offers); if (text.length > 16000) throw error('Prévia excede o limite de mensagem; reduza as opções.', 'OPPORTUNITY_TEXT_TOO_LONG', { definitive: true, submitted: false });
+      const text = task.manualCampaignSelection ? offers[0]?.rawText || '' : formatOpportunityResponse(op, offers); if (text.length > 16000) throw error('Prévia excede o limite de mensagem; reduza as opções.', 'OPPORTUNITY_TEXT_TOO_LONG', { definitive: true, submitted: false });
       this._trace(task.id, 'sending', 'OPPORTUNITY_SENDING', 'Envio privado iniciado.', { taskId: task.id, opportunityId: task.opportunityId, recipient: resolved.jid, attempts: task.attempts });
       if (this.scheduler) this.scheduler.lastSubmissionAt = this.now();
       return this._bounded(ctx => { const beforeSubmit = () => this._finalGuard(task, adapter, mode, () => { ctx.beforeSubmit(); outer.beforeSubmit?.(); }); beforeSubmit();
         const options = { clientMessageId: task.clientMessageId || task.clientId, traceId: task.id, beforeSubmit, signal: ctx.signal, timeoutMs: ctx.timeoutMs };
         const offer = offers.length === 1 && offers[0], campaign = offer && this.store.getCampaign(offer.campaignId), item = campaign?.items?.find(row => row.id === offer.itemId);
-        if (offer?.singleItemOffer && ['image', 'video', 'document'].includes(item?.type) && typeof adapter.sendPrivateContent === 'function') {
+        if ((offer?.singleItemOffer || task.manualCampaignSelection) && ['image', 'video', 'document'].includes(item?.type) && typeof adapter.sendPrivateContent === 'function') {
           const media = this.store.getMedia?.(item.mediaId); if (!media) throw error('A mídia do anúncio não está disponível; revise a campanha.', 'OPPORTUNITY_MEDIA_MISSING', { definitive: true, submitted: false });
           return adapter.sendPrivateContent(resolved.jid, { ...item, caption: text }, media, options);
         }
@@ -393,11 +496,16 @@ class OpportunityService extends EventEmitter {
   }
   _proof(taskId, proof, adapter = this.adapter, mode = this._mode()) {
     if (!proof || adapter !== this.adapter || mode !== this._mode()) return false; const task = this.store.getOpportunityTask(taskId); if (!task) return false;
-    if (proof.status === 'failed' && proof.confirmedFailure === true && !['accepted', 'delivered'].includes(task.status)) { this.store.updateOpportunityTask(taskId, { status: 'failed', resultAt: this.now(), code: proof.code || 'OPPORTUNITY_CONFIRMED_FAILURE', reason: 'A integração confirmou a falha.', safeToRetry: false, proof: true, proofAccepted: true }); return true; }
+    if (proof.status === 'failed' && proof.confirmedFailure === true && !['accepted', 'delivered'].includes(task.status)) { if (task.status !== 'failed') this.store.updateOpportunityTask(taskId, { status: 'failed', resultAt: task.resultAt || this.now(), code: proof.code || 'OPPORTUNITY_CONFIRMED_FAILURE', reason: 'A integração confirmou a falha.', safeToRetry: false, proof: true, proofAccepted: true }); return true; }
     if (!accepted(proof)) return false;
     if (task.messageId && task.messageId !== proof.messageId && task.clientMessageId !== proof.messageId && task.clientId !== proof.messageId) return false;
-    const delivered = ['delivered', 'read'].includes(proof.status) || proof.deliveredAt || proof.delivered === true;
-    this.store.updateOpportunityTask(taskId, { status: delivered ? 'delivered' : 'accepted', messageId: proof.messageId, acceptedAt: task.acceptedAt || this.now(), deliveredAt: task.deliveredAt || proof.deliveredAt || (delivered ? this.now() : null), resultAt: this.now(), confirmationScope: proof.confirmationScope || 'integration-ack', reason: null, code: null, safeToRetry: false, proof: true, proofAccepted: true });
+    const delivered = ['delivered', 'read'].includes(proof.status) || proof.deliveredAt || proof.delivered === true || ['whatsapp-delivered', 'whatsapp-read'].includes(proof.confirmationScope);
+    const read = proof.status === 'read' || proof.confirmationScope === 'whatsapp-read';
+    // A synchronous ACK and the completion of the same promise are one proof.
+    // Ignore repeated/weaker receipts rather than rewriting timestamps, logging
+    // another acceptance or downgrading an already delivered message.
+    if (['accepted', 'delivered'].includes(task.status) && (!delivered || task.status === 'delivered') && (!read || task.confirmationScope === 'whatsapp-read')) return true;
+    this.store.updateOpportunityTask(taskId, { status: delivered ? 'delivered' : 'accepted', messageId: proof.messageId || task.messageId, acceptedAt: task.acceptedAt || proof.acceptedAt || this.now(), deliveredAt: task.deliveredAt || proof.deliveredAt || (delivered ? this.now() : null), resultAt: task.resultAt || this.now(), confirmationScope: read ? 'whatsapp-read' : proof.confirmationScope || (delivered ? 'whatsapp-delivered' : 'integration-ack'), reason: null, code: null, safeToRetry: false, proof: true, proofAccepted: true });
     this._trace(taskId, 'result', delivered ? 'OPPORTUNITY_DELIVERED' : 'OPPORTUNITY_ACCEPTED', delivered ? 'Entrega confirmada pela integração.' : 'Envio aceito pela integração; entrega não presumida.', { taskId, status: delivered ? 'delivered' : 'accepted', messageId: proof.messageId }); this.emit('change'); return true;
   }
   _receipt(proof) { if (!proof?.messageId || proof.mode && proof.mode !== this._mode() || proof.simulation === true && this._mode() !== 'simulated') return; const tasks = list(this.store.listOpportunityTasks({ messageId: proof.messageId, limit: 100 })); for (const task of tasks) if ([task.messageId, task.clientMessageId, task.clientId].includes(proof.messageId)) this._proof(task.id, proof); }
@@ -408,7 +516,7 @@ class OpportunityService extends EventEmitter {
   }
   async retryUncertain(input, actorId) { this._assert(actorId, 'respond'); const task = this.store.getOpportunityTask(input.taskId || input.id); if (!task || task.status !== 'uncertain') throw error('Selecione um envio incerto.', 'OPPORTUNITY_TASK_NOT_UNCERTAIN'); await this.reconcile({ id: task.id }, actorId); if (this.store.getOpportunityTask(task.id).status !== 'uncertain') return { reconciled: true, task: this.store.getOpportunityTask(task.id) };
     if (input.duplicateRiskAcknowledged !== true || input.confirm !== true) throw error('Este envio pode ter ocorrido. Confirme o risco de duplicação.', 'OPPORTUNITY_DUPLICATE_RISK_REQUIRED');
-    const result = this.store.reserveOpportunitySend({ opportunityId: task.opportunityId, offerIds: task.offerIds, recipient: task.recipient, clientId: `OPPR-${hash([this._mode(), task.id])}`, automatic: false, now: this.now(), actorId, manualOverride: true, duplicateRiskAcknowledged: true, retryOf: task.id });
+    const result = this.store.reserveOpportunitySend({ opportunityId: task.opportunityId, offerIds: task.offerIds, recipient: task.recipient, clientId: `OPPR-${hash([this._mode(), task.id])}`, automatic: false, now: this.now(), actorId, manualOverride: true, duplicateRiskAcknowledged: true, retryOf: task.id, ...(task.manualCampaignSelection ? { manualCampaignSelection: task.manualCampaignSelection } : {}) });
     if (!result.ok) throw error(result.reason, result.code); this._schedulePump(); this.emit('change'); return result;
   }
   _notify(op) { const registered = this.store.registerOpportunityNotification([op.id], { now: this.now(), kind: 'compatible' }); if (registered === false || registered?.inserted === false || registered?.newIds && !registered.newIds.length) return;

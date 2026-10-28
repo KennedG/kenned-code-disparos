@@ -485,9 +485,19 @@ class AlertService extends EventEmitter {
   }
 
   flush() {
-    if (this.flushing) return this.flushing;
-    if (this.closed || this._stopped() || this.store.persistenceFailed || this.scheduler?.persistenceFailed) return Promise.resolve();
-    this.flushing = Promise.resolve().then(() => { this._flushDestinationSummaries(); return this._flush(); }).finally(() => { this.flushing = null; });
+    if (this.flushing) { this.flushRequested = true; return this.flushing; }
+    if (this.closed || this.scheduler?.closed || this.scheduler?.closing || this._stopped() || this.store.persistenceFailed || this.scheduler?.persistenceFailed) return Promise.resolve();
+    // An occurrence can be queued after a concurrent pass observed an empty
+    // queue, before its promise settles. Keep that wake-up on the same pump;
+    // otherwise waitForIdle/testRecipient may finish with an unsent notice.
+    this.flushRequested = false;
+    this.flushing = Promise.resolve().then(async () => {
+      do {
+        this.flushRequested = false;
+        this._flushDestinationSummaries();
+        await this._flush();
+      } while (this.flushRequested && !this.closed && !this.scheduler?.closed && !this.scheduler?.closing && !this._stopped() && !this.store.persistenceFailed && !this.scheduler?.persistenceFailed);
+    }).finally(() => { this.flushing = null; });
     return this.flushing;
   }
 
@@ -506,12 +516,21 @@ class AlertService extends EventEmitter {
       // The FIFO slot contains a bounded batch, while each network operation
       // gets its own shorter deadline. One stalled notice cannot occupy the
       // slot indefinitely or turn every following notice into uncertain work.
-      const batchMs = 50 * (attemptMs * 2 + Math.max(3, this.adapter?.minimumSpacingSeconds || 3) * 1000) + 5000;
-      try { return await this.scheduler.runExternalSubmission(context => this._flushBatch(context), { timeoutMs: batchMs }); }
+      const batchMs = attemptMs * 2 + Math.max(3, this.adapter?.minimumSpacingSeconds || 3) * 1000 + 5000;
+      try {
+        for (let count = 0; count < 50 && !this.closed && !this.scheduler.closed && !this.scheduler.closing && !this._stopped(); count++) {
+          const channel = this.adapter?.status?.state === 'connected' ? undefined : 'webhook';
+          const due = this.store.listPendingAlerts ? this.store.listPendingAlerts({ at: this.now(), channel, limit: 1 }) : this._list('alerts', { status: 'pending' }).filter(a => (!channel || a.channel === channel) && (a.nextAttemptAt || 0) <= this.now()).slice(0, 1);
+          if (!due.length) break;
+          await this.scheduler.runExternalSubmission(context => this._flushBatch({ ...context, managedSubmission: true, singleDelivery: true }), { timeoutMs: batchMs });
+        }
+        return;
+      }
       catch (error) {
         // Cancelling an automatic queue is an intentional operator action,
         // not a disk fault. Do not latch a persistence failure on stop-all.
         if (error?.code === 'AUTOMATION_STOPPED') return;
+        if (error?.code === 'SUBMISSION_SERVICE_CLOSED' && (this.closed || this.scheduler?.closed || this.scheduler?.closing)) return;
         if (error?.code === 'SUBMISSION_TIMEOUT') {
           for (const alert of this._list('alerts', { status: 'sending' })) {
             const uncertain = this._save('alerts', { ...alert, status: 'uncertain', resultAt: this.now(), retryEligible: false, errorCode: 'ALERT_SEND_TIMEOUT', error: 'Tempo limite excedido. O envio pode ter ocorrido; revise antes de repetir.' });
@@ -557,18 +576,18 @@ class AlertService extends EventEmitter {
     this.emit('change');
   }
 
-  async _flushBatch({ signal, beforeSubmit: batchBeforeSubmit = () => {} } = {}) {
+  async _flushBatch({ signal, beforeSubmit: batchBeforeSubmit = () => {}, managedSubmission = false, singleDelivery = false } = {}) {
     if (this._stopped()) return;
     const stopRevision = this.stopRevision;
     const adapter = this.adapter;
     const adapterRevision = this.adapterRevision;
     const mode = this._mode();
     const channel = this.adapter?.status?.state === 'connected' ? undefined : 'webhook';
-    const pending = this.store.listPendingAlerts ? this.store.listPendingAlerts({ at: this.now(), channel, limit: 50 }) : this._list('alerts', { status: 'pending' }).filter(a => (!channel || a.channel === channel) && (a.nextAttemptAt || 0) <= this.now()).sort((a, b) => a.createdAt - b.createdAt).slice(0, 50);
+    const pending = this.store.listPendingAlerts ? this.store.listPendingAlerts({ at: this.now(), channel, limit: singleDelivery ? 1 : 50 }) : this._list('alerts', { status: 'pending' }).filter(a => (!channel || a.channel === channel) && (a.nextAttemptAt || 0) <= this.now()).sort((a, b) => a.createdAt - b.createdAt).slice(0, singleDelivery ? 1 : 50);
     if (!pending.length) return;
-    const release = this.scheduler?.holdSubmissions?.() || (() => {});
+    const release = managedSubmission ? (() => {}) : this.scheduler?.holdSubmissions?.() || (() => {});
     try {
-      await this.scheduler?.waitForIdle?.();
+      if (!managedSubmission) await this.scheduler?.waitForIdle?.();
       for (const snapshot of pending) {
         if (signal?.aborted || this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || this.scheduler?.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode()) break;
         const alert = this._get('alerts', snapshot.id);
@@ -645,6 +664,10 @@ class AlertService extends EventEmitter {
           const safe = !submitted || error?.safeToRetry === true;
           const definitive = safe || error?.definitive === true;
           if (acknowledged?.status === 'cancelled') continue;
+          if (error?.code === 'SUBMISSION_SERVICE_CLOSED' && error.submitted === false && (this.closed || this.scheduler?.closed || this.scheduler?.closing)) {
+            this._save('alerts', { ...acknowledged, status: 'pending', attempts: Math.max(0, attempt - 1), submittedAt: null, resultAt: null, errorCode: null, error: null, retryEligible: false });
+            break;
+          }
           if (error?.code === 'AUTOMATION_STOPPED' && error.submitted === false) {
             const cancelled = this._save('alerts', { ...acknowledged, status: 'cancelled', resultAt: this.now(), cancelledAt: this.now(), errorCode: 'AUTOMATION_STOPPED', error: 'Alerta interrompido antes da submissão pelo comando parar tudo.', retryEligible: false });
             this._trace(cancelled, 'cancelled', 'AUTOMATION_STOPPED', cancelled.error, 'Nenhuma mensagem foi enviada e nenhuma nova tentativa automática será realizada.', attempt);

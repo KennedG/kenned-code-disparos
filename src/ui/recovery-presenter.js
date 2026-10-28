@@ -24,20 +24,39 @@
     }
     return value;
   }
-  function timing(campaign) {
-    const c = campaign || {}, recovery = c.executionRecovery || {};
+  function timing(campaign, operation = {}) {
+    const c = campaign || {}, recovery = c.executionRecovery || {}, runtime = operation.runtime || operation.timing || operation;
     const last = c.lastRoundScheduledAt || c.lastRoundAt || c.lastRoundStartedAt || null;
-    let status = recovery.status || '';
-    if (!status && c.executionPendingRoundId) status = 'Rodada interrompida — itens pendentes aguardam próximo horário';
-    if (!status && c.state === 'active') status = c.nextRunAt ? 'Aguardando próximo horário de rodada' : 'Verificando a próxima execução permitida';
-    if (!status && c.state === 'paused') status = c.pauseReason === 'connection' ? 'Pausada por conexão — aguardando recuperação' : 'Pausada — requer retomada autorizada';
-    if (!status && c.state === 'draft') status = 'Rascunho — nenhum envio autorizado';
-    if (!status && c.state === 'stopped') status = 'Encerrada — nenhum envio agendado';
-    return { last, next: c.nextRunAt || null, status, authorizedAt: c.executionAuthorization?.at || null, authorizedDate: c.executionAuthorization?.dateKey || '', authorizedTimezone: c.executionAuthorization?.timezone || '' };
+    const roundStatus = runtime.roundStatus || operation.roundStatus || operation.round?.status || null;
+    // A persisted pending ID also identifies the currently running round. It
+    // is never, by itself, evidence that the queue stopped or disconnected.
+    const runningRound = c.state === 'active' && (runtime.runningRound === true || roundStatus === 'running');
+    const stoppingRound = runtime.stoppingRound === true || runtime.runningRound === true && c.state !== 'active';
+    let status = '';
+    if (stoppingRound) status = 'Interrupção solicitada — aguardando resultado do envio em andamento';
+    else if (runningRound) status = runtime.processingStage === 'waiting-transport' ? 'Rodada em andamento — aguardando o transporte compartilhado' : 'Rodada em andamento — processando os envios';
+    else if (recovery.status) status = recovery.status;
+    else if (c.state === 'active' && roundStatus === 'interrupted') status = 'Rodada interrompida — itens pendentes aguardam próximo horário';
+    else if (c.state === 'active' && c.executionPendingRoundId && !roundStatus) status = 'Verificando o andamento da rodada';
+    else if (c.state === 'active') status = c.nextRunAt ? 'Aguardando próximo horário de rodada' : 'Verificando a próxima execução permitida';
+    else if (c.state === 'paused') status = c.pauseReason === 'connection' ? 'Pausada por conexão — aguardando recuperação' : 'Pausada — requer retomada autorizada';
+    else if (c.state === 'draft') status = 'Rascunho — nenhum envio autorizado';
+    else if (c.state === 'stopped') status = 'Encerrada — nenhum envio agendado';
+    const scheduled = c.nextRunAt ?? runtime.nextRoundAt ?? operation.nextRoundAt;
+    const confirmed = c.state === 'active' && Number.isFinite(scheduled) && scheduled > 0 ? scheduled : null;
+    const estimate = runningRound && !confirmed && Number.isFinite(runtime.nextRoundEstimateAt) && runtime.nextRoundEstimateAt > 0 ? runtime.nextRoundEstimateAt : null;
+    const next = confirmed || estimate;
+    const nextLabel = estimate ? 'Próxima após esta rodada (previsão)' : 'Próxima rodada';
+    const nextText = next ? format(next) : stoppingRound ? 'Nenhuma nova rodada durante a interrupção' : runningRound ? 'A calcular ao concluir a rodada' : c.state === 'paused' ? 'Sem próxima rodada enquanto pausada' : c.state === 'draft' ? 'Nenhuma rodada autorizada' : c.state === 'stopped' ? 'Nenhuma nova rodada agendada' : 'Aguardando cálculo do agendamento';
+    const sourceCounts = runtime.roundCounts || operation.roundCounts;
+    const counts = sourceCounts && typeof sourceCounts === 'object' ? Object.fromEntries(['queued', 'sending', 'accepted', 'confirmed', 'delivered', 'uncertain', 'failed', 'cancelled'].filter(key => Number.isFinite(sourceCounts[key]) && sourceCounts[key] >= 0).map(key => [key, Math.floor(sourceCounts[key])])) : null;
+    const countLabels = { queued: 'aguardando', sending: 'em envio', accepted: 'aceitos pela integração', confirmed: 'aceitos pela integração', delivered: 'entregas confirmadas', uncertain: 'incertos', failed: 'falhas', cancelled: 'cancelados' };
+    const progress = counts ? Object.entries(counts).filter(([key]) => key !== 'confirmed' || counts.accepted === undefined).map(([key, value]) => `${value} ${countLabels[key]}`).join(' · ') : '';
+    return { last, next, nextLabel, nextText, nextIsEstimate: Boolean(estimate), runningRound, stoppingRound, roundStatus, status, progress, lastResultAt: runtime.lastResultAt || null, authorizedAt: c.executionAuthorization?.at || null, authorizedDate: c.executionAuthorization?.dateKey || '', authorizedTimezone: c.executionAuthorization?.timezone || '' };
   }
-  function renderTiming(campaign) {
-    const value = timing(campaign);
-    return `<div class="campaign-timing"><span><small>Última rodada prevista</small><strong>${escape(format(value.last))}</strong></span><span><small>Próxima rodada</small><strong>${escape(format(value.next))}</strong></span></div><span class="table-subtitle recovery-status">${escape(value.status)}</span>${campaign?.roundAnchorAt ? `<span class="table-subtitle">Intervalo contado desde: ${escape(format(campaign.roundAnchorAt))}</span>` : ''}${value.authorizedAt ? `<span class="table-subtitle">Iniciada: ${escape(format(value.authorizedAt))} · ${escape(value.authorizedTimezone || 'fuso do computador')}</span>` : ''}`;
+  function renderTiming(campaign, operation = {}) {
+    const value = timing(campaign, operation);
+    return `<div class="campaign-timing"><span><small>Última rodada prevista</small><strong>${escape(format(value.last))}</strong></span><span><small>${escape(value.nextLabel)}</small><strong>${escape(value.nextText)}</strong></span></div><span class="table-subtitle recovery-status">${escape(value.status)}</span>${value.progress ? `<span class="table-subtitle campaign-round-progress">Rodada: ${escape(value.progress)}</span>` : ''}${value.lastResultAt ? `<span class="table-subtitle">Último resultado registrado: ${escape(format(value.lastResultAt))}</span>` : ''}${campaign?.roundAnchorAt ? `<span class="table-subtitle">Intervalo contado desde: ${escape(format(campaign.roundAnchorAt))}</span>` : ''}${value.authorizedAt ? `<span class="table-subtitle">Iniciada: ${escape(format(value.authorizedAt))} · ${escape(value.authorizedTimezone || 'fuso do computador')}</span>` : ''}`;
   }
   function activeIncidents(snapshot) {
     const d = snapshot || {}, mode = d.storageMode || d.settings?.integrationMode || d.connection?.mode;

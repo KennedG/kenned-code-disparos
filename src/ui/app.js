@@ -184,7 +184,7 @@
 
   function campaignTable(list,compact=false) {
     if (!list.length) return empty('campaign','Sua próxima campanha começa aqui','Crie uma sequência, selecione seus grupos e revise a programação antes de ativar.','new-campaign','Criar campanha');
-    return `<div class="table-scroll"><table><thead><tr><th>CAMPANHA</th><th>STATUS</th><th>DESTINOS</th><th>FREQUÊNCIA</th><th>PROGRAMAÇÃO</th><th>AÇÕES</th></tr></thead><tbody>${list.map(c => `<tr><td><span class="table-name">${e(c.name)}</span><span class="table-subtitle">${e(short(c.id))} · ${(c.items||[]).length} conteúdo(s) · ${c.mode==='rotate'?'Alternar sequência':'Repetir conjunto'}</span></td><td>${badge(c.state)}<span class="table-subtitle recovery-status">${e(recoveryUI.timing(c).status)}</span></td><td>${(c.groupIds||[]).length} grupos</td><td>${e(c.intervalMinutes)} min<span class="table-subtitle">${e(c.spacingSeconds)}s entre grupos</span></td><td>${recoveryUI.renderTiming(c)}</td><td><div class="row-actions">${button('preview','Prévia','small ghost',c.id,'eye')}${button('send-now','Enviar campanha agora','small primary',c.id,'play')}${c.state==='active'?button('pause','Pausar','small',c.id,'pause'):button(c.state==='paused'?'resume':'activate',c.state==='paused'?'Retomar':'Ativar','small primary',c.id,'play')}${compact?'':button('source-monitor','Acompanhar','small ghost',c.id,'history')+button('edit-campaign','Editar','small ghost',c.id,'edit')}</div></td></tr>`).join('')}</tbody></table></div>`;
+    return `<div class="table-scroll"><table><thead><tr><th>CAMPANHA</th><th>STATUS</th><th>DESTINOS</th><th>FREQUÊNCIA</th><th>PROGRAMAÇÃO</th><th>AÇÕES</th></tr></thead><tbody>${list.map(c => `<tr><td><span class="table-name">${e(c.name)}</span><span class="table-subtitle">${e(short(c.id))} · ${(c.items||[]).length} conteúdo(s) · ${c.mode==='rotate'?'Alternar sequência':'Repetir conjunto'}</span></td><td>${badge(c.state)}<span class="table-subtitle recovery-status">${e(recoveryUI.timing(c,data().campaignOps?.[c.id]).status)}</span></td><td>${(c.groupIds||[]).length} grupos</td><td>${e(c.intervalMinutes)} min<span class="table-subtitle">${e(c.spacingSeconds)}s entre grupos</span></td><td>${recoveryUI.renderTiming(c,data().campaignOps?.[c.id])}</td><td><div class="row-actions">${button('preview','Prévia','small ghost',c.id,'eye')}${button('send-now','Enviar campanha agora','small primary',c.id,'play')}${c.state==='active'?button('pause','Pausar','small',c.id,'pause'):button(c.state==='paused'?'resume':'activate',c.state==='paused'?'Retomar':'Ativar','small primary',c.id,'play')}${compact?'':button('source-monitor','Acompanhar','small ghost',c.id,'history')+button('edit-campaign','Editar','small ghost',c.id,'edit')}</div></td></tr>`).join('')}</tbody></table></div>`;
   }
 
   function renderDashboard() {
@@ -338,7 +338,7 @@
 
   function renderReports() {
     const m=data().metrics||{};
-    return pageTitle('Resultados das suas campanhas','Relatórios','Totais persistentes das campanhas que seu perfil permite consultar.',button('export-reports','Exportar relatório','','','upload'))+`<div class="stats-grid">${[['Aceitos pela integração',m.confirmed||0],['Falhas',m.failed||0],['Incertos',m.uncertain||0],['Campanhas ativas',m.activeCampaigns||0]].map(([label,value])=>`<div class="stat-card"><div class="stat-top">${e(label)}</div><div class="stat-value">${number(value)}</div></div>`).join('')}</div>`+panel('Programação cadastrada',`<div class="table-scroll"><table><thead><tr><th>CAMPANHA</th><th>STATUS</th><th>DESTINOS</th><th>CONTEÚDOS</th><th>PRÓXIMA RODADA</th></tr></thead><tbody>${campaigns().map(c=>`<tr><td>${e(c.name)}</td><td>${badge(c.state)}<span class="table-subtitle recovery-status">${e(recoveryUI.timing(c).status)}</span></td><td>${c.groupIds.length}</td><td>${c.items.length}</td><td>${e(fmt(c.nextRunAt))}</td></tr>`).join('')}</tbody></table></div>`)+`<div class="info-note">A limpeza de históricos remove os registros de consulta selecionados. Estes totais usam o controle operacional preservado para impedir duplicidade. Confirmação indica aceitação pelo serviço, não leitura.</div>`;
+    return pageTitle('Resultados das suas campanhas','Relatórios','Totais persistentes das campanhas que seu perfil permite consultar.',button('export-reports','Exportar relatório','','','upload'))+`<div class="stats-grid">${[['Aceitos pela integração',m.confirmed||0],['Falhas',m.failed||0],['Incertos',m.uncertain||0],['Campanhas ativas',m.activeCampaigns||0]].map(([label,value])=>`<div class="stat-card"><div class="stat-top">${e(label)}</div><div class="stat-value">${number(value)}</div></div>`).join('')}</div>`+panel('Programação cadastrada',`<div class="table-scroll"><table><thead><tr><th>CAMPANHA</th><th>STATUS</th><th>DESTINOS</th><th>CONTEÚDOS</th><th>PRÓXIMA RODADA</th></tr></thead><tbody>${campaigns().map(c=>`<tr><td>${e(c.name)}</td><td>${badge(c.state)}<span class="table-subtitle recovery-status">${e(recoveryUI.timing(c,data().campaignOps?.[c.id]).status)}</span></td><td>${c.groupIds.length}</td><td>${c.items.length}</td><td>${e(fmt(c.nextRunAt))}</td></tr>`).join('')}</tbody></table></div>`)+`<div class="info-note">A limpeza de históricos remove os registros de consulta selecionados. Estes totais usam o controle operacional preservado para impedir duplicidade. Confirmação indica aceitação pelo serviço, não leitura.</div>`;
   }
 
   function diagnosticText(row) {
@@ -711,7 +711,8 @@
       case 'resume': await showPreview(id,true,true);break;
       case 'confirm-activation': {
         const m=state.modal;
-        await perform(m.immediate?'sendCampaignNow':m.resume?'resumeCampaign':'activateCampaign',{id,requestId:m.requestId,revision:m.revision,configRevision:m.configRevision,summaryState:m.summaryState},m.immediate?'Rodada imediata solicitada. Próximos horários contados a partir deste início.':m.resume?'Campanha retomada.':'Campanha ativada.');
+        const activation = await perform(m.immediate?'sendCampaignNow':m.resume?'resumeCampaign':'activateCampaign',{id,requestId:m.requestId,revision:m.revision,configRevision:m.configRevision,summaryState:m.summaryState},m.immediate?null:m.resume?'Campanha retomada.':'Campanha ativada.');
+        if(m.immediate) toast(activation?.executionAlreadyRunning?'A rodada já está enviando e continuará sem reiniciar.':'Rodada solicitada. Acompanhe o processamento e as confirmações no painel.');
         closeModal();break;
       }
       case 'pause': await perform('pauseCampaign',{id},'Campanha pausada.');break;
@@ -832,6 +833,11 @@
       }
     }catch(error){if(el.dataset.authorizeGroup)el.checked=!el.checked;toast(error.message,true);}
   });
+
+  document.addEventListener('toggle',event=>{
+    const el=event.target;
+    if(el?.isConnected&&el.closest?.('#opportunity-page'))opportunityUI?.onToggle(el);
+  },true);
 
   document.addEventListener('input',event=>{
     const el=event.target;

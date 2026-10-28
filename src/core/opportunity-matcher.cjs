@@ -178,6 +178,40 @@ function stableOfferIdentity(item = {}, campaign = {}, media = {}, { offer = {},
 }
 
 function timestamp(value) { const n = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN; return Number.isSafeInteger(n) && n > 0 ? n : null; }
+function singleAnnouncementDetails(rawText, offer, aliases) {
+  // A shop announcement commonly puts these labelled attributes before the
+  // price. The shared multi-product parser cannot safely carry arbitrary lines
+  // through a list; here there is exactly one parsed offer and one model.
+  const spans = modelSpans(normalize(rawText, aliases));
+  if (new Set(spans.map(span => span.text)).size > 1) return offer;
+  const values = { colorKey: [], storageGB: [], condition: [], batteryPercent: [] };
+  for (const line of String(rawText).split(/\r?\n/)) {
+    const folded = line.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/^[^\p{L}\p{N}]+/u, '').trim();
+    const label = folded.match(/^(cor|color|memoria|armazenamento|capacidade|condicao)\s*[:=\-]\s*(.+)$/i);
+    if (label) {
+      const q = parseQuery(`${offer.model} ${label[2]}`, { aliases });
+      if (q.valid) {
+        const field = /^(cor|color)$/i.test(label[1]) ? 'colorKey' : /^condicao$/i.test(label[1]) ? 'condition' : 'storageGB';
+        if (q[field] != null) values[field].push({ value: q[field], color: q.color });
+      }
+    }
+    const battery = normalize(line, aliases).match(/^(?:saude(?: da bateria)?|bateria|battery)\s*(?:em|de)?\s*(\d{1,3})\b/);
+    if (battery && Number(battery[1]) <= 100) values.batteryPercent.push({ value: Number(battery[1]) });
+  }
+  const result = { ...offer }, reasons = [...(offer.reviewReasons || [])];
+  for (const [field, found] of Object.entries(values)) {
+    const unique = [...new Set(found.map(value => value.value))];
+    if (!unique.length) continue;
+    if (unique.length > 1 || offer[field] != null && offer[field] !== unique[0]) {
+      result[field] = null; if (field === 'colorKey') result.color = null;
+      reasons.push(`ambiguous_labelled_${field}`); result.confidence = 'review'; continue;
+    }
+    result[field] = unique[0]; if (field === 'colorKey') result.color = found.find(value => value.value === unique[0]).color;
+  }
+  result.reviewReasons = [...new Set(reasons)];
+  result.productKey = [result.modelKey, result.storageGB ?? '?', result.colorKey ?? '?', result.condition ?? '?'].join('|');
+  return result;
+}
 function parseCampaignOffer(item = {}, campaign = {}, media = {}, options = {}) {
   if (item.captureDeleted === true || item.ready === false || item.captureStatus && item.captureStatus !== 'ready' || !['text', 'image', 'video', 'document'].includes(item.type)) return [];
   const rawText = typeof item.caption === 'string' ? item.caption : typeof item.text === 'string' ? item.text : '';
@@ -199,7 +233,8 @@ function parseCampaignOffer(item = {}, campaign = {}, media = {}, options = {}) 
     for (const match of normalized.matchAll(/\b(\d{1,4})\s*(?:unidades?|aparelhos?|pecas?)\s*(?:disponiveis|em estoque)?\b/g)) quantities.push(Number(match[1]));
     const unique = [...new Set(quantities)]; if (unique.length === 1) quantityAvailable = unique[0];
   }
-  return parsed.map((offer, ordinal) => {
+  return parsed.map((originalOffer, ordinal) => {
+    const offer = parsed.length === 1 ? singleAnnouncementDetails(rawText, originalOffer, options.aliases) : originalOffer;
     const identity = stableOfferIdentity(item, campaign, media, { offer, ordinal });
     if (parsed.length > 1) {
       // Without one original unit reference per option, reordered/edited list
@@ -244,4 +279,4 @@ function matchOffer(spec, offer, { now = Date.now(), availabilityMaxAgeMinutes =
   return { eligible: true, code: 'MATCH_CONFIRMED', reason: campaignMode ? 'Pedido exato e item habilitado em uma campanha selecionada.' : 'Pedido e oferta compatíveis com disponibilidade confirmada.', needsReview: false };
 }
 
-module.exports = { parseRequest, classifyPurchaseIntent, closureRequest, parseCampaignOffer, matchOffer, stableOfferIdentity };
+module.exports = { parseRequest, classifyPurchaseIntent, closureRequest, parseCampaignOffer, matchOffer, stableOfferIdentity, materialFingerprint };

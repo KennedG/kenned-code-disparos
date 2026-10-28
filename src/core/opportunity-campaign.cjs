@@ -11,7 +11,7 @@ function campaignItemFingerprint(item = {}, campaign = {}, { source, media } = {
     source: item.sourcePublicationId ? source ? { id: source.id, status: source.status, revisionAt: source.revisionAt, originalAt: source.originalAt } : { missing: true } : null,
     media: item.mediaId ? media ? { id: media.id, sha256: media.sha256 || media.hash || null, path: media.path || media.filePath || null, size: media.size ?? null, status: media.status || null } : { missing: true } : null })).digest('hex');
 }
-function assessCampaignItem(item, campaign, { source, media, availabilityMode = 'campaign' } = {}) {
+function assessCampaignItem(item, campaign, { source, media, availabilityMode = 'campaign', manualSelection = false } = {}) {
   const blocked = (code, reason, available = false) => ({ eligible: false, blocker: { code, reason }, availabilityDeclared: false, availabilitySource: availabilityMode, available,
     availabilityConfirmedAt: null, quantityAvailable: quantity(item), identityReference: null });
   if (!item || !campaign || !item.id || !campaign.id) return blocked('OFFER_CAMPAIGN_ITEM_MISSING', 'O anúncio não está mais na campanha selecionada.');
@@ -22,7 +22,8 @@ function assessCampaignItem(item, campaign, { source, media, availabilityMode = 
   const state = normalize(item.status || item.state || item.availability?.status);
   if (item.sold === true || item.reserved === true || ['sold', 'vendido', 'vendida', 'reserved', 'reservado', 'reservada', 'deleted', 'removed', 'cancelled', 'unavailable'].includes(state) || /\b(?:nao disponive(?:l|is)|indisponive(?:l|is)|esgotad[oa]s?|sem estoque|vendid[oa]s?|reservad[oa]s?|nao tenho mais)\b/.test(text)) return blocked('OFFER_UNAVAILABLE', 'O anúncio informa aparelho vendido, reservado ou indisponível.');
   if (item.available === false || item.availability?.available === false || quantity(item) === 0) return blocked('OFFER_UNAVAILABLE', 'O anúncio foi marcado como indisponível.');
-  if (/\b(?:sob encomenda|por encomenda|a confirmar|sujeito a disponibilidade|consulte (?:o )?estoque|consultar (?:o )?estoque)\b/.test(text)) return blocked('OFFER_AVAILABILITY_CONDITIONAL', 'Anúncio sob encomenda ou com disponibilidade a confirmar; revisão necessária.', null);
+  const conditional = /\b(?:sob encomenda|por encomenda|a confirmar|sujeito a disponibilidade|consulte (?:o )?estoque|consultar (?:o )?estoque)\b/.test(text);
+  if (conditional && !manualSelection) return blocked('OFFER_AVAILABILITY_CONDITIONAL', 'Anúncio sob encomenda ou com disponibilidade a confirmar; revisão necessária.', null);
   if (item.sourcePublicationId) {
     if (!source) return blocked('OFFER_SOURCE_MISSING', 'A referência original do anúncio não está disponível; revise a campanha.');
     if (source.status !== 'ready') return blocked(source.status === 'removed' ? 'OFFER_SOURCE_REMOVED' : 'OFFER_SOURCE_NOT_READY', source.status === 'removed' ? 'A publicação original foi retirada; a cópia não pode ser oferecida automaticamente.' : 'A publicação original está pendente ou em revisão; confirme o conteúdo antes de oferecer.', source.status === 'removed' ? false : null);
@@ -31,7 +32,7 @@ function assessCampaignItem(item, campaign, { source, media, availabilityMode = 
   if (item.type !== 'text' && (!item.mediaId || !media || media.status === 'removed' || media.status === 'error')) return blocked('OFFER_MEDIA_MISSING', 'A mídia do anúncio não está disponível; revise antes de oferecer.', null);
   const stated = /\b(?:disponivel|disponiveis|pronta entrega|a pronta entrega|tenho em estoque|em estoque|ainda disponivel)\b/.test(text);
   const available = availabilityMode === 'campaign' || item.available === true || item.availability?.available === true || stated ? true : null;
-  return { eligible: true, blocker: null, availabilityDeclared: availabilityMode === 'campaign', availabilitySource: availabilityMode, available,
+  return { eligible: true, blocker: null, availabilityDeclared: availabilityMode === 'campaign', availabilitySource: availabilityMode, available, availabilityConditional: conditional,
     availabilityConfirmedAt: stamp(item.availability?.confirmedAt ?? item.availabilityConfirmedAt) || (stated ? stamp(source?.originalAt ?? item.sourceOriginalAt ?? item.originalAt ?? campaign.createdAt) : null),
     quantityAvailable: quantity(item), identityReference: `campaign-item:${item.id}` };
 }

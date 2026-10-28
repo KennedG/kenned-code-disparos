@@ -422,7 +422,7 @@ class WhatsAppAdapter extends EventEmitter {
           this._opportunityUpdate(event);
           if (Number(event.update?.status) >= 2 && (event.key?.fromMe || this.pendingAcks.has(event.key?.id))) {
             const status = Number(event.update.status);
-            this._ack(event.key.id, { confirmationScope: status >= 4 ? 'whatsapp-read' : status >= 3 ? 'whatsapp-delivered' : 'whatsapp-server' });
+            this._ack(event.key.id, { confirmationScope: status >= 4 ? 'whatsapp-read' : status >= 3 ? 'whatsapp-delivered' : 'whatsapp-server', targetId: event.key.remoteJid });
           }
           if (Number(event.update?.status) === 0 && event.key?.fromMe) {
             const targetId = this.pendingAcks.get(event.key.id)?.targetId || this.submittedOutcomes.get(event.key.id)?.targetId || event.key.remoteJid;
@@ -460,7 +460,7 @@ class WhatsAppAdapter extends EventEmitter {
           if (event.key?.fromMe && (event.receipt?.receiptTimestamp || event.receipt?.readTimestamp || event.receipt?.playedTimestamp)) {
             const deliveredAt = messageTimestamp(event.receipt.receiptTimestamp);
             const readAt = messageTimestamp(event.receipt.readTimestamp || event.receipt.playedTimestamp);
-            this._ack(event.key.id, { confirmationScope: readAt ? 'whatsapp-read' : 'whatsapp-delivered', ...(deliveredAt ? { deliveredAt } : {}), ...(readAt ? { readAt } : {}) });
+            this._ack(event.key.id, { confirmationScope: readAt ? 'whatsapp-read' : 'whatsapp-delivered', targetId: event.key.remoteJid, ...(deliveredAt ? { deliveredAt } : {}), ...(readAt ? { readAt } : {}) });
           }
         }
       });
@@ -767,8 +767,9 @@ class WhatsAppAdapter extends EventEmitter {
   async reconcile(messageId) {
     if (typeof messageId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(messageId)) throw definitiveError('Identificador de mensagem inválido.', false, 'WA_MESSAGE_ID_INVALID');
     const outcome = this.submittedOutcomes.get(messageId);
-    const delivered = this.deliveryProofs.get(messageId);
-    if (this.receipts.has(messageId) || outcome?.status === 'confirmed') return { status: 'confirmed', messageId, confirmed: true, accepted: true, delivered: Boolean(delivered), confirmationScope: delivered?.confirmationScope || 'whatsapp-server', ...(delivered || {}), source: 'authenticated-receipt-cache', mode: 'whatsapp', simulation: false };
+    const durable = this.store?.getOutboundProof?.(messageId);
+    const delivered = this.deliveryProofs.get(messageId) || durable;
+    if (this.receipts.has(messageId) || outcome?.status === 'confirmed' || durable) return { status: 'confirmed', messageId, confirmed: true, accepted: true, delivered: ['whatsapp-delivered', 'whatsapp-read'].includes(delivered?.confirmationScope), confirmationScope: delivered?.confirmationScope || 'whatsapp-server', ...(delivered || {}), source: durable ? 'authenticated-durable-receipt' : 'authenticated-receipt-cache', mode: 'whatsapp', simulation: false };
     if (outcome?.status === 'failed') return { ...outcome, messageId, confirmed: true, source: 'authenticated-rejection', mode: 'whatsapp', simulation: false };
     // rc14 provides receipt events but no authoritative historical lookup by message ID.
     // Absence in a local cache never proves that WhatsApp did not receive the message.
@@ -1301,20 +1302,41 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   _ack(messageId, proof = {}) {
-    if (!messageId || !this._isAutomaticMessage(messageId)) return;
-    const targetId = this.pendingAcks.get(messageId)?.targetId || this.submittedOutcomes.get(messageId)?.targetId;
-    const previouslyAccepted = this.receipts.has(messageId);
-    const previousProof = this.deliveryProofs.get(messageId);
+    if (!messageId) return;
+    // A bounded L1 cache cannot establish deduplication after thousands of
+    // group receipts or a restart. The private operational ledger records only
+    // monotonic aggregate proof, never participants, text or raw protocol data.
+    const durable = this.store?.getOutboundProof?.(messageId);
+    if (!durable && !this._isAutomaticMessage(messageId)) return;
+    const knownTarget = this.pendingAcks.get(messageId)?.targetId || this.submittedOutcomes.get(messageId)?.targetId || durable?.targetId;
+    const eventTarget = typeof proof.targetId === 'string' && /^(?:\d+(?:-\d+)?@g\.us|\d+(?::\d+)?@(s\.whatsapp\.net|lid))$/.test(proof.targetId) ? proof.targetId.replace(/:\d+(?=@)/, '') : null;
+    if (knownTarget && eventTarget && knownTarget !== eventTarget && (knownTarget.endsWith('@g.us') || eventTarget.endsWith('@g.us'))) return;
+    const targetId = knownTarget || eventTarget;
+    const previousProof = this.deliveryProofs.get(messageId) || durable;
+    const previouslyAccepted = this.receipts.has(messageId) || Boolean(durable);
     const ranks = { 'whatsapp-server': 1, 'whatsapp-delivered': 2, 'whatsapp-read': 3 };
     const previousRank = previouslyAccepted ? ranks[previousProof?.confirmationScope || 'whatsapp-server'] : 0;
     const scope = proof.confirmationScope || 'whatsapp-server';
-    if (previousRank >= ranks[scope]) return;
-    const acceptedAt = this.receipts.get(messageId) || Date.now();
+    if (!ranks[scope] || previousRank >= ranks[scope]) return;
+    const acceptedAt = durable?.acceptedAt ?? this.receipts.get(messageId) ?? Date.now();
+    let observed = { ...previousProof, ...proof, messageId, acceptedAt, confirmationScope: scope, ...(targetId ? { targetId } : {}) };
+    let persistenceFailed = false;
+    if (typeof this.store?.advanceOutboundProof === 'function') {
+      try {
+        const saved = this.store.advanceOutboundProof(messageId, observed);
+        if (saved?.proof) observed = saved.proof;
+        if (saved?.changed === false) return;
+      } catch {
+        // The receipt was observed, so preserve that evidence in memory and
+        // settle an in-flight attempt truthfully. Refuse new traffic until the
+        // persistence problem is reviewed; never resubmit the observed message.
+        persistenceFailed = true;
+      }
+    }
     this.receipts.set(messageId, acceptedAt);
-    this._rememberOutcome(messageId, 'confirmed');
-    if (proof.confirmationScope === 'whatsapp-delivered' || proof.confirmationScope === 'whatsapp-read') {
-      const previous = this.deliveryProofs.get(messageId) || {};
-      this.deliveryProofs.set(messageId, { ...previous, ...proof, ...(previous.confirmationScope === 'whatsapp-read' ? { confirmationScope: 'whatsapp-read' } : {}) });
+    this._rememberOutcome(messageId, 'confirmed', targetId);
+    if (scope !== 'whatsapp-server') {
+      this.deliveryProofs.set(messageId, observed);
       while (this.deliveryProofs.size > 1000) this.deliveryProofs.delete(this.deliveryProofs.keys().next().value);
     }
     while (this.receipts.size > 1000) this.receipts.delete(this.receipts.keys().next().value);
@@ -1322,10 +1344,15 @@ class WhatsAppAdapter extends EventEmitter {
     if (pending) {
       clearTimeout(pending.timer);
       this.pendingAcks.delete(messageId);
-      pending.resolve({ status: 'confirmed', messageId, ...(this.deliveryProofs.get(messageId) || {}) });
+      pending.resolve({ status: 'confirmed', messageId, ...(scope === 'whatsapp-server' ? proof : observed), ...(persistenceFailed ? { operationalPersistenceFailed: true } : {}) });
     }
-    this.emit('receipt', { messageId, status: 'confirmed', accepted: true, acceptedAt, delivered: scope === 'whatsapp-delivered' || scope === 'whatsapp-read', mode: 'whatsapp', simulation: false, confirmationScope: 'whatsapp-server', ...proof });
-    this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, proof.confirmationScope === 'whatsapp-read' || proof.confirmationScope === 'whatsapp-delivered' ? 'transport.delivered' : 'transport.accepted', proof.confirmationScope === 'whatsapp-read' ? 'WA_MESSAGE_READ' : proof.confirmationScope === 'whatsapp-delivered' ? 'WA_MESSAGE_DELIVERED' : 'WA_SERVER_ACCEPTED', proof.confirmationScope === 'whatsapp-read' ? 'Leitura confirmada pelo recibo disponibilizado pelo WhatsApp.' : proof.confirmationScope === 'whatsapp-delivered' ? 'Entrega confirmada pelo recibo disponibilizado pelo WhatsApp.' : 'O servidor do WhatsApp confirmou a aceitação. Isso não comprova recebimento no celular.', { confirmationScope: proof.confirmationScope || 'whatsapp-server' });
+    if (persistenceFailed) {
+      this._status('restricted', 'Um recibo foi recebido, mas não pôde ser salvo. Novos envios pausados; confira o armazenamento antes de continuar.', { reasonCode: 'restricted', errorCode: 'WA_RECEIPT_PERSISTENCE_FAILED', retryable: false });
+      this._captureFailure('WA_RECEIPT_PERSISTENCE_FAILED', 'Recibo confirmado pelo WhatsApp mantido em memória; a gravação operacional falhou e novos envios foram pausados.');
+      return;
+    }
+    this.emit('receipt', { messageId, status: 'confirmed', accepted: true, acceptedAt, delivered: scope === 'whatsapp-delivered' || scope === 'whatsapp-read', mode: 'whatsapp', simulation: false, ...observed });
+    this._transportDiagnostic({ key: { id: messageId, remoteJid: targetId, fromMe: true } }, scope === 'whatsapp-read' || scope === 'whatsapp-delivered' ? 'transport.delivered' : 'transport.accepted', scope === 'whatsapp-read' ? 'WA_MESSAGE_READ' : scope === 'whatsapp-delivered' ? 'WA_MESSAGE_DELIVERED' : 'WA_SERVER_ACCEPTED', scope === 'whatsapp-read' ? 'Leitura confirmada pelo recibo disponibilizado pelo WhatsApp.' : scope === 'whatsapp-delivered' ? 'Entrega confirmada pelo recibo disponibilizado pelo WhatsApp.' : 'O servidor do WhatsApp confirmou a aceitação. Isso não comprova recebimento no celular.', { confirmationScope: scope });
   }
 
   _rememberOutcome(messageId, status, targetId) {
@@ -1486,7 +1513,7 @@ class WhatsAppAdapter extends EventEmitter {
   async resolveRecipient(number, { traceId } = {}) {
     try { return await this._resolveRecipient(number); }
     catch (error) {
-      if (this._validTraceId(traceId)) this._transportDiagnostic({ key: { id: '', remoteJid: /^\d{10,15}$/.test(String(number || '')) ? `${number}@s.whatsapp.net` : '', fromMe: true } }, 'transport.failed', /^[A-Z0-9_]{1,80}$/.test(error?.code || '') ? error.code : 'WA_RECIPIENT_LOOKUP_REJECTED', 'Não foi possível resolver o destinatário pela integração. Nenhuma mensagem foi submetida.', { submitted: false }, traceId);
+      if (this._validTraceId(traceId)) this._transportDiagnostic({ key: { id: '', remoteJid: /^\d{10,15}$/.test(String(number || '')) ? `${number}@s.whatsapp.net` : '', fromMe: true } }, 'transport.failed', /^[A-Z0-9_]{1,80}$/.test(error?.code || '') ? error.code : 'WA_RECIPIENT_LOOKUP_REJECTED', 'Não foi possível resolver o destinatário pela integração. Nenhuma mensagem foi submetida.', { submitted: false, ...(error?.resolutionDetails || {}) }, traceId);
       throw error;
     }
   }
@@ -1528,7 +1555,12 @@ class WhatsAppAdapter extends EventEmitter {
         const jid = accountJid(this.library?.jidNormalizedUser?.(available[0].jid) || available[0].jid);
         if (!jid) throw definitiveError('O WhatsApp retornou um identificador de destinatário inválido. Nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_INVALID_JID');
         const resolvedPhone = phoneFromJid(jid);
-        if (resolvedPhone && resolvedPhone !== digits) throw definitiveError('O WhatsApp retornou um telefone diferente do configurado. Revise o destinatário; nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_MISMATCH');
+        if (resolvedPhone && resolvedPhone !== digits) {
+          const masked = value => `${value.slice(0, 2)}…${value.slice(-4)}`;
+          const mismatch = definitiveError('O WhatsApp retornou um telefone diferente do configurado. Confira o número solicitado e a identificação mascarada em Diagnóstico; o destino não foi substituído e nenhuma mensagem foi enviada.', false, 'WA_RECIPIENT_MISMATCH');
+          mismatch.resolutionDetails = { resolutionSource: 'whatsapp-usync', requestedPhoneMasked: masked(digits), requestedPhoneLength: digits.length, returnedPhoneMasked: masked(resolvedPhone), returnedPhoneLength: resolvedPhone.length, returnedIdentifierType: 'phone-jid', identityConfirmed: false, destinationSubstituted: false, guidance: 'Confira o cadastro do responsável ou solicite uma mensagem privada desse contato para obter uma rota autenticada. Uma variação de telefone não é autorizada automaticamente.' };
+          throw mismatch;
+        }
         const result = { jid, phone: digits, requestedPhone: digits, isSelf: false, mode: 'whatsapp', simulation: false, resolutionSource: 'whatsapp-usync' };
         this._rememberContacts([{ id: jid, phoneNumber: `${digits}@s.whatsapp.net` }]);
         this.recipientCache.set(digits, { result, generation, expiresAt: Date.now() + 600000 });
@@ -1596,7 +1628,12 @@ class WhatsAppAdapter extends EventEmitter {
       if (outcome.targetId && outcome.targetId !== targetId) throw definitiveError('O identificador do envio já pertence a outro destino.');
       return { ...(outcome.status === 'failed' ? outcome : {}), status: outcome.status, messageId, ...(outcome.status === 'confirmed' ? this.deliveryProofs.get(messageId) || {} : {}) };
     }
-    if (this.receipts.has(messageId)) return { status: 'confirmed', messageId };
+    const durableProof = this.store?.getOutboundProof?.(messageId);
+    if (this.receipts.has(messageId) || durableProof) {
+      const acknowledgedTarget = durableProof?.targetId || this.submittedOutcomes.get(messageId)?.targetId || this.deliveryProofs.get(messageId)?.targetId;
+      if (!acknowledgedTarget || acknowledgedTarget !== targetId) throw definitiveError('O identificador já possui confirmação, mas pertence a outro destino ou sua rota original não está disponível. Verifique o resultado antes de reenviar.', false, 'WA_MESSAGE_DESTINATION_CONFLICT');
+      return { status: 'confirmed', messageId, ...(durableProof || this.deliveryProofs.get(messageId) || {}) };
+    }
     const socket = this.socket, generation = this.generation;
     // Publish diagnostics before the final guard: listeners may synchronously
     // pause the system or invalidate a recipient. No external event listener
