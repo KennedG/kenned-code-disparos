@@ -15,8 +15,8 @@ class SimulatedAdapter extends EventEmitter {
     this.status = { state: 'disconnected', mode: 'simulated', detail: 'Simulação local: nenhum envio pelo WhatsApp.' };
   }
 
-  _status(state, detail) {
-    this.status = { state, mode: 'simulated', detail };
+  _status(state, detail, extras = {}) {
+    this.status = { state, ...(state === 'disconnected' ? { reasonCode: 'manual', at: new Date().toISOString(), manual: true, retryable: false } : {}), ...extras, mode: 'simulated', detail };
     this.emit('status', this.status);
   }
 
@@ -25,8 +25,8 @@ class SimulatedAdapter extends EventEmitter {
     return this.status;
   }
 
-  async disconnect() {
-    this._status('disconnected', 'Simulação desconectada. Nenhum envio real foi realizado.');
+  async disconnect({ reasonCode = 'manual', manual = reasonCode === 'manual' } = {}) {
+    this._status('disconnected', 'Simulação desconectada. Nenhum envio real foi realizado.', { reasonCode, manual: Boolean(manual), retryable: !manual && !['restricted', 'session_expired'].includes(reasonCode) });
   }
 
   async listGroups() {
@@ -64,14 +64,44 @@ class SimulatedAdapter extends EventEmitter {
     }
     const messageId = item.clientMessageId || `SIM-${randomUUID()}`;
     this.sent.push({ groupId, item: { ...item }, mediaId: media?.id, messageId, at: new Date().toISOString(), simulation: true });
+    if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);
     if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
     const result = { status: outcome === 'uncertain' ? 'uncertain' : 'confirmed', messageId };
     if (result.status === 'confirmed') this.emit('receipt', { messageId, status: 'confirmed', simulation: true });
     return result;
   }
 
+  async sendPrivate(number, text, { clientMessageId } = {}) {
+    if (!/^\d{10,15}$/.test(String(number || ''))) throw Object.assign(new Error('Telefone privado inválido. Use código do país e DDD.'), { safeToRetry: false });
+    if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw Object.assign(new Error('Alerta privado inválido.'), { safeToRetry: false });
+    if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
+    const outcome = this.nextOutcome || 'confirmed';
+    this.nextOutcome = null;
+    if (outcome === 'failed') throw Object.assign(new Error('Falha temporária simulada antes do alerta.'), { safeToRetry: true });
+    const messageId = clientMessageId || `SIM-PRIVATE-${randomUUID()}`;
+    const existing = this.sent.find(entry => entry.messageId === messageId);
+    if (existing) return { status: existing.status || 'uncertain', messageId, simulation: true };
+    this.sent.push({ privateNumber: String(number), text, messageId, at: new Date().toISOString(), simulation: true, status: outcome });
+    if (this.sent.length > 1000) this.sent.splice(0, this.sent.length - 1000);
+    if (this.delayMs > 0) await new Promise(resolve => setTimeout(resolve, this.delayMs));
+    const status = outcome === 'uncertain' ? 'uncertain' : 'confirmed';
+    if (status === 'confirmed') this.emit('receipt', { messageId, status, simulation: true });
+    return { status, messageId, simulation: true };
+  }
+
+  setNetworkOnline(online) { return this.setNetworkState({ online }); }
+
+  setNetworkState(value) {
+    const online = typeof value === 'boolean' ? value : value?.online;
+    if (typeof online !== 'boolean') throw new Error('Estado de rede inválido.');
+    if (online === false && this.status.state === 'connected') this._status('disconnected', 'Queda de rede simulada: nenhum envio real.', { reasonCode: 'internet', manual: false, retryable: true, errorCode: 'NETWORK_OFFLINE' });
+    return this.status;
+  }
+
   async reply(chatId, text) {
+    if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     this.replies.push({ chatId, text: String(text), at: new Date().toISOString(), simulation: true });
+    if (this.replies.length > 1000) this.replies.splice(0, this.replies.length - 1000);
     this.emit('reply', this.replies[this.replies.length - 1]);
     return { status: 'confirmed', messageId: `SIM-REPLY-${randomUUID()}` };
   }

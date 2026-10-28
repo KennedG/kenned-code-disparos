@@ -1,102 +1,165 @@
 
-> mega-disparos@1.0.1 test
+> mega-disparos@2.0.0 test
 > node scripts/test.cjs
 
 
 adapter.test.cjs
-✔ simulação identifica grupos fictícios e oferece falha antes do envio e resultado incerto (3.349168ms)
-✔ integração real exige Windows e proteção do sistema operacional (0.780686ms)
-✔ sessão e chaves ficam cifradas e gravadas atomicamente, sem arquivos de texto de autenticação (48.509096ms)
-✔ sendMessage sem ACK retorna incerto; ACK autenticado confirma inclusive após timeout (36.921724ms)
-✔ erro após submissão não autoriza retentativa e restrição pausa transporte (14.120533ms)
-✔ desconexão libera envio pendente como incerto sem aguardar um transporte travado (5.535067ms)
-✔ tempo de submissão encerra transporte travado e registra resultado incerto sem retentativa (28.219168ms)
-✔ reconectar cria outro transporte e preserva a sessão cifrada (9.442409ms)
-✔ logout confirmado remove a sessão inválida e aguarda conexão explícita (6.307758ms)
-✔ sessão cifrada corrompida permanece bloqueada até remoção explícita (5.871555ms)
-✔ resposta de controle travada tem prazo e encerra transporte sem repetir (23.260435ms)
-✔ download atrasado tem prazo e destrói um stream que chega depois sem fornecer mídia (24.061376ms)
-✔ download que para após alguns bytes é rejeitado sem retornar conteúdo parcial (23.984329ms)
-✔ mídia usa bytes verificados da biblioteca e rejeita caminho externo ou conteúdo alterado (6.253013ms)
-✔ identidade vem do protocolo, LID sem número é rejeitado e histórico/replay não entram (1.813539ms)
-ℹ tests 15
+✔ simulação identifica grupos fictícios e oferece falha antes do envio e resultado incerto (4.313954ms)
+✔ integração real exige Windows e proteção do sistema operacional (0.756567ms)
+✔ sessão e chaves ficam cifradas e gravadas atomicamente, sem arquivos de texto de autenticação (24.987258ms)
+✔ sendMessage sem ACK retorna incerto; ACK autenticado confirma inclusive após timeout (32.436344ms)
+✔ erro após submissão não autoriza retentativa e restrição pausa transporte (3.339157ms)
+✔ desconexão libera envio pendente como incerto sem aguardar um transporte travado (2.157086ms)
+✔ tempo de submissão encerra transporte travado e registra resultado incerto sem retentativa (22.534529ms)
+✔ reconectar cria outro transporte e preserva a sessão cifrada (3.350294ms)
+✔ logout confirmado remove a sessão inválida e aguarda conexão explícita (2.943525ms)
+✔ sessão cifrada corrompida permanece bloqueada até remoção explícita (4.519237ms)
+✔ resposta de controle travada tem prazo e encerra transporte sem repetir (22.379359ms)
+✔ download atrasado tem prazo e destrói um stream que chega depois sem fornecer mídia (23.35978ms)
+✔ download que para após alguns bytes é rejeitado sem retornar conteúdo parcial (22.571398ms)
+✔ mídia usa bytes verificados da biblioteca e rejeita caminho externo ou conteúdo alterado (5.507357ms)
+✔ identidade vem do protocolo, LID sem número é rejeitado e histórico/replay não entram (2.13322ms)
+✔ bridge assíncrona de proteção cifra e restaura credenciais antes de criar transporte (3.580371ms)
+✔ alerta privado valida telefone e não mostra confirmado sem ACK autenticado (16.610972ms)
+✔ alertas privados concorrentes compartilham submissão e aguardam confirmação (1.449315ms)
+✔ queda de internet fecha transporte, mantém sessão e marca envio pendente como incerto (3.127273ms)
+✔ motivos de sessão expirada, restrição e erro de rede são tipados sem expor segredos (1.974454ms)
+✔ buffers de simulação têm limite e alerta incerto continua incerto sem novo envio (10.642792ms)
+✔ gravação protegida agrupa rajadas e aguarda atualizações que chegam durante a cifra (7.091959ms)
+✔ falha de proteção em uma rajada produz um único evento e encerra a conexão com segurança (1.283015ms)
+✔ falha tardia do transporte antigo não restringe a nova conexão (1.567434ms)
+ℹ tests 24
 ℹ suites 0
-ℹ pass 15
+ℹ pass 24
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 250.904838
+ℹ duration_ms 233.918185
+
+alerts.test.cjs
+✔ one occurrence queues one alert per distinct authorized recipient and uses the original failure time (19.426517ms)
+✔ reconnection flushes pending alerts sequentially with server confirmation and preserves failure timestamp (1.511775ms)
+✔ ambiguous alert result never retries; late ACK reconciles only its durable message identifier (0.826767ms)
+✔ a crash during alert submission recovers to uncertain and never performs a second network request (0.415712ms)
+✔ only safe presubmission alert failures retry using bounded configurable delays and the same identifier (1.171814ms)
+✔ private test uses the real transport path and an uncertain result requires an audited explicit review (1.238864ms)
+✔ disconnect notifications deduplicate a failure, omit manual disconnects and create a new occurrence after reconnection (3.900815ms)
+✔ automatic resume is opt-in and only resumes previously active unchanged connection-paused campaigns (2.744982ms)
+✔ independent HTTPS channel is marked channel acceptance and works while WhatsApp is disconnected (1.017459ms)
+✔ notification muting persists and cleanup does not recreate the local occurrence on restart (2.822339ms)
+✔ alert message exposes campaign outcome counts without credentials (0.23233ms)
+✔ automatic reconnection obeys a finite attempt limit and never reconnects an expired or manual session (1.237556ms)
+✔ uncertain sends and an explicit manual pause are never automatically resumed (1.447423ms)
+✔ storage poisoning creates one immediate local critical warning and blocks all private submissions (0.33909ms)
+✔ zero automatic reconnect attempts means zero socket attempts even when reconnect is enabled (0.458982ms)
+✔ an automatic connection attempt waits for handshake or QR instead of recreating the socket on a timer (2.068426ms)
+✔ pending alerts use bounded indexed batches and concurrent flush calls share one network worker (18.771404ms)
+ℹ tests 17
+ℹ suites 0
+ℹ pass 17
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 66.586372
+
+auth.test.cjs
+✔ passwords use random salted asynchronous scrypt and verify safely (600.573393ms)
+✔ only one first-owner registration succeeds including concurrent attempts (97.02632ms)
+✔ setup adopts existing campaigns and legacy authorized phones without modifying content or progress (92.098896ms)
+✔ no hashes, password or recovery secrets appear in public users/status/audits (227.795567ms)
+✔ unauthenticated signup/user management and permission calls are denied (98.073729ms)
+✔ seller visibility and action scope are enforced from saved ownership (350.675588ms)
+✔ individual grants and all-campaign scope take effect and can be revoked live (215.468289ms)
+✔ last owner cannot be deleted, disabled or demoted; additional owner can (200.131089ms)
+✔ administrator cannot grant owner privileges or modify a protected owner role (352.494746ms)
+✔ custom profiles are configurable and cannot be deleted while assigned (235.224718ms)
+✔ deactivated users and phone commands lose permission immediately without changing GUI actor (286.123782ms)
+✔ phone identities are validated and cannot be claimed by multiple local users (178.539237ms)
+✔ login throttles repeated failures persistently and permits recovery after the interval (369.00462ms)
+✔ admin-created credentials require a password change before app and WhatsApp operations (474.81875ms)
+✔ owner offline recovery codes work once, never stored as plaintext, and require secure new password (380.438275ms)
+✔ authorized administrator-issued reset expires, consumes once and never exposes another owner code (592.705727ms)
+✔ password and recovery rotation invalidate reset tokens and previous offline codes (371.522534ms)
+✔ important actions and denials record actor, time and purpose separately from history (185.030348ms)
+✔ additional owners receive their private recovery codes only on their own first login (383.156098ms)
+✔ real local database persists auth and ordinary backup/history cleanup preserve accounts and recovery state (290.724126ms)
+ℹ tests 20
+ℹ suites 0
+ℹ pass 20
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 5993.00499
+
+backend.test.cjs
+✔ upgrade keeps existing campaigns and the first owner adopts them; no unauthenticated data or mutation (224.641942ms)
+✔ backend enforces own campaign scope, denied settings and media paths, and last owner protection (330.789732ms)
+✔ history deletion requires preview and typed confirmation; confirmed and uncertain operational jobs remain reviewable (120.959011ms)
+✔ native notification results are persisted truthfully and disconnection works while the GUI is logged out (224.196155ms)
+✔ history export uses native save selection and never contains password hashes or recovery codes (105.662143ms)
+✔ sound preferences reject invalid values and the test passes exact configured volume to the native host (113.01488ms)
+✔ own-scope settings editors cannot change the shared integration, backup foreign data or replace all campaigns (443.425316ms)
+✔ global campaign visibility alone does not authorize connection changes, complete backups or restore (290.858102ms)
+✔ owner metrics survive display settings, rejected commands and logout without exposing totals to sellers (414.541561ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2276.196286
 
 commands.test.cjs
-✔ somente administradores autenticados em conversa direta podem comandar (6.820263ms)
-✔ telefone real verificado suporta LID; mensagens não verificadas e número LID não autenticam (0.929115ms)
-✔ comando repetido não é processado novamente, inclusive após recriar controlador (0.436902ms)
-✔ sem administradores configurados os comandos permanecem desabilitados (1.0586ms)
-✔ criar e editar campanhas não as ativa e preserva texto/legendas (3.36935ms)
-✔ ativação exige resumo e confirmação de uso único (2.876897ms)
-✔ confirmação expirada, cancelada ou de revisão antiga nunca ativa (2.586018ms)
-✔ confirmação pertence ao administrador que recebeu o resumo (0.987502ms)
-✔ alteração de destinos ativa somente após resumo; fila velha é pausada antes da retomada (1.804881ms)
-✔ pausar e parar tudo invalidam confirmações pendentes (2.501934ms)
-✔ grupos não autorizados, outra integração e excesso de grupos são recusados (0.763965ms)
-✔ mídias só são importadas em uma sessão de conteúdo da campanha selecionada (1.625066ms)
-✔ sessão expirada não baixa nem associa mídias (0.410786ms)
-✔ mídia de outro administrador não é associada à sessão alheia (0.339879ms)
-✔ menu configura horários, dias, intervalo, modo e ordena conteúdos (16.388679ms)
-✔ configuração individual recebe seu próprio conteúdo sem alterar outros grupos (0.832136ms)
-✔ edição de conteúdo ativo aguarda confirmação, e alteração concorrente invalida sessão (2.331905ms)
-✔ avanço de rodadas não invalida resumo e preserva o contador ao confirmar alteração (0.847418ms)
-✔ atualizações de execução não encerram a sessão de edição do WhatsApp (0.748574ms)
-✔ mudança de estado após o resumo invalida confirmação mesmo sem alterar conteúdo (1.00724ms)
-✔ parada externa durante a espera da fila impede aplicar conteúdo e retomar (2.228254ms)
-✔ conteúdo individual vazio usa os conteúdos principais como o agendador (1.186629ms)
-✔ legenda de mídia com prefixo não executa comandos e permanece conteúdo da campanha (0.665321ms)
-✔ parada autorizada interrompe campanha enquanto uma configuração aguarda mídia (1.00717ms)
-✔ parada prioritária de remetente não autorizado não interrompe campanhas (0.174792ms)
-✔ download com prazo excedido libera a fila e não importa conteúdo parcial (0.768247ms)
-✔ falha da resposta de controle não bloqueia o próximo comando (0.995779ms)
-ℹ tests 27
+✔ somente administradores autenticados em conversa direta podem comandar (6.897521ms)
+✔ telefone real verificado suporta LID; mensagens não verificadas e número LID não autenticam (0.527788ms)
+✔ comando repetido não é processado novamente, inclusive após recriar controlador (0.757067ms)
+✔ sem administradores configurados os comandos permanecem desabilitados (0.240941ms)
+✔ criar e editar campanhas não as ativa e preserva texto/legendas (3.595096ms)
+✔ ativação exige resumo e confirmação de uso único (1.860426ms)
+✔ confirmação expirada, cancelada ou de revisão antiga nunca ativa (1.463545ms)
+✔ confirmação pertence ao administrador que recebeu o resumo (1.169509ms)
+✔ alteração de destinos ativa somente após resumo; fila velha é pausada antes da retomada (1.067177ms)
+✔ pausar e parar tudo invalidam confirmações pendentes (1.570061ms)
+✔ grupos não autorizados, outra integração e excesso de grupos são recusados (0.855432ms)
+✔ mídias só são importadas em uma sessão de conteúdo da campanha selecionada (1.171468ms)
+✔ sessão expirada não baixa nem associa mídias (1.909447ms)
+✔ mídia de outro administrador não é associada à sessão alheia (0.471968ms)
+✔ menu configura horários, dias, intervalo, modo e ordena conteúdos (3.218928ms)
+✔ configuração individual recebe seu próprio conteúdo sem alterar outros grupos (3.294027ms)
+✔ edição de conteúdo ativo aguarda confirmação, e alteração concorrente invalida sessão (1.093213ms)
+✔ avanço de rodadas não invalida resumo e preserva o contador ao confirmar alteração (1.350093ms)
+✔ atualizações de execução não encerram a sessão de edição do WhatsApp (1.336319ms)
+✔ mudança de estado após o resumo invalida confirmação mesmo sem alterar conteúdo (1.625517ms)
+✔ parada externa durante a espera da fila impede aplicar conteúdo e retomar (1.169413ms)
+✔ conteúdo individual vazio usa os conteúdos principais como o agendador (0.616449ms)
+✔ legenda de mídia com prefixo não executa comandos e permanece conteúdo da campanha (0.636164ms)
+✔ parada autorizada interrompe campanha enquanto uma configuração aguarda mídia (0.684416ms)
+✔ parada prioritária de remetente não autorizado não interrompe campanhas (0.13686ms)
+✔ download com prazo excedido libera a fila e não importa conteúdo parcial (0.704925ms)
+✔ falha da resposta de controle não bloqueia o próximo comando (1.096494ms)
+✔ número legado sem vínculo com usuário ativo não autentica em produção (0.330469ms)
+✔ campanhas e prévias respeitam o escopo do vendedor sem alterar o login do aplicativo (1.038356ms)
+✔ permissões de editar, iniciar, pausar e encerrar são separadas no controle remoto (0.504006ms)
+✔ confirmação revalida permissões e identidade após mudança de acesso (1.244889ms)
+✔ criação remota grava o dono correto e auditoria separada sem salvar texto ou tokens (1.005162ms)
+✔ edição de mídia revalida acesso depois do download e não importa mídia sem permissão (0.72764ms)
+✔ vendedor não encerra globalmente campanhas de outro usuário (0.311437ms)
+ℹ tests 34
 ℹ suites 0
-ℹ pass 27
+ℹ pass 34
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 71.802778
+ℹ duration_ms 59.120869
 
-persistence.test.cjs
-✔ campaign configuration version stays stable across rounds but changes with edited content (409.806633ms)
-✔ disk persistence failure blocks later mutations and leaves last durable data intact (36.543247ms)
-✔ received media with an unknown filename extension produces a restorable backup (152.320437ms)
-✔ legacy backups restore received filenames and remain restored after first-use initialization (107.134765ms)
-✔ malformed campaign and administrator data reject restoration before replacing saved configuration (121.378413ms)
-✔ SQLite persists every write before close and preserves campaign revisions (81.962828ms)
-✔ process exit without close cannot erase the durable pre-send marker (2252.390898ms)
-✔ restart cancels old queued work, preserves uncertain outcomes and never resumes campaigns (59.73029ms)
-✔ SQLite rejects duplicate round/group/item dispatches and preserves confirmed outcomes (34.953397ms)
-✔ refresh cannot grant publication authorization to a previously denied group (10.340773ms)
-✔ first-use example contains exactly 15 simulated groups and stays disabled across restarts (59.838205ms)
-✔ campaign validation ignores a request to autoactivate a newly created campaign (18.043946ms)
-✔ managed media survives moving the original and store restart (21.34136ms)
-✔ media manager rejects paths outside its managed folder and unsupported files (9.671401ms)
-✔ backup roundtrip restores campaign content and files as drafts without credentials (69.096926ms)
-✔ corrupted media checksums reject restore without changing existing data (25.048701ms)
-✔ backup supplied media paths, IDs and names cannot escape the managed folder (32.854801ms)
-✔ restore rejects missing media references and cleans files written before validation (46.001035ms)
-✔ restore rejects duplicate media IDs and removes partially restored files (25.143788ms)
-ℹ tests 19
-ℹ suites 0
-ℹ pass 19
-ℹ fail 0
-ℹ cancelled 0
-ℹ skipped 0
-ℹ todo 0
-ℹ duration_ms 3622.523866
-
-scheduler-integration.test.cjs
-✔ real SQLite + local simulator: 15 deliveries are durable before transport and restart rebases without replay (912.122492ms)
-✔ real SQLite + local simulator: uncertain delivery survives restart, blocks resume and reconciles by durable ID (261.035217ms)
+export-records.test.cjs
+✔ paged JSON export checks permission between pages and leaves the previous file intact if revoked (4.232849ms)
+✔ paged JSON export returns the true record count and preserves non-ASCII content (1.547821ms)
 ℹ tests 2
 ℹ suites 0
 ℹ pass 2
@@ -104,45 +167,168 @@ scheduler-integration.test.cjs
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 1199.708139
+ℹ duration_ms 12.322671
 
-scheduler.test.cjs
-✔ creating a campaign never activates it; 15 authorized destinations preserve media/text order (38.727623ms)
-✔ interval counts from round start; separate spacing is enforced and early ticks do nothing (1.487117ms)
-✔ a slow round skips elapsed slots with no simultaneous round or backlog (3.153278ms)
-✔ one global worker serializes campaigns and concurrent ticks (3.929096ms)
-✔ a synchronous transport event cannot reenter the worker and create a second round (0.905331ms)
-✔ a durable queue write failure blocks submissions and further activation (1.821367ms)
-✔ pause cancels pending destinations, allows the in-flight result to settle, and resume avoids recent duplicates (2.571177ms)
-✔ stop all interrupts a wait immediately and does not leave active campaigns (1.577305ms)
-✔ emergency stop aborts the current campaign before an earlier campaign persistence failure (2.260783ms)
-✔ a persistence failure after transport settlement blocks all later submissions even if another write succeeds (2.75954ms)
-✔ a late receipt persistence failure blocks sending without throwing from a transport event (1.310045ms)
-✔ a storage fault outside the scheduler blocks ticks and activation without repeated persistence attempts (0.37782ms)
-✔ real storage: a settings write fault immediately before transport prevents the network request (108.655139ms)
-✔ waitForIdle settles the in-flight result before callers replace persistent data (1.531996ms)
-✔ disconnection pauses active campaigns and prevents pending sends or disconnected activation (1.82309ms)
-✔ uncertain outcomes pause immediately and are never retried; late server receipt reconciles (4.555904ms)
-✔ ambiguous exceptions have one attempt and do not expose adapter secrets in history (2.011515ms)
-✔ only definitive pre-submission failures get bounded retries using the same durable message ID (1.897811ms)
-✔ a retry never submits after the group operating window has closed (2.620562ms)
-✔ a retry rechecks the individual group end date before another network request (1.381452ms)
-✔ a restriction stops attempts even when a failure was definitely before submission (1.046054ms)
-✔ daily send and round limits defer to the next local day instead of accumulating slots (3.968839ms)
-✔ a simulated suspension creates one current round rather than all missed rounds (1.877882ms)
-✔ group override intervals can be shorter and rotation advances per group participation (3.518042ms)
-✔ individual windows run independently, including outside the main campaign window (2.978791ms)
-✔ local weekday, inclusive dates and overnight windows use the opening day (0.250731ms)
-✔ expired scheduling stops rather than replaying previous dates (0.972692ms)
-✔ restart marks in-flight work uncertain and stale queued work cancelled without any submission (0.864832ms)
-✔ activation rejects unauthorized, mixed integration groups, invalid limits, duplicate destinations and missing media (1.473308ms)
-✔ summary includes content, authorized groups, frequency, individual settings and sending estimate (0.87889ms)
-ℹ tests 30
+media-stream.test.cjs
+✔ file import copies and hashes asynchronously without reading the complete original (17.272219ms)
+✔ old-format backup and unknown-extension received media restore across tiny token/base64 boundaries (91.71827ms)
+✔ a late corrupt checksum cleans every staged file and preserves existing data/media (31.973025ms)
+✔ late invalid campaign configuration rolls back all restored media without replacing the database (32.434313ms)
+✔ malformed base64, duplicate object keys and prototype keys fail safely before restore (37.654486ms)
+✔ database rejection removes imported files instead of leaving unmanaged orphans (6.775427ms)
+✔ backup stays compatible, excludes credentials and preserves an existing export if a source is corrupt (11.713997ms)
+✔ 24 MiB import, backup and restore complete with a 48 MiB V8 heap ceiling (771.779777ms)
+ℹ tests 8
 ℹ suites 0
-ℹ pass 30
+ℹ pass 8
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 214.529349
-Desktop: 3 testes passaram (restauração e bloqueio durante envio, exclusão após resultado incerto, manifesto preservando arquivos alheios).
+ℹ duration_ms 1007.911226
+
+persistence.test.cjs
+✔ campaign configuration version stays stable across rounds but changes with edited content (10.073326ms)
+✔ disk persistence failure blocks later mutations and leaves last durable data intact (5.605095ms)
+✔ received media with an unknown filename extension produces a restorable backup (53.566019ms)
+✔ legacy backups restore received filenames and remain restored after first-use initialization (21.561199ms)
+✔ malformed campaign and administrator data reject restoration before replacing saved configuration (39.02309ms)
+✔ SQLite persists every write before close and preserves campaign revisions (6.070231ms)
+✔ process exit without close cannot erase the durable pre-send marker (58.502033ms)
+✔ restart cancels old queued work, preserves uncertain outcomes and never resumes campaigns (6.879802ms)
+✔ SQLite rejects duplicate round/group/item dispatches and preserves confirmed outcomes (6.943445ms)
+✔ refresh cannot grant publication authorization to a previously denied group (4.855047ms)
+✔ first-use example contains exactly 15 simulated groups and stays disabled across restarts (5.0582ms)
+✔ campaign validation ignores a request to autoactivate a newly created campaign (4.554381ms)
+✔ managed media survives moving the original and store restart (6.692093ms)
+✔ media manager rejects paths outside its managed folder and unsupported files (5.479074ms)
+✔ backup roundtrip restores campaign content and files as drafts without credentials (24.265804ms)
+✔ corrupted media checksums reject restore without changing existing data (18.481027ms)
+✔ backup supplied media paths, IDs and names cannot escape the managed folder (21.387978ms)
+✔ restore rejects missing media references and cleans files written before validation (15.759756ms)
+✔ restore rejects duplicate media IDs and removes partially restored files (12.998138ms)
+ℹ tests 19
+ℹ suites 0
+ℹ pass 19
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 340.930661
+
+scheduler-integration.test.cjs
+✔ real SQLite + local simulator: 15 deliveries are durable before transport and restart rebases without replay (54.72195ms)
+✔ real SQLite + local simulator: uncertain delivery survives restart, blocks resume and reconciles by durable ID (28.643572ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 90.739411
+
+scheduler.test.cjs
+✔ creating a campaign never activates it; 15 authorized destinations preserve media/text order (44.685438ms)
+✔ interval counts from round start; separate spacing is enforced and early ticks do nothing (1.962423ms)
+✔ a slow round skips elapsed slots with no simultaneous round or backlog (1.030552ms)
+✔ one global worker serializes campaigns and concurrent ticks (3.988376ms)
+✔ a synchronous transport event cannot reenter the worker and create a second round (0.949199ms)
+✔ a durable queue write failure blocks submissions and further activation (2.591459ms)
+✔ pause cancels pending destinations, allows the in-flight result to settle, and resume avoids recent duplicates (2.118232ms)
+✔ stop all interrupts a wait immediately and does not leave active campaigns (1.617069ms)
+✔ emergency stop aborts the current campaign before an earlier campaign persistence failure (1.554182ms)
+✔ a persistence failure after transport settlement blocks all later submissions even if another write succeeds (1.522567ms)
+✔ a late receipt persistence failure blocks sending without throwing from a transport event (1.015726ms)
+✔ a storage fault outside the scheduler blocks ticks and activation without repeated persistence attempts (0.457551ms)
+✔ real storage: a settings write fault immediately before transport prevents the network request (13.728259ms)
+✔ waitForIdle settles the in-flight result before callers replace persistent data (0.989785ms)
+✔ disconnection pauses active campaigns and prevents pending sends or disconnected activation (0.819893ms)
+✔ uncertain outcomes pause immediately and are never retried; late server receipt reconciles (1.052019ms)
+✔ ambiguous exceptions have one attempt and do not expose adapter secrets in history (1.167466ms)
+✔ only definitive pre-submission failures get bounded retries using the same durable message ID (1.704761ms)
+✔ a retry never submits after the group operating window has closed (1.004694ms)
+✔ a retry rechecks the individual group end date before another network request (1.037742ms)
+✔ a restriction stops attempts even when a failure was definitely before submission (0.937472ms)
+✔ daily send and round limits defer to the next local day instead of accumulating slots (1.775214ms)
+✔ a simulated suspension creates one current round rather than all missed rounds (0.730028ms)
+✔ group override intervals can be shorter and rotation advances per group participation (1.996321ms)
+✔ individual windows run independently, including outside the main campaign window (2.069645ms)
+✔ local weekday, inclusive dates and overnight windows use the opening day (0.196695ms)
+✔ expired scheduling stops rather than replaying previous dates (1.092121ms)
+✔ restart marks in-flight work uncertain and stale queued work cancelled without any submission (0.742235ms)
+✔ activation rejects unauthorized, mixed integration groups, invalid limits, duplicate destinations and missing media (4.24148ms)
+✔ summary includes content, authorized groups, frequency, individual settings and sending estimate (0.935158ms)
+✔ campaign retry policy controls attempts and delay; exhausted failures emit one durable incident (1.293701ms)
+✔ a known definitive nonretryable error stops once; an ambiguous error remains uncertain (0.686584ms)
+✔ a temporary failure which succeeds within the configured policy preserves campaign progression (1.2845ms)
+✔ idempotent timer startup and a private-alert submission hold cannot duplicate campaign work (0.720135ms)
+✔ indexed aggregate queries replace loading old history and accept compact group round counts (0.629752ms)
+ℹ tests 35
+ℹ suites 0
+ℹ pass 35
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 114.898306
+
+sound.test.cjs
+✔ sound volume clamps to the Windows audio gain range including mute (2.166965ms)
+✔ duplicate occurrences play once and disabled event types stay silent (3.613277ms)
+✔ overnight quiet hours suppress alerts but explicit tests can play (0.937559ms)
+✔ repeats respect the configured interval and total limit (0.566222ms)
+✔ muting an occurrence cancels repeats and stops current playback (0.634082ms)
+✔ different alerts never play concurrently and playback failures are reported (0.719876ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 15.881442
+
+storage-v2.test.cjs
+✔ legacy SQLite upgrades in place with a complete pre-migration copy and WAL FULL durability (27.867396ms)
+✔ clearing presentation histories preserves duplicate protection, daily limits, data and immutable audit (19.08914ms)
+✔ category-only cleanup keeps other records and never turns uncertainty into a retry (5.940594ms)
+✔ history projections show one current send outcome, with indexed pagination and literal search (20.327811ms)
+✔ diagnostic pages scope campaigns and global events without loading unrelated failures (6.413622ms)
+✔ calendar date filters include the entire final local day and reject malformed dates (8.81244ms)
+✔ retention bounds visible logs by age, entries and bytes while keeping operational ledgers and audit (9.49526ms)
+✔ group checkpoints count each round once across multiple content items and survive history cleanup (7.566108ms)
+✔ local accounts and recovery are preserved on ordinary restore; credentials never enter portable backup (24.934333ms)
+✔ ordinary restore preserves managed local sound assets and excludes machine-specific paths from exported settings (7.729759ms)
+✔ malformed new settings reject restoration before changing existing campaigns and accounts (6.935258ms)
+✔ transaction rollback is atomic, UNIQUE validation does not poison storage and new fields cannot invoke arbitrary SQL (4.55791ms)
+✔ diagnostics and audit omit credential fields and truncate oversized messages (5.0936ms)
+✔ pending private alerts are loaded in bounded due batches and ACK lookup uses durable message ID (8.153415ms)
+✔ streamed log export yields between pages, produces valid JSON and retains the old file on failure (26.64359ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 15
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 198.219739
+
+worker.test.cjs
+✔ real worker persists owner and campaigns, enforces login, and cannot expose internal RPC actions (371.883964ms)
+✔ real worker sends disconnect events to native host while logged out and records only explicit notification acknowledgement (489.552633ms)
+✔ a CPU-bound backend RPC leaves the host event loop responsive; worker exit rejects unresolved requests (319.706754ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1187.658612
+Desktop: 5 fluxos passaram (instância/IPC/bandeja, retorno das notificações, suspensão/rede/encerramento, manifesto e renderizador real de áudio com ganho/volume). Facade nativa; exibição e áudio físicos no Windows não verificados.
+
+GUI de origem e GUI do app.asar Windows executadas no Electron Linux: ambas aprovadas. Login, 11 seções, campanha inicialmente desativada, ordem de conteúdos, 2 envios simulados confirmados aguardados por polling RPC, parada, configurações sem perda de rascunho, volume 37% e volume zero, APAGAR com auditoria e controle operacional preservado, vendedor com troca de senha e escopo próprio. Nenhuma mensagem real.
+Sintaxe: npm run check, exit 0.
+Baileys instalado: importação aprovada sem conexão.
+Benchmark sintético SQLite Linux Node24.19: 15.000 jobs, 1.000 rodadas, 15 grupos; 100 repetições de 4 consultas (histórico50, métricas, progresso por grupo, totais diários), média 3,376ms por conjunto. Não mede Windows ou rede.

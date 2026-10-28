@@ -11,8 +11,8 @@ const SUBMISSION_TIMEOUT_MS = 90000;
 const MAX_MEDIA_BYTES = 64 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(['text', 'image', 'video', 'document']);
 
-function definitiveError(message, safeToRetry = false) {
-  return Object.assign(new Error(message), { safeToRetry });
+function definitiveError(message, safeToRetry = false, code = safeToRetry ? 'WA_PRE_SUBMISSION_TEMPORARY' : 'WA_VALIDATION') {
+  return Object.assign(new Error(message), { safeToRetry, temporary: safeToRetry, definitive: !safeToRetry, code });
 }
 
 function unwrapMessage(message) {
@@ -57,13 +57,16 @@ class EncryptedAuthStore {
     this.library = library;
     this.data = null;
     this.writeChain = Promise.resolve();
+    this.persistPromise = null;
+    this.requestedVersion = 0;
+    this.persistedVersion = 0;
   }
 
   async load() {
     await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
     try {
       const ciphertext = await fs.readFile(path.join(this.dir, AUTH_FILE));
-      this.data = JSON.parse(this.safeStorage.decryptString(ciphertext), this.library.BufferJSON.reviver);
+      this.data = JSON.parse(await this.safeStorage.decryptString(ciphertext), this.library.BufferJSON.reviver);
       if (!this.data?.creds || !this.data?.keys) throw new Error('invalid');
     } catch (error) {
       if (error.code !== 'ENOENT') throw new Error('Não foi possível abrir a sessão protegida. Desconecte a conta para criar uma nova sessão.');
@@ -101,23 +104,38 @@ class EncryptedAuthStore {
   }
 
   persist() {
+    this.requestedVersion++;
+    if (this.persistPromise) return this.persistPromise;
     const operation = this.writeChain.catch(() => {}).then(async () => {
-      const plaintext = JSON.stringify(this.data, this.library.BufferJSON.replacer);
-      const encrypted = this.safeStorage.encryptString(plaintext);
-      const temporary = path.join(this.dir, `.session-${randomBytes(8).toString('hex')}.tmp`);
-      let handle;
+      // Coalesce bursts of key/credential events. Do not release any caller until every
+      // update received during the write has reached the encrypted, atomically replaced file.
       try {
-        handle = await fs.open(temporary, 'wx', 0o600);
-        await handle.writeFile(encrypted);
-        await handle.sync();
-        await handle.close();
-        handle = null;
-        await fs.rename(temporary, path.join(this.dir, AUTH_FILE));
+        do {
+          const version = this.requestedVersion;
+          const plaintext = JSON.stringify(this.data, this.library.BufferJSON.replacer);
+          const encrypted = await this.safeStorage.encryptString(plaintext);
+          const temporary = path.join(this.dir, `.session-${randomBytes(8).toString('hex')}.tmp`);
+          let handle;
+          try {
+            handle = await fs.open(temporary, 'wx', 0o600);
+            await handle.writeFile(encrypted);
+            await handle.sync();
+            await handle.close();
+            handle = null;
+            await fs.rename(temporary, path.join(this.dir, AUTH_FILE));
+            this.persistedVersion = version;
+          } finally {
+            if (handle) await handle.close().catch(() => {});
+            await fs.unlink(temporary).catch(() => {});
+          }
+        } while (this.persistedVersion < this.requestedVersion);
       } finally {
-        if (handle) await handle.close().catch(() => {});
-        await fs.unlink(temporary).catch(() => {});
+        // Clear synchronously inside the operation so a newly arriving request cannot
+        // attach to an already completed write before an outer promise.finally runs.
+        this.persistPromise = null;
       }
     });
+    this.persistPromise = operation;
     this.writeChain = operation;
     return operation;
   }
@@ -150,20 +168,23 @@ class WhatsAppAdapter extends EventEmitter {
     this.generation = 0;
     this.pendingAcks = new Map();
     this.receipts = new Map();
+    this.submittedOutcomes = new Map();
     this.seenIncoming = new Map();
     this.connectStartedAt = 0;
     this.requestedDisconnect = false;
     this.restartCount = 0;
+    this.networkAvailable = true;
   }
 
   _status(state, detail, extras = {}) {
-    this.status = { state, mode: 'whatsapp', detail, ...extras };
+    const failure = ['disconnected', 'restricted'].includes(state);
+    this.status = { state, mode: 'whatsapp', detail, ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
     this.emit('status', this.status);
   }
 
-  _ensureProtection() {
+  async _ensureProtection() {
     if (this.runtimePlatform !== 'win32') throw new Error('A conexão real está disponível no aplicativo Windows; nesta plataforma, use a simulação.');
-    if (!this.safeStorage?.isEncryptionAvailable()) throw new Error('A proteção de credenciais do Windows não está disponível. A conexão foi bloqueada.');
+    if (!this.safeStorage || !await this.safeStorage.isEncryptionAvailable()) throw new Error('A proteção de credenciais do Windows não está disponível. A conexão foi bloqueada.');
     if (!this.credentialsDir) throw new Error('Pasta protegida da sessão não configurada.');
   }
 
@@ -180,7 +201,11 @@ class WhatsAppAdapter extends EventEmitter {
   }
 
   async _connect() {
-    this._ensureProtection();
+    if (!this.networkAvailable) {
+      this._status('disconnected', 'Sem conexão com a internet. A tentativa de conexão foi adiada.', { reasonCode: 'internet', manual: false, retryable: true, errorCode: 'NETWORK_OFFLINE' });
+      throw definitiveError('Sem conexão com a internet. Tente novamente após restabelecer a rede.', true);
+    }
+    await this._ensureProtection();
     this._status('connecting', 'Preparando a conexão não oficial com o WhatsApp…');
     const generation = ++this.generation;
     this.connectStartedAt = Date.now();
@@ -214,8 +239,14 @@ class WhatsAppAdapter extends EventEmitter {
       socket.ev.on('creds.update', update => {
         if (generation !== this.generation) return;
         this.authStore.updateCreds(update).catch(() => {
-          this._status('restricted', 'Falha ao proteger a sessão no Windows. Envios pausados.');
-          socket.end(new Error('Não foi possível salvar a sessão protegida.'));
+          if (generation !== this.generation || this.status.state === 'restricted') return;
+          this._status('restricted', 'Falha ao proteger a sessão no Windows. Envios pausados.', { errorCode: 'SESSION_PERSISTENCE_FAILED', reasonCode: 'restricted', retryable: false });
+          this._resolveAllPending();
+          if (this.socket === socket) {
+            this.generation += 1;
+            this.socket = null;
+            socket.end(new Error('Não foi possível salvar a sessão protegida.'));
+          }
         });
       });
       socket.ev.on('connection.update', update => {
@@ -253,7 +284,7 @@ class WhatsAppAdapter extends EventEmitter {
       else socket.ws?.on('CB:ack,class:message', protocolAck);
       return this.status;
     } catch (error) {
-      if (generation === this.generation) this._status('disconnected', 'Não foi possível conectar. Verifique a internet, a instalação e a sessão protegida.');
+      if (generation === this.generation) this._status('disconnected', 'Não foi possível conectar. Verifique a internet, a instalação e a sessão protegida.', this._disconnectInfo(error));
       throw definitiveError(error.message === 'A proteção de credenciais do Windows não está disponível. A conexão foi bloqueada.' ? error.message : 'Não foi possível iniciar a integração com o WhatsApp. Verifique a internet ou reconecte a conta.');
     }
   }
@@ -271,28 +302,59 @@ class WhatsAppAdapter extends EventEmitter {
     if (update.connection !== 'close') return;
     this.socket = null;
     this._resolveAllPending();
-    const code = update.lastDisconnect?.error?.output?.statusCode || update.lastDisconnect?.error?.statusCode;
+    const error = update.lastDisconnect?.error;
+    const rawCode = error?.output?.statusCode || error?.statusCode;
+    const code = rawCode == null ? null : Number(rawCode);
+    const info = this._disconnectInfo(error);
     const reasons = this.library.DisconnectReason || {};
     if (this.status.state === 'restricted' || code === 403 || code === 429 || (reasons.forbidden && code === reasons.forbidden)) {
-      this._status('restricted', 'O WhatsApp restringiu a conexão. Todos os envios estão pausados; respeite a restrição.');
-    } else if (code === reasons.loggedOut || code === 401) {
+      this._status('restricted', 'O WhatsApp restringiu a conexão. Todos os envios estão pausados; respeite a restrição.', { ...info, reasonCode: 'restricted', retryable: false });
+    } else if ((reasons.loggedOut != null && code === Number(reasons.loggedOut)) || code === 401) {
       const reset = this._clearSession();
-      this._status('disconnected', 'A conta foi desconectada pelo WhatsApp. Removendo a sessão local inválida…');
+      this._status('disconnected', 'A conta foi desconectada pelo WhatsApp. Removendo a sessão local inválida…', { ...info, reasonCode: 'session_expired', retryable: false });
       try {
         await reset;
-        if (generation === this.generation) this._status('disconnected', 'A conta foi desconectada pelo WhatsApp. Conecte novamente pelo QR Code.');
+        if (generation === this.generation) this._status('disconnected', 'A conta foi desconectada pelo WhatsApp. Conecte novamente pelo QR Code.', { ...info, reasonCode: 'session_expired', retryable: false });
       } catch {
-        if (generation === this.generation) this._status('disconnected', 'Não foi possível remover a sessão inválida. Use Remover sessão antes de conectar novamente.');
+        if (generation === this.generation) this._status('disconnected', 'Não foi possível remover a sessão inválida. Use Remover sessão antes de conectar novamente.', { ...info, reasonCode: 'session_expired', retryable: false });
       }
     } else {
-      this._status('disconnected', this.requestedDisconnect ? 'WhatsApp desconectado.' : 'Conexão interrompida. Envios pausados; reconecte para continuar.');
+      this._status('disconnected', this.requestedDisconnect ? 'WhatsApp desconectado.' : info.reasonCode === 'internet' ? 'Sem conexão com a internet. Envios pausados; reconecte após restabelecer a rede.' : 'Conexão interrompida. Envios pausados; reconecte para continuar.', info);
     }
     // Pairing requires one transport restart. This never retries a submitted campaign item.
-    if (!this.requestedDisconnect && code === (reasons.restartRequired || 515) && this.restartCount < 2) {
+    if (!this.requestedDisconnect && code === (reasons.restartRequired || 515) && this.restartCount < 1) {
       this.restartCount += 1;
       await this.authStore.writeChain.catch(() => {});
       if (generation === this.generation && !this.requestedDisconnect) await this._connect();
     }
+  }
+
+  _disconnectInfo(error) {
+    const statusCode = error?.output?.statusCode || error?.statusCode;
+    const networkCode = error?.code || error?.cause?.code;
+    const manual = this.requestedDisconnect === true;
+    const reasonCode = manual ? 'manual' : [401].includes(Number(statusCode)) ? 'session_expired' :
+      [403, 429, 463].includes(Number(statusCode)) ? 'restricted' :
+      this.networkAvailable === false || ['ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'].includes(networkCode) ? 'internet' : 'unexpected';
+    const safeCode = Number.isInteger(Number(statusCode)) && statusCode != null ? `WA_${Number(statusCode)}` :
+      /^[A-Z0-9_]{1,32}$/.test(String(networkCode || '')) ? String(networkCode) : 'WA_CONNECTION_CLOSED';
+    return { reasonCode, at: new Date().toISOString(), manual, retryable: !['manual', 'session_expired', 'restricted'].includes(reasonCode), errorCode: safeCode };
+  }
+
+  setNetworkOnline(online) { return this.setNetworkState({ online }); }
+
+  setNetworkState(value) {
+    const online = typeof value === 'boolean' ? value : value?.online;
+    if (typeof online !== 'boolean') throw definitiveError('Estado de rede inválido.');
+    this.networkAvailable = online;
+    if (online || this.requestedDisconnect || this.status.state === 'disconnected' || this.status.state === 'restricted') return this.status;
+    const socket = this.socket;
+    this.generation += 1;
+    this.socket = null;
+    this._resolveAllPending();
+    this._status('disconnected', 'Sem conexão com a internet. Envios pausados até a reconexão.', { reasonCode: 'internet', manual: false, retryable: true, errorCode: 'NETWORK_OFFLINE' });
+    socket?.end(new Error('A conexão de rede foi interrompida.'));
+    return this.status;
   }
 
   async _clearSession() {
@@ -306,8 +368,8 @@ class WhatsAppAdapter extends EventEmitter {
     return this.sessionResetPromise;
   }
 
-  async disconnect({ logout = false } = {}) {
-    this.requestedDisconnect = true;
+  async disconnect({ logout = false, reasonCode = 'manual', manual = reasonCode === 'manual' } = {}) {
+    this.requestedDisconnect = Boolean(manual);
     this.generation += 1;
     const socket = this.socket;
     this.socket = null;
@@ -321,7 +383,7 @@ class WhatsAppAdapter extends EventEmitter {
       if (logout) {
         await this._clearSession();
       } else if (this.authStore) await this.authStore.writeChain.catch(() => {});
-      this._status('disconnected', logout ? (logoutFailed ? 'Sessão local removida. Remova também o aparelho nas configurações do WhatsApp.' : 'Conta desconectada e sessão local removida.') : 'WhatsApp desconectado. A sessão permanece protegida para reconexão.');
+      this._status('disconnected', logout ? (logoutFailed ? 'Sessão local removida. Remova também o aparelho nas configurações do WhatsApp.' : 'Conta desconectada e sessão local removida.') : 'WhatsApp desconectado. A sessão permanece protegida para reconexão.', { reasonCode, manual: Boolean(manual), retryable: !manual && !['restricted', 'session_expired'].includes(reasonCode) });
     }
   }
 
@@ -339,6 +401,7 @@ class WhatsAppAdapter extends EventEmitter {
   _ack(messageId) {
     if (!messageId) return;
     this.receipts.set(messageId, Date.now());
+    this._rememberOutcome(messageId, 'confirmed');
     while (this.receipts.size > 1000) this.receipts.delete(this.receipts.keys().next().value);
     const pending = this.pendingAcks.get(messageId);
     if (pending) {
@@ -349,9 +412,17 @@ class WhatsAppAdapter extends EventEmitter {
     this.emit('receipt', { messageId, status: 'confirmed' });
   }
 
+  _rememberOutcome(messageId, status, targetId) {
+    const previous = this.submittedOutcomes.get(messageId);
+    if (previous?.status === 'confirmed' && status !== 'confirmed') return;
+    this.submittedOutcomes.set(messageId, { status, targetId: targetId || previous?.targetId });
+    while (this.submittedOutcomes.size > 1000) this.submittedOutcomes.delete(this.submittedOutcomes.keys().next().value);
+  }
+
   _resolveAllPending() {
     for (const [messageId, pending] of this.pendingAcks) {
       clearTimeout(pending.timer);
+      this._rememberOutcome(messageId, 'uncertain', pending.targetId);
       pending.resolve({ status: 'uncertain', messageId });
     }
     this.pendingAcks.clear();
@@ -362,13 +433,19 @@ class WhatsAppAdapter extends EventEmitter {
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pendingAcks.delete(messageId);
+    this._rememberOutcome(messageId, 'uncertain', pending.targetId);
     pending.resolve({ status: 'uncertain', messageId });
   }
 
   _restrict(socket) {
-    this._status('restricted', 'O WhatsApp restringiu o envio. Campanhas pausadas; respeite os limites da integração.');
+    if (socket && this.socket !== socket) return;
+    if (this.status.state !== 'restricted') this._status('restricted', 'O WhatsApp restringiu o envio. Campanhas pausadas; respeite os limites da integração.', { reasonCode: 'restricted', retryable: false, errorCode: 'WA_RESTRICTED' });
     this._resolveAllPending();
-    socket?.end(new Error('Restrição do WhatsApp: conexão pausada.'));
+    if (this.socket === socket) {
+      this.generation += 1;
+      this.socket = null;
+      socket?.end(new Error('Restrição do WhatsApp: conexão pausada.'));
+    }
   }
 
   async send(groupId, item, media) {
@@ -400,14 +477,38 @@ class WhatsAppAdapter extends EventEmitter {
       if (item.caption) content.caption = String(item.caption);
       if (item.type === 'document') content.fileName = media.name || path.basename(media.path);
     }
+    return this._submitVerified(groupId, content, item.clientMessageId);
+  }
+
+  async sendPrivate(number, text, { clientMessageId } = {}) {
+    const digits = String(number || '');
+    if (!/^\d{10,15}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.');
+    if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Informe um alerta de 1 a 16.000 caracteres.');
+    return this._submitVerified(`${digits}@s.whatsapp.net`, { text }, clientMessageId);
+  }
+
+  async _submitVerified(targetId, content, clientMessageId) {
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado antes da submissão. Envios pausados.', true);
-    const messageId = item.clientMessageId || this.library.generateMessageIDV2?.(this.socket.user?.id) || randomBytes(16).toString('hex').toUpperCase();
+    if (clientMessageId != null && (typeof clientMessageId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(clientMessageId))) throw definitiveError('Identificador de envio inválido.');
+    if (this.pendingAcks.size >= 64 && !this.pendingAcks.has(clientMessageId)) throw definitiveError('Há envios demais aguardando confirmação. Aguarde a fila atual.', true);
+    const messageId = clientMessageId || this.library.generateMessageIDV2?.(this.socket.user?.id) || randomBytes(16).toString('hex').toUpperCase();
+    const pendingSubmission = this.pendingAcks.get(messageId);
+    if (pendingSubmission) {
+      if (pendingSubmission.targetId !== targetId) throw definitiveError('O identificador do envio já pertence a outro destino.');
+      return pendingSubmission.promise;
+    }
+    const outcome = this.submittedOutcomes.get(messageId);
+    if (outcome) {
+      if (outcome.targetId && outcome.targetId !== targetId) throw definitiveError('O identificador do envio já pertence a outro destino.');
+      return { status: outcome.status, messageId };
+    }
+    if (this.receipts.has(messageId)) return { status: 'confirmed', messageId };
     const socket = this.socket;
     // Register before submitting so even an immediate server ACK cannot be lost.
     const resultPromise = new Promise(resolve => {
       const timer = setTimeout(() => {
         if (!this.pendingAcks.has(messageId)) return;
-        this._status('disconnected', 'O envio excedeu o tempo de resposta. Resultado incerto; revise o Histórico antes de retomar.');
+        this._status('disconnected', 'O envio excedeu o tempo de resposta. Resultado incerto; revise o Histórico antes de retomar.', { errorCode: 'WA_SUBMISSION_TIMEOUT', reasonCode: 'unexpected' });
         this._resolveAllPending();
         // Close the old socket so a delayed media upload cannot submit after the queue is paused.
         if (this.socket === socket) {
@@ -416,8 +517,10 @@ class WhatsAppAdapter extends EventEmitter {
           socket.end(new Error('Tempo de submissão excedido; transporte encerrado.'));
         }
       }, this.submissionTimeoutMs);
-      this.pendingAcks.set(messageId, { resolve, timer });
+      this.pendingAcks.set(messageId, { resolve, timer, targetId, promise: null });
     });
+    this.pendingAcks.get(messageId).promise = resultPromise;
+    this._rememberOutcome(messageId, 'uncertain', targetId);
     const sent = message => {
       if (Number(message?.status) >= 2 || this.receipts.has(messageId)) this._ack(messageId);
       const pending = this.pendingAcks.get(messageId);
@@ -427,12 +530,12 @@ class WhatsAppAdapter extends EventEmitter {
       }
     };
     const failed = error => {
-      const code = error?.output?.statusCode || error?.statusCode;
+      const code = Number(error?.output?.statusCode || error?.statusCode);
       if (code === 429 || code === 403 || code === 463) this._restrict(socket);
       // A transport exception after submission cannot prove the server did not accept the item.
       this._uncertain(messageId);
     };
-    try { Promise.resolve(socket.sendMessage(groupId, content, { messageId })).then(sent, failed); }
+    try { Promise.resolve(socket.sendMessage(targetId, content, { messageId })).then(sent, failed); }
     catch (error) { failed(error); }
     return resultPromise;
   }
@@ -493,7 +596,7 @@ class WhatsAppAdapter extends EventEmitter {
             if (this.socket === socket) {
               this.generation += 1;
               this.socket = null;
-              this._status('disconnected', 'A resposta de controle excedeu o tempo de espera. Reconecte para continuar.');
+              this._status('disconnected', 'A resposta de controle excedeu o tempo de espera. Reconecte para continuar.', { reasonCode: 'unexpected', errorCode: 'WA_CONTROL_TIMEOUT' });
               this._resolveAllPending();
               socket.end(new Error('Tempo de resposta de controle excedido.'));
             }

@@ -18,6 +18,10 @@ Limitações: alterações de protocolo, desconexões, limitações por conta, r
 
 O remetente dos comandos é extraído dos metadados autenticados da conexão. Identificadores LID só são aceitos quando também existe um número real verificado no protocolo. Caso o número não possa ser resolvido com segurança, o comando é ignorado. Outro número administrador deve falar em conversa privada com a conta conectada; mensagens `fromMe`, encaminhadas ou em grupo não executam comandos.
 
+Na versão 2, o telefone de controle também precisa estar vinculado a um usuário local ativo, autorizado e sem troca de senha pendente. Permissões e acesso às campanhas são validados em cada comando e novamente antes da confirmação. O login da interface não é utilizado como identidade do remetente WhatsApp.
+
+Alertas privados usam envio de texto pelo mesmo adaptador Baileys e exigem a mesma confirmação por ACK. Se essa conexão estiver indisponível, os alertas aguardam e mantêm o horário original da falha. O canal independente opcional é um endpoint HTTPS externo: aceitar a requisição não comprova entrega ao WhatsApp e não substitui silenciosamente os privados por uma integração oficial.
+
 Confirmação de envio usa ACK do servidor e recibos do protocolo. `sendMessage` retornar não é, sozinho, confirmação. Ausência de ACK em 20 segundos ou erro após tentativa de submissão produz resultado incerto e pausa para revisão. Após reinício, o aplicativo não consulta um histórico remoto confiável de todos os envios; mantém resultados incertos e exige verificação manual se não houver confirmação posterior. Isso atende à alternativa solicitada de revisar em vez de reenviar automaticamente.
 
 Nenhuma conta foi conectada nesta entrega e nenhum envio real foi realizado. Os testes de transporte usam eventos e mensagens simulados, não comprovam a operação contra uma conta real nem instalação em um Windows físico.

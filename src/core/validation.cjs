@@ -35,6 +35,13 @@ function campaign(input, store) {
     overrides[g] = {enabled:true,intervalMinutes:number(v.intervalMinutes ?? input.intervalMinutes,1,10080,'Intervalo do grupo'),schedule:schedule(v.schedule || input.schedule)};
     if (v.items?.length) overrides[g].items = items(v.items,store);
   }
-  return {id,name:String(input.name).trim(),state:old?.state || 'draft',mode:input.mode,intervalMinutes:number(input.intervalMinutes,1,10080,'Intervalo entre rodadas'),spacingSeconds:number(input.spacingSeconds,3,3600,'Espaçamento entre envios'),schedule:schedule(input.schedule),dailyRoundLimit:number(input.dailyRoundLimit || 0,0,10000,'Limite diário de rodadas'),dailySendLimit:number(input.dailySendLimit || 0,0,100000,'Limite diário de envios'),groupIds:ids,items:items(input.items || [],store),groupOverrides:overrides,nextRunAt:old?.nextRunAt || null,roundIndex:old?.roundIndex || 0,revision:old?.revision || 0,configRevision:old?.configRevision||0};
+  const references=(values,name)=>{if(!Array.isArray(values)||values.length>100||values.some(v=>typeof v!=='string'||!v||v.length>512))throw new Error(`${name}: lista inválida.`);return [...new Set(values)];};
+  const policy=input.retryPolicy??old?.retryPolicy??{maxAttempts:3,delaySeconds:3};
+  const maxAttempts=number(policy.maxAttempts??3,1,5,'Tentativas máximas');
+  if(!Number.isInteger(maxAttempts))throw new Error('Tentativas máximas devem ser um número inteiro.');
+  const retryPolicy={maxAttempts,delaySeconds:number(policy.delaySeconds??3,3,3600,'Intervalo entre tentativas')};
+  const ownerId=input.ownerId??old?.ownerId??old?.ownerUserId??null;
+  if(ownerId!==null&&(typeof ownerId!=='string'||!ownerId||ownerId.length>512))throw new Error('Dono da campanha inválido.');
+  return {id,name:String(input.name).trim(),state:old?.state || 'draft',mode:input.mode,intervalMinutes:number(input.intervalMinutes,1,10080,'Intervalo entre rodadas'),spacingSeconds:number(input.spacingSeconds,3,3600,'Espaçamento entre envios'),schedule:schedule(input.schedule),dailyRoundLimit:number(input.dailyRoundLimit || 0,0,10000,'Limite diário de rodadas'),dailySendLimit:number(input.dailySendLimit || 0,0,100000,'Limite diário de envios'),groupIds:ids,items:items(input.items || [],store),groupOverrides:overrides,ownerId,responsibleUserIds:references(input.responsibleUserIds??old?.responsibleUserIds??[],'Responsáveis'),alertRecipientIds:references(input.alertRecipientIds??old?.alertRecipientIds??[],'Destinatários'),retryPolicy,nextRunAt:old?.nextRunAt || null,roundIndex:old?.roundIndex || 0,revision:old?.revision || 0,configRevision:old?.configRevision||0};
 }
 module.exports = {campaign,items,schedule,number};

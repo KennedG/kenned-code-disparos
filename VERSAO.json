@@ -1,8 +1,8 @@
 {
-  "tag": "v1.0.2",
-  "installer": "Mega-Disparos-Setup-1.0.2-x64.exe",
-  "installerSha256": "1a6be5281a5231fd8526b59b60385a9b92f067dc8130d8d28a8a224c72bf0927",
+  "tag": "v2.0.0",
+  "installer": "Mega-Disparos-Setup-2.0.0-x64.exe",
+  "installerSha256": "67427b5617094881c75b8af5e68dab0888f17bf5fe162ec7967e348f8cab3b9c",
   "sourceRecoveredFromInstaller": true,
-  "packagedSourceFilesAudited": 26,
+  "packagedSourceFilesAudited": 38,
   "latestRecommended": false
 }

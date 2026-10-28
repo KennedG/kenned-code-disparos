@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body data-theme="dark">
+  <div id="auth-root" class="auth-root" hidden></div>
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="#" aria-label="Mega Disparos, painel"><span class="brand-symbol">M</span><span>Mega<span class="brand-second">Disparos</span></span></a>
@@ -16,7 +17,8 @@
       <div class="sidebar-bottom"><div class="local-badge"><span class="status-dot"></span> Dados salvos neste computador</div><div class="sidebar-version">Mega Disparos <span id="version">1.0</span></div></div>
     </aside>
     <div class="workspace">
-      <header class="topbar"><div><span class="topbar-label">Sua central de campanhas</span><div id="connection-pill" class="connection-pill">Carregando conexão…</div></div><div class="topbar-actions"><button id="theme-toggle" class="icon-button" data-action="toggle-theme" title="Alternar tema" aria-label="Alternar tema"></button><button class="stop-button" data-action="stop-all"><span class="stop-square"></span> PARAR TODOS OS ENVIOS</button></div></header>
+      <header class="topbar"><div><span class="topbar-label">Sua central de campanhas</span><div id="connection-pill" class="connection-pill">Carregando conexão…</div></div><div class="topbar-actions"><div id="user-bar" class="user-bar"></div><button id="theme-toggle" class="icon-button" data-action="toggle-theme" title="Alternar tema" aria-label="Alternar tema"></button><button class="stop-button" data-action="stop-all"><span class="stop-square"></span> PARAR TODOS OS ENVIOS</button></div></header>
+      <div id="connection-banner" class="connection-banner" hidden></div>
       <main id="main" tabindex="-1"><div class="initial-loader">Carregando seus dados…</div></main>
       <footer class="app-footer"><span>O envio depende de computador ligado, conectado e sem suspensão.</span><button class="text-button" data-action="window-minimize">Minimizar</button></footer>
     </div>

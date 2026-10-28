@@ -97,10 +97,11 @@ class Scheduler extends EventEmitter {
     this.currentRound = null;
     this.lastSubmissionAt = null;
     this.closed = false;
+    this.submissionHolds = 0;
     this.receipts = new Map();
     // Defense in depth: constructing a worker never replays an old queue.
     const interrupted = new Set();
-    for (const job of store.listJobs({ limit: 1000000 })) {
+    for (const job of [...store.listJobs({ status: 'sending', limit: 1000000 }), ...store.listJobs({ status: 'queued', limit: 1000000 })]) {
       if (job.status === 'sending' || job.status === 'queued') {
         this._persist('updateJob', job.id, {
           status: job.status === 'sending' ? 'uncertain' : 'cancelled',
@@ -132,7 +133,7 @@ class Scheduler extends EventEmitter {
       this.receipts.set(receipt.messageId, this.now());
       if (this.receipts.size > 1000) this.receipts.delete(this.receipts.keys().next().value);
       try {
-        for (const job of this.store.listJobs({ status: 'uncertain', limit: 1000000 })) {
+        for (const job of this.store.listJobs({ status: 'uncertain', messageId: receipt.messageId, limit: 1000000 })) {
           if (job.messageId === receipt.messageId) this._persist('updateJob', job.id, { status: 'confirmed', resultAt: this.now(), error: null });
         }
       } catch { this._failClosed(); }
@@ -197,6 +198,8 @@ class Scheduler extends EventEmitter {
     if (!campaign) throw new Error('Campanha não encontrada.');
     if (!campaign.name?.trim()) throw new Error('Informe um nome para a campanha.');
     if (!['repeat', 'rotate'].includes(campaign.mode)) throw new Error('Escolha repetir ou alternar os conteúdos.');
+    const retries = campaign.retryPolicy || { maxAttempts: 3, delaySeconds: 3 };
+    if (!Number.isInteger(retries.maxAttempts) || retries.maxAttempts < 1 || retries.maxAttempts > 5 || !Number.isFinite(retries.delaySeconds) || retries.delaySeconds < 3 || retries.delaySeconds > 3600) throw new Error('Configure entre 1 e 5 tentativas, com intervalo entre 3 e 3600 segundos.');
     if (!Number.isFinite(campaign.intervalMinutes) || campaign.intervalMinutes < 1) throw new Error('O intervalo entre rodadas deve ser de pelo menos 1 minuto.');
     const minimumSpacing = Math.max(3, this.adapter.minimumSpacingSeconds ?? 3);
     if (!Number.isFinite(campaign.spacingSeconds) || campaign.spacingSeconds < minimumSpacing) throw new Error(`O espaçamento deve ser de pelo menos ${minimumSpacing} segundo(s).`);
@@ -224,10 +227,11 @@ class Scheduler extends EventEmitter {
         if (item.type !== 'text' && !this.store.getMedia(item.mediaId)) throw new Error('Uma mídia não existe na biblioteca gerenciada.');
       }
     }
-    if (this.store.listJobs({ campaignId: campaign.id, status: 'uncertain', limit: 1000000 }).length) throw new Error('Revise os envios com resultado incerto no Histórico antes de retomar.');
+    if (this.store.listJobs({ campaignId: campaign.id, status: 'uncertain', limit: 1 }).length) throw new Error('Revise os envios com resultado incerto no Histórico antes de retomar.');
   }
 
   _counts(campaignId, at) {
+    if (this.store.getCampaignCounts) return this.store.getCampaignCounts(campaignId, at);
     const key = dateKey(at);
     const rounds = this.store.listRounds(campaignId).filter(r => dateKey(r.startedAt) === key).length;
     const sends = this.store.listJobs({ campaignId, limit: 1000000 }).filter(j => j.attempts > 0 && dateKey(j.firstAttemptAt ?? j.createdAt) === key).length;
@@ -235,6 +239,10 @@ class Scheduler extends EventEmitter {
   }
 
   _history(campaign) {
+    if (this.store.getGroupHistory) {
+      const result = this.store.getGroupHistory(campaign.id);
+      return new Map([...result].map(([id, value]) => [id, { ...value, roundCount: value.roundCount ?? value.rounds?.size ?? value.roundsSet?.size ?? 0 }]));
+    }
     const rounds = new Map(this.store.listRounds(campaign.id).map(r => [r.id, r]));
     const byGroup = new Map();
     for (const job of this.store.listJobs({ campaignId: campaign.id, limit: 1000000 })) {
@@ -275,7 +283,7 @@ class Scheduler extends EventEmitter {
     if (campaign.state === 'active') return campaign;
     const next = this._nextEligibleAt(campaign, this.now());
     if (!Number.isFinite(next)) throw new Error('Não há horário futuro disponível na programação.');
-    this._persist('saveCampaign', { ...campaign, state: 'active', nextRunAt: next });
+    this._persist('saveCampaign', { ...campaign, state: 'active', nextRunAt: next, pauseReason: null, pausedAt: null });
     this.emit('change');
     return this.store.getCampaign(id);
   }
@@ -290,7 +298,7 @@ class Scheduler extends EventEmitter {
     if (this.currentRound?.campaignId === id) this.currentRound.controller.abort();
     const campaign = this.store.getCampaign(id);
     if (!campaign) throw new Error('Campanha não encontrada.');
-    if (campaign.state === 'active') this._persist('saveCampaign', { ...campaign, state: 'paused', nextRunAt: null });
+    if (['active', 'paused'].includes(campaign.state)) this._persist('saveCampaign', { ...campaign, state: 'paused', nextRunAt: null, pauseReason: reason, pausedAt: this.now() });
     this._cancelQueued(id, reason);
     this.emit('change');
   }
@@ -326,9 +334,15 @@ class Scheduler extends EventEmitter {
     }
   }
 
+  holdSubmissions() {
+    this.submissionHolds++;
+    let released = false;
+    return () => { if (!released) { released = true; this.submissionHolds = Math.max(0, this.submissionHolds - 1); } };
+  }
+
   tick() {
     if (this.store.persistenceFailed) this.blockOnPersistenceFailure();
-    if (this.closed || this.persistenceFailed) return Promise.resolve();
+    if (this.closed || this.persistenceFailed || this.submissionHolds) return Promise.resolve();
     // Lock before invoking _tick: an adapter may synchronously emit an event
     // that calls tick again, before the worker promise has been assigned.
     if (this.busy) return this.worker || Promise.resolve();
@@ -380,7 +394,8 @@ class Scheduler extends EventEmitter {
   }
 
   async _sendJob(job, signal) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    const policy = this.store.getCampaign(job.campaignId)?.retryPolicy || { maxAttempts: 3, delaySeconds: 3 };
+    for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
       if (signal.aborted || !this._maySend(job.campaignId, job.groupId)) return 'cancelled';
       const at = this.now();
       const live = this.store.getCampaign(job.campaignId);
@@ -405,22 +420,54 @@ class Scheduler extends EventEmitter {
         this.emit('change');
         return confirmed ? 'confirmed' : 'uncertain';
       } catch (error) {
-        const definitive = error?.safeToRetry === true;
+        const safeRetry = error?.safeToRetry === true;
+        const definitive = safeRetry || error?.definitive === true;
         const restricted = this.adapter.status.state === 'restricted' || error?.restricted === true;
-        if (definitive && attempt < 3 && !restricted && !signal.aborted && this._connected()) {
+        const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : definitive ? 'SEND_FAILED' : 'SEND_UNCERTAIN';
+        if (safeRetry && attempt < policy.maxAttempts && !restricted && !signal.aborted && this._connected()) {
           this._persist('updateJob', job.id, { status: 'queued', error: 'Falha anterior à submissão; tentativa limitada pendente.' });
-          await this._wait(Math.max(1000 * attempt, (this.adapter.minimumSpacingSeconds ?? 3) * 1000), signal);
+          this._diagnostic(job, code, 'Falha temporária anterior à submissão.', attempt, 'Nova tentativa limitada agendada.');
+          await this._wait(Math.max(policy.delaySeconds * 1000, (this.adapter.minimumSpacingSeconds ?? 3) * 1000), signal);
           continue;
         }
         const status = definitive ? 'failed' : 'uncertain';
         // Persist only a curated description; adapter exceptions can contain secrets.
-        this._persist('updateJob', job.id, { status, resultAt: this.now(), error: definitive ? 'Falha anterior à submissão; limite de tentativas atingido ou envio interrompido.' : 'Falha com submissão desconhecida; revisão manual obrigatória.' });
+        this._persist('updateJob', job.id, { status, resultAt: this.now(), errorCode: code, error: definitive ? 'Falha confirmada; limite de tentativas atingido ou envio interrompido.' : 'Falha com submissão desconhecida; revisão manual obrigatória.' });
+        this._diagnostic(job, code, definitive ? 'Envio não confirmado por falha definitiva ou limite de tentativas.' : 'O serviço não confirmou o resultado da submissão.', attempt, definitive ? 'Campanha interrompida; confira a conexão e a configuração.' : 'Revisão manual obrigatória; nenhum reenvio automático.');
         this.emit('change');
         if (restricted) this._pauseActive('Restrição informada pela integração.');
+        if (definitive && !signal.aborted && (this._connected() || restricted)) this._incident(job.campaignId, 'fatal', code, 'Falha definitiva ou limite de tentativas atingido.');
+        else if (!definitive) this._incident(job.campaignId, 'uncertain', code, 'Resultado de envio incerto; revisão manual obrigatória.');
         return status;
       }
     }
     return 'failed';
+  }
+
+  _diagnostic(job, code, description, attempts, action) {
+    if (!this.store.addDiagnostic) return;
+    const c = this.store.getCampaign(job.campaignId);
+    this._persist('addDiagnostic', { id: randomUUID(), at: this.now(), campaignId: job.campaignId, userId: c?.ownerId || c?.ownerUserId || null, stage: 'envio', code, description, attempts, action, guidance: 'Confira a conexão, a autorização do grupo e a existência da mídia. Resultados incertos precisam de revisão.' });
+  }
+
+  _incident(campaignId, kind, code, reason) {
+    const campaign = this.store.getCampaign(campaignId);
+    if (!campaign || campaign.lastError?.roundId === this.currentRound?.id) return;
+    const incident = { id: randomUUID(), campaignId, campaignName: campaign.name, at: this.now(), code, reason, kind, roundId: this.currentRound?.id || null, userId: campaign.ownerId || campaign.ownerUserId || null };
+    if (this.store.getMetrics) {
+      const metrics = this.store.getMetrics({ campaignIds: [campaignId] });
+      incident.confirmed = metrics.confirmed || 0;
+      incident.pending = (metrics.pending || 0) + (metrics.uncertain || 0);
+    } else {
+      const jobs = this.store.listJobs({ campaignId, limit: 1000000 });
+      incident.confirmed = jobs.filter(j => j.status === 'confirmed').length;
+      incident.pending = jobs.filter(j => ['queued', 'sending', 'uncertain'].includes(j.status)).length;
+    }
+    this.currentRound?.controller.abort();
+    this._persist('saveCampaign', { ...campaign, state: kind === 'fatal' ? 'stopped' : 'paused', nextRunAt: null, pauseReason: reason, pausedAt: incident.at, lastError: incident });
+    if (this.store.addAudit) this._persist('addAudit', { id: randomUUID(), at: incident.at, userId: incident.userId, action: 'campaign.error', subjectId: campaignId, campaignId, details: { occurrenceId: incident.id, code, kind, action: kind === 'fatal' ? 'encerrada' : 'pausada para revisão' } });
+    this.emit('incident', incident);
+    this.emit('change');
   }
 
   async _runRound(campaign) {
@@ -439,7 +486,8 @@ class Scheduler extends EventEmitter {
     const jobs = [];
     for (const groupId of groups) {
       const config = this._groupConfig(campaign, groupId);
-      const index = history.get(groupId)?.rounds.size || 0;
+      const past = history.get(groupId);
+      const index = past?.roundCount ?? past?.rounds?.size ?? 0;
       const items = campaign.mode === 'rotate' ? [config.items[index % config.items.length]] : config.items;
       for (const item of items) {
         const job = { id: randomUUID(), roundId: round.id, campaignId: campaign.id, groupId, itemId: item.id, itemSnapshot: structuredClone(item), status: 'queued', createdAt: at, attempts: 0, messageId: randomBytes(16).toString('hex').toUpperCase(), resultAt: null, error: null };
@@ -462,7 +510,8 @@ class Scheduler extends EventEmitter {
         const live = this.store.getCampaign(campaign.id);
         if (live.dailySendLimit && this._counts(campaign.id, this.now()).sends >= live.dailySendLimit) { roundStatus = 'limited'; break; }
         const result = await this._sendJob(job, controller.signal);
-        if (result === 'uncertain') { roundStatus = 'uncertain'; await this.pause(campaign.id, 'Resultado incerto exige revisão manual.'); break; }
+        if (result === 'uncertain') { roundStatus = 'uncertain'; this._incident(campaign.id, 'uncertain', 'SEND_UNCERTAIN', 'Resultado incerto exige revisão manual.'); await this.pause(campaign.id, 'Resultado incerto exige revisão manual.'); break; }
+        if (result === 'failed' && this.store.getCampaign(campaign.id)?.state === 'stopped') { roundStatus = 'failed'; break; }
         if (result === 'cancelled') { roundStatus = 'cancelled'; break; }
       }
     } catch (error) {

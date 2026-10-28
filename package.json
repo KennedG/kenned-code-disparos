@@ -1,6 +1,6 @@
 {
   "name": "mega-disparos",
-  "version": "1.0.2",
+  "version": "2.0.0",
   "description": "Agendador local de campanhas autorizadas para grupos do WhatsApp",
   "main": "src/main.cjs",
   "author": "Mega Disparos",
@@ -9,6 +9,6 @@
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4",
-    "sql.js": "^1.13.0"
+    "stream-json": "1.9.1"
   }
 }
