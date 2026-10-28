@@ -20,6 +20,10 @@ const {TemplateService}=require('../core/template-service.cjs');
 const {ReminderService}=require('../core/reminders.cjs');
 const {ContactIntake}=require('../core/contact-intake.cjs');
 const {AutomationControl}=require('../core/automation-control.cjs');
+const {CommerceFinance}=require('../core/commerce-finance.cjs');
+const {CommercialService}=require('../core/commercial.cjs');
+const {CommerceAutomation}=require('../core/commerce-automation.cjs');
+const {businessActions}=require('./business-api.cjs');
 const {writeRecordsJSON}=require('../core/export-records.cjs');
 
 const SETTINGS=['integrationMode','admins','theme','maxSelectedGroups','launchAtLogin','closeBehavior','minimizeToTray','unofficialAcknowledged','reconnect','sound','notifications','retention','webhook','systemAlertRecipientIds','alertRetryPolicy'];
@@ -31,13 +35,13 @@ const withoutPath=m=>{const {path:ignored,...safe}=m;return {...safe,previewUrl:
 const bounded=(v,min,max,name)=>validation.number(v,min,max,name);
 const asText=(value,max)=>String(value??'').slice(0,max);
 
-async function createAppService({dir,safeStorage,host=async()=>{throw new Error('Recurso nativo indisponível.');},version='2.3.0',runtimePlatform='win32',now=()=>Date.now()}={}){
+async function createAppService({dir,safeStorage,host=async()=>{throw new Error('Recurso nativo indisponível.');},version='3.0.0',runtimePlatform='win32',now=()=>Date.now()}={}){
   const store=await createStore(dir);seed(store);store.recoverInterrupted();
   for(const [key,value] of Object.entries(DEFAULTS))if(store.getSetting(key)===undefined)store.setSetting(key,value);
   const media=new MediaManager(store),events=new EventEmitter();
   let channelUrl='';try{const value=await host('secretGet',{key:'webhookUrl'});if(typeof value==='string')channelUrl=value;}catch{}
   const auth=new AuthService({store,clock:now});
-  let adapter,scheduler,commands,alerts,searches,reminders,contacts,templates,automation,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,groupSync=null,groupSyncSource=null,groupLoadError=null;
+  let adapter,scheduler,commands,alerts,searches,reminders,contacts,templates,automation,finance,commercial,commerceAutomation,maintenance=false,closed=false,tail=Promise.resolve(),updateTimer=null,retentionTimer=null,groupSync=null,groupSyncSource=null,groupLoadError=null;
   const cleanupTokens=new Map();
   const nativeTasks=new Set();
   const audioDir=path.join(dir,'audio');fs.mkdirSync(audioDir,{recursive:true});
@@ -81,6 +85,12 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     return ids;
   };
   const visibleMedia=()=>can('media.view')?store.listMedia().map(withoutPath):[];
+  function businessSnapshot(){
+    const financial=can('finance.view'),core=finance?.snapshot({financial})||{};
+    const manager=can('commerce.manage'),recipients=(manager||can('finance.reports'))?store.listEntities('users').filter(u=>u.active!==false&&validPhone(cleanPhone(u.phone))&&(auth.canFor(u,'commerce.manage')||auth.canFor(u,'finance.reports')&&auth.canFor(u,'finance.view'))).map(u=>({id:'user:'+u.id,name:u.name,phone:u.phone,commercial:auth.canFor(u,'commerce.manage'),financialReports:auth.canFor(u,'finance.reports')&&auth.canFor(u,'finance.view')})):[];
+    const commerceSettings=commercial?.settings()||{};
+    return {inventory:can('stock.view')?core.inventory||[]:[],suppliers:can('supplier.view')&&financial?core.suppliers||[]:[],purchases:financial?core.purchases||[]:[],reservations:financial?core.reservations||[]:[],sales:financial?core.sales||[]:[],cashSessions:financial?core.cashSessions||[]:[],cashMovements:financial?core.cashMovements||[]:[],historyWindow:financial?core.historyWindow:null,lists:can('commerce.view')?commercial?.listCommercialLists({includeCosts:financial})||[]:[],categories:can('contacts.view')?commercial?.listCategories()||[]:[],settings:financial?commerceSettings:{promotionSchedule:commerceSettings.promotionSchedule,repeatLimit:commerceSettings.repeatLimit},promotionTargets:can('commerce.view')?commercial?.listPromotionTargets()||[]:[],opportunities:manager?store.listEntities('opportunity_rules',{limit:200}):[],demands:manager&&financial?store.listEntities('buyer_demands',{limit:200}):[],matches:manager&&financial?store.listEntities('commerce_matches',{limit:200}):[],deliveries:manager?store.listEntities('commerce_deliveries',{limit:100}).filter(d=>d.kind==='opportunity'||can('finance.reports')&&financial):[],recipients,automation:can('finance.reports')&&financial?{dailySettings:commerceAutomation?.reportSettings(user().id),dailyReports:store.listEntities('daily_reports',{limit:50})}:{},offers:can('search.view')&&financial?store.querySearchOffers({confidence:'confirmed',status:'active',limit:100}).items:[]};
+  }
   function snapshot(){
     const status=auth.status(),base={auth:status,version,maintenance,storageMode:store.getStorageMode(),settings:{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()},campaigns:[],groups:[],media:[],templates:[],contacts:[],alertRecipients:[],campaignUsers:[],history:[],metrics:{confirmed:0,failed:0,uncertain:0,activeCampaigns:0,selectedGroups:0,nextRunAt:null}};
     if(!status.authenticated)return {...base,connection:null};
@@ -88,7 +98,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     const metrics=store.getMetrics?store.getMetrics({campaignIds:scopeIds()}):{confirmed:0,failed:0,uncertain:0};
     let recent=[];if(can('history.view'))recent=historyPage({limit:50,offset:0}).items||[];
     const publicSettings=can('settings.view')?settings():{theme:store.getSetting('theme','dark'),integrationMode:store.getStorageMode()};
-    return {...base,auth:status,buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,groupLoadError:can('groups.view')?groupLoadError:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items.filter(n=>!n.ownerOnly||user()?.isOwner):[],pendingContacts:can('contacts.view')?contacts?.listPendingContacts({limit:50},user()?.id):{items:[],total:0},reminders:can('reminder.view')?reminders?.list(user()?.id):null,automation:automation?.getState()};
+    return {...base,auth:status,commerce:businessSnapshot(),contactCategories:can('contacts.view')?commercial?.listCategories()||[]:[],buscas:searches?.getState(user()?.id),connection:can('connection.view')?{...adapter.status,detail:storageError?`${adapter.status.detail||''} ${storageError}`:adapter.status.detail}:null,groupLoadError:can('groups.view')?groupLoadError:null,storageError,campaigns:cs,groups:can('groups.view')?store.listGroups():[],media:visibleMedia(),templates:can('media.view')?store.listTemplates():[],contacts:can('contacts.view')?entityList('contacts'):[],alertRecipients:can('campaign.create')||can('campaign.edit')||can('settings.view')?listRecipients():[],campaignUsers:can('campaign.create')||can('campaign.edit')?stripEntities(entityList('users')).filter(u=>u.active!==false).map(u=>({id:u.id,name:u.name,phone:u.phone||'',isOwner:entityList('roles').find(r=>r.id===u.roleId)?.isOwner===true||u.roleId==='owner'})):[],settings:publicSettings,history:recent,pendingReviews:can('history.view')&&store.listOperationalReviews?pendingReviewsPage({limit:20}).items:[],metrics:{...metrics,activeCampaigns:cs.filter(c=>c.state==='active').length,selectedGroups:new Set(cs.flatMap(c=>c.groupIds||[])).size,nextRunAt:cs.filter(c=>c.state==='active'&&c.nextRunAt).map(c=>c.nextRunAt).sort((a,b)=>a-b)[0]||null},dataDir:can('settings.view')?dir:undefined,notifications:can('notifications.view')?pageEntities('notifications',{campaignIds:scopeIds(),includeGlobal:true,limit:20}).items.filter(n=>!n.ownerOnly||user()?.isOwner):[],pendingContacts:can('contacts.view')?contacts?.listPendingContacts({limit:50},user()?.id):{items:[],total:0},reminders:can('reminder.view')?reminders?.list(user()?.id):null,automation:automation?.getState()};
   }
   function broadcast(immediate=false){
     if(closed)return;
@@ -140,10 +150,10 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(!id)return null;const entry=(store.getSetting('audioAssets',[])||[]).find(a=>a.id===id);if(!entry)return null;
     try{const real=fs.realpathSync(entry.path);if(!real.startsWith(fs.realpathSync(audioDir)+path.sep))return null;return real;}catch{return null;}
   }
-  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');return await task();}finally{searches?.resumeCapture();maintenance=false;broadcast();}}
+  async function withMaintenance(task){if(maintenance)throw new Error('Aguarde a manutenção dos dados e da conexão terminar.');maintenance=true;broadcast();try{await searches?.suspendCapture('maintenance');await commerceAutomation?.suspend();return await task();}finally{commerceAutomation?.resume();searches?.resumeCapture();maintenance=false;broadcast();}}
   async function switchMode(mode){
-    await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await alerts.waitForIdle?.();await reminders?.waitForIdle?.();if(groupSync)await groupSync.catch(()=>{});adapter.removeAllListeners();
-    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);reminders?.setAdapter(adapter);automation?.syncMode();contacts?.invalidateContacts();bindAdapter();
+    await scheduler.stopAll();await adapter.disconnect();await scheduler.waitForIdle();await alerts.waitForIdle?.();await reminders?.waitForIdle?.();await commerceAutomation?.waitForIdle?.();if(groupSync)await groupSync.catch(()=>{});adapter.removeAllListeners();
+    store.setSetting('integrationMode',mode);adapter=makeAdapter();scheduler.setAdapter(adapter);commands.setAdapter(adapter);alerts.setAdapter(adapter);searches.setAdapter(adapter);reminders?.setAdapter(adapter);commerceAutomation?.setAdapter(adapter);automation?.syncMode();contacts?.invalidateContacts();bindAdapter();
     cleanupTokens.clear();groupLoadError=null;
     if(mode==='simulated'){await adapter.connect();await syncGroups(adapter);}
   }
@@ -240,6 +250,20 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     saveCampaign:async p=>{
       const old=p.campaign?.id?store.getCampaign(p.campaign.id):null;assert(old?'campaign.edit':'campaign.create',old);
       const c=validation.campaign(p.campaign,store);validateAssignments(c,old);
+      // Product references are created on the backend. Keep them even when a
+      // page edits the public text; deleting metadata cannot bypass stock checks.
+      const bindRefs=(items,previous)=>items.map(item=>{const prior=previous?.find(i=>i.id===item.id);return prior?.commercialRef?{...item,commercialRef:structuredClone(prior.commercialRef)}:item;});
+      if(old?.commercialReviewRequired)c.commercialReviewRequired=true;if(old?.inventoryRefs)c.inventoryRefs=structuredClone(old.inventoryRefs);
+      c.items=bindRefs(c.items,old?.items);
+      const stockIds=new Set(old?.inventoryIds||[]);
+      for(let index=0;index<c.items.length;index++){
+        const raw=p.campaign.items[index];
+        if(raw.templateId&&raw.sourceTemplateItemId){assert('media.view');const model=store.getTemplate(raw.templateId),original=model?.items.find(i=>i.id===raw.sourceTemplateItemId);if(!original)throw new Error('O conteúdo do modelo mudou; selecione-o novamente.');if(original.commercialRef){c.items[index].commercialRef=structuredClone(original.commercialRef);c.audience=original.commercialRef.audience;}for(const id of model.inventoryIds||[])stockIds.add(id);}
+        for(const line of c.items[index].commercialRef?.lines||[])if(line.sourceType==='inventory')stockIds.add(line.sourceId);
+      }
+      if(stockIds.size)c.inventoryIds=[...stockIds];for(const [id,value]of Object.entries(c.groupOverrides))value.items=value.items?bindRefs(value.items,old?.groupOverrides?.[id]?.items):value.items;
+      if(!old&&p.campaign.items?.some(i=>i.commercialRef&&!i.templateId))throw new Error('Crie uma campanha pela prévia da lista comercial para vincular os produtos com segurança.');
+      commercial.validateCampaignAudience(c);
       if(old)checkRevision(old,{configRevision:p.campaign.configRevision,revision:p.campaign.revision,summaryState:p.campaign.state});
       if(old?.state==='active'){
         assert('campaign.pause',old);assert('campaign.start',old);
@@ -303,7 +327,7 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     clearHistory:async p=>{assert('history.clear');if(p.confirmation!=='APAGAR')throw new Error('Digite APAGAR para confirmar.');const token=cleanupTokens.get(p.token),categories=validateCategories(p.categories);if(!token||token.userId!==user().id||now()-token.at>5*60*1000||JSON.stringify(categories)!==JSON.stringify(token.categories))throw new Error('A confirmação expirou. Confira uma nova prévia.');if(token.fingerprint!==JSON.stringify(store.cleanupPreview(categories)))throw new Error('Os registros mudaram. Confira uma nova prévia antes de apagar.');cleanupTokens.delete(p.token);const result=store.clearHistory({categories,actor:{id:user().id,name:user().name},at:now()});broadcast();return result;},
     reviewJob:async p=>{assert('history.view');const j=store.getJob(p.id);if(!j||j.status!=='uncertain')throw new Error('Envio incerto não encontrado.');getCampaign(j.campaignId,'campaign.edit');if(!['confirm','discard'].includes(p.decision))throw new Error('Decisão inválida.');const result=store.updateJob(j.id,{status:p.decision==='confirm'?'confirmed':'cancelled',resultAt:now(),error:p.decision==='confirm'?'Confirmado manualmente após verificação no WhatsApp.':'Descartado manualmente. Não reenviado.',reviewed:true,reviewedBy:user().id});audit('history.review',{campaignId:j.campaignId,jobId:j.id,decision:p.decision});return result;},
     listContacts:async p=>{assert('contacts.view');return p?.limit?pageEntities('contacts',p):entityList('contacts');},
-    saveContact:async p=>{const v=p.contact||p,old=v.id?store.getEntity('contacts',v.id):null;assert(old?'contacts.edit':'contacts.create');const phone=cleanPhone(v.phone);if(!asText(v.name,121).trim()||asText(v.name,121).length>120||!validPhone(phone))throw new Error('Informe nome e telefone com país + DDD + número.');const result=store.saveEntity('contacts',{id:old?.id||randomUUID(),name:asText(v.name,120).trim(),phone,notes:asText(v.notes,1000),category:v.category!==undefined?(['Cliente Nerópolis','Lojista Camelódromo'].includes(v.category)?v.category:old?.category||''):old?.category||'',savedLocation:'system',addressBookSupported:false,createdAt:old?.createdAt||now(),updatedAt:now()});contacts?.invalidateContacts();audit(old?'contacts.edit':'contacts.create',{contactId:result.id});return result;},
+    saveContact:async p=>{const v=p.contact||p,old=(v.id?store.getEntity('contacts',v.id):null)||store.findContactByPhone(cleanPhone(v.phone));assert(old?'contacts.edit':'contacts.create');const result=commercial.saveContact(v,user().id);contacts?.invalidateContacts();return result;},
     deleteContact:async p=>{assert('contacts.delete');store.deleteEntity('contacts',p.id);contacts?.invalidateContacts();audit('contacts.delete',{contactId:p.id});return true;},
     listAlertRecipients:async()=>{assert('notifications.view');return listRecipients();},
     saveAlertRecipient:async p=>{assert('notifications.manage');const v=p.recipient||p,old=v.id?getRecipient(v.id):null,phone=cleanPhone(v.phone);if(!asText(v.name,121).trim()||asText(v.name,121).length>120||!validPhone(phone))throw new Error('Informe nome e telefone com país + DDD + número.');if(v.userId&&!store.getEntity('users',v.userId))throw new Error('Usuário não encontrado.');const result=store.saveEntity('alert_recipients',{id:old?.id||randomUUID(),name:asText(v.name,120).trim(),phone,userId:v.userId||null,enabled:v.enabled!==false});audit('alerts.recipientSave',{recipientId:result.id});return result;},
@@ -339,18 +363,22 @@ async function createAppService({dir,safeStorage,host=async()=>{throw new Error(
     if(action==='shutdown')return events.shutdown();
     throw new Error('Ação interna não autorizada.');
   };
-  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);await scheduler?.stopAll();await searches?.shutdown();await reminders?.stop();await adapter?.disconnect();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
-  adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now});automation=new AutomationControl({store,scheduler,now});
-  media.auth=auth;templates=new TemplateService({store,auth,media,now});contacts=new ContactIntake({store,auth,now});
-  commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,automationControl:automation,statusProvider:()=>({connection:adapter.status,campaigns:store.getMetrics(),queue:store.getMetrics().pending,search:searches?.getState(store.listEntities('users').find(u=>u.roleId==='role-owner')?.id)?.monitor,alerts:{pending:store.queryEntities('alerts',{status:'pending'}).total,failed:store.queryEntities('alerts',{status:'failed'}).total},reminders:reminders?.status(),automation:automation.getState()}),now});
+  events.shutdown=async()=>{if(closed)return;closed=true;clearTimeout(updateTimer);clearInterval(retentionTimer);await scheduler?.stopAll();await searches?.shutdown();await reminders?.stop();await commerceAutomation?.shutdown();await adapter?.disconnect();await alerts?.shutdown();await scheduler?.shutdown();await Promise.allSettled([...nativeTasks]);auth.logout();store.close();};
+  finance=new CommerceFinance({store,now});commercial=new CommercialService({store,finance,now});
+  adapter=makeAdapter();scheduler=new Scheduler({store,adapter,now,beforeSend:args=>commercial.evaluateJob(args),onSendResult:args=>commercial.recordJobResult({...args,payload:args.job.itemSnapshot})});automation=new AutomationControl({store,scheduler,now});
+  media.auth=auth;templates=new TemplateService({store,auth,media,commercial,now});contacts=new ContactIntake({store,auth,now});
+  commands=new CommandController({store,scheduler,adapter,mediaManager:media,authService:auth,automationControl:automation,commercialService:commercial,statusProvider:()=>({connection:adapter.status,campaigns:store.getMetrics(),queue:store.getMetrics().pending,search:searches?.getState(store.listEntities('users').find(u=>u.roleId==='role-owner')?.id)?.monitor,alerts:{pending:store.queryEntities('alerts',{status:'pending'}).total,failed:store.queryEntities('alerts',{status:'failed'}).total},reminders:reminders?.status(),commerce:commerceAutomation?.status?.(),automation:automation.getState()}),now});
   alerts=new AlertService({store,scheduler,adapter,now,isAutomationStopped:()=>automation.isStopped(),secretGet:async key=>host('secretGet',{key}),sendWebhook:async({secret,message,occurrenceId,originalAt,idempotencyKey})=>{if(!channelUrl)throw Object.assign(new Error('Canal independente não configurado.'),{definitive:true});const parsed=new URL(channelUrl);if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw Object.assign(new Error('Canal HTTPS inválido.'),{definitive:true});const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);try{const response=await fetch(parsed.href,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${secret}`,'idempotency-key':idempotencyKey},body:JSON.stringify({message,occurrenceId,originalAt}),signal:controller.signal,redirect:'error'});if(!response.ok)throw Object.assign(new Error('WEBHOOK_HTTP_FAILURE'),{definitive:true,code:'WEBHOOK_HTTP_FAILURE'});return {status:'confirmed',messageId:idempotencyKey};}finally{clearTimeout(timer);}}});
   searches=new SearchService({store,adapter,authService:auth,now,scheduler,host,automationGuard:()=>!automation.isStopped()});
   reminders=new ReminderService({store,auth,scheduler,adapter,now,isAutomationStopped:()=>automation.isStopped(),onCriticalIncident:incident=>alerts.recordSystemIncident(incident)});
+  commerceAutomation=new CommerceAutomation({store,auth,scheduler,adapter,searches,finance,commercial,now,isAutomationStopped:()=>automation.isStopped(),onCriticalIncident:incident=>alerts.recordSystemIncident(incident)});
+  Object.assign(actions,businessActions({store,auth,finance,commercial,commerceAutomation,scheduler,audit,now,host,dir}));
+  automation.register('commerce',()=>commerceAutomation.stopPending({userId:user()?.id}));commerceAutomation.on('change',()=>broadcast());commerceAutomation.start();
   automation.register('search',()=>searches.stopPending());automation.register('alerts',()=>alerts.stopPending());automation.register('reminders',()=>reminders.stopAll({source:'global-stop'}));
   automation.on('change',()=>broadcast());reminders.on('change',()=>broadcast());contacts.on('change',()=>broadcast());
   contacts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});
   reminders.start();
-  searches.on('change',()=>broadcast());searches.start();
+  searches.on('change',()=>{broadcast();commerceAutomation?.tick().catch(()=>{});});searches.start();
   alerts.on('localAlert',payload=>{const task=nativeAlert(payload).catch(()=>{});nativeTasks.add(task);task.finally(()=>nativeTasks.delete(task));});alerts.on('change',()=>broadcast());scheduler.on('change',()=>broadcast());bindAdapter();alerts.start();scheduler.start();
   retentionTimer=setInterval(()=>{try{store.applyRetention?.(store.getSetting('retention',DEFAULTS.retention));}catch{if(store.persistenceFailed)scheduler.blockOnPersistenceFailure();}},60000);retentionTimer.unref?.();
   if(store.getSetting('integrationMode')==='simulated'){await adapter.connect();await syncGroups(adapter);}

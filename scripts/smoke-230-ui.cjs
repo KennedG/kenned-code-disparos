@@ -97,7 +97,7 @@ const { MediaManager } = require('../src/core/media.cjs');
     await nav('dashboard'); await nav('contacts'); await expect(page.locator('.contact-intake-form')).toHaveCount(2);
     await page.locator('[data-action=contact-intake-dismiss][data-id="' + extraPending.id + '"]').click();
     await expect.poll(async () => (await rpc('listPendingContacts')).total).toBe(1);
-    await page.locator('.contact-intake-form [name=contactIntakeName]').fill('Cliente da validação'); await page.locator('.contact-intake-form [name=contactIntakeCategory]').selectOption('Cliente Nerópolis'); await page.locator('.contact-intake-form [type=submit]').click();
+    await page.locator('.contact-intake-form [name=contactIntakeName]').fill('Cliente da validação'); await page.locator('.contact-intake-form [name=contactIntakeCategories][value="Cliente Nerópolis"]').check(); await page.locator('.contact-intake-form [type=submit]').click();
     await expect.poll(async () => (await rpc('listPendingContacts')).total).toBe(0); const savedContact = (await snap()).contacts[0]; assert.equal(savedContact.name, 'Cliente da validação'); assert.equal(savedContact.category, 'Cliente Nerópolis'); assert.equal(savedContact.addressBookSupported, false); await expect(page.locator('#main')).toContainText('Salvo no sistema');
     console.log('PASS: repeated verified private contact produces one pending; editable name/classification saved locally with truthful agenda limitation.');
 

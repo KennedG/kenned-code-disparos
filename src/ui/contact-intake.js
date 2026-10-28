@@ -20,7 +20,7 @@ window.KennedContactIntakeUI = {
       return '<section id="contact-intake-panel" class="panel"><div class="panel-header"><h2>Novos contatos para classificar</h2><span class="soft-text">'+e(result.total ?? rows.length)+' pendência(s)</span></div><div class="panel-body">'+
         '<p class="soft-text">Somente mensagens privadas de números novos criam pendências. O contato será salvo neste computador; a integração não permite gravar na agenda vinculada ao WhatsApp.</p>'+
         (rows.length ? rows.map(p => '<article class="role-card"><strong>'+e(p.phone)+'</strong><p class="soft-text">Perfil no WhatsApp: '+e(p.profileName || 'Nome não informado')+' · Primeiro contato: '+e(fmt(p.firstContactAt))+'</p>'+
-          '<form class="contact-intake-form" data-pending-id="'+e(p.id)+'"><div class="field-grid"><div class="field"><label>Nome para salvar</label><input name="contactIntakeName" value="'+e(p.profileName || '')+'" required maxlength="120" '+(!can('contacts.create')?'disabled':'')+'></div><div class="field"><label>Classificação</label><select name="contactIntakeCategory" required '+(!can('contacts.create')?'disabled':'')+'><option value="">Selecione</option><option>Cliente Nerópolis</option><option>Lojista Camelódromo</option></select></div></div><div class="row-actions">'+
+          '<form class="contact-intake-form" data-pending-id="'+e(p.id)+'"><div class="field-grid"><div class="field"><label>Nome para salvar</label><input name="contactIntakeName" value="'+e(p.profileName || '')+'" required maxlength="120" '+(!can('contacts.create')?'disabled':'')+'></div><div class="field"><label>Classificações (pode selecionar várias)</label><div class="check-grid">'+(ctx.data()?.contactCategories || [{name:'Cliente Nerópolis'},{name:'Lojista Camelódromo'},{name:'Fornecedor'}]).map(c=>'<label class="check"><input type="checkbox" name="contactIntakeCategories" value="'+e(c.name)+'" '+(!can('contacts.create')?'disabled':'')+'>'+e(c.name)+'</label>').join('')+'</div></div></div><div class="row-actions">'+
           (can('contacts.create')?'<button type="submit" class="button primary">Salvar e classificar</button>':'')+
           (can('contacts.edit')?'<button type="button" class="button ghost" data-action="contact-intake-dismiss" data-id="'+e(p.id)+'">Dispensar pendência</button>':'')+
           '</div></form></article>').join('') : '<p class="soft-text">Nenhum número novo aguardando classificação.</p>')+
@@ -31,7 +31,9 @@ window.KennedContactIntakeUI = {
       if (state.submitting || !form.reportValidity()) return true;
       state.submitting = true;
       try {
-        const result = await call('savePendingContact', { id: form.dataset.pendingId, name: form.elements.contactIntakeName.value.trim(), category: form.elements.contactIntakeCategory.value });
+        const categories = [...form.querySelectorAll('input[name="contactIntakeCategories"]:checked')].map(el => el.value);
+        if (!categories.length) { ctx.toast('Selecione ao menos uma classificação para o contato.'); return true; }
+        const result = await call('savePendingContact', { id: form.dataset.pendingId, name: form.elements.contactIntakeName.value.trim(), categories });
         state.dirty = false;
         await load(); await ctx.refresh?.(); ctx.render(true);
         ctx.toast(result.message || 'Contato salvo no cadastro local do sistema.');

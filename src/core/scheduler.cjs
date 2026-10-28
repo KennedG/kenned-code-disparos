@@ -85,9 +85,10 @@ function defaultSleep(ms, signal) {
 }
 
 class Scheduler extends EventEmitter {
-  constructor({ store, adapter, now = () => Date.now(), sleep = defaultSleep }) {
+  constructor({ store, adapter, now = () => Date.now(), sleep = defaultSleep, beforeSend = null, onSendResult = null }) {
     super();
     this.store = store;
+    this.beforeSend = beforeSend;this.onSendResult = onSendResult;
     this.now = now;
     this.sleep = sleep;
     this.timer = null;
@@ -182,6 +183,9 @@ class Scheduler extends EventEmitter {
     catch (error) { this._failClosed(); throw error; }
   }
 
+  _destinations(campaign) { return [...(campaign.groupIds||[]),...(campaign.contactIds||[]).map(id=>'contact:'+id)]; }
+  _target(id) { if(!id.startsWith('contact:'))return this.store.getGroup(id);const c=this.store.getEntity('contacts',id.slice(8));return c?{...c,id,contactId:c.id,isContact:true,authorized:c.promotionalConsent===true,simulation:c.storageMode==='simulated'}:undefined; }
+
   _groupConfig(campaign, groupId) {
     const override = campaign.groupOverrides?.[groupId];
     if (!override?.enabled) return { intervalMinutes: campaign.intervalMinutes, schedule: campaign.schedule || {}, items: campaign.items || [] };
@@ -213,14 +217,14 @@ class Scheduler extends EventEmitter {
     const minimumSpacing = Math.max(3, this.adapter.minimumSpacingSeconds ?? 3);
     if (!Number.isFinite(campaign.spacingSeconds) || campaign.spacingSeconds < minimumSpacing) throw new Error(`O espaçamento deve ser de pelo menos ${minimumSpacing} segundo(s).`);
     const maxGroups = Number(this.store.getSetting('maxSelectedGroups', 15));
-    if (!Array.isArray(campaign.groupIds) || !campaign.groupIds.length || campaign.groupIds.length > maxGroups) throw new Error(`Selecione entre 1 e ${maxGroups} grupos.`);
+    if (!Array.isArray(campaign.groupIds) || campaign.groupIds.length > maxGroups || !this._destinations(campaign).length || (campaign.contactIds||[]).length>1000) throw new Error(`Selecione grupos (até ${maxGroups}) ou contatos autorizados (até 1.000).`);
     if (new Set(campaign.groupIds).size !== campaign.groupIds.length) throw new Error('A seleção contém grupos repetidos.');
     this._validateSchedule(campaign.schedule);
     for (const field of ['dailyRoundLimit', 'dailySendLimit']) {
       if (campaign[field] !== undefined && (!Number.isInteger(campaign[field]) || campaign[field] < 0)) throw new Error('Os limites diários devem ser inteiros iguais ou maiores que zero.');
     }
-    for (const groupId of campaign.groupIds) {
-      const group = this.store.getGroup(groupId);
+    for (const groupId of this._destinations(campaign)) {
+      const group = this._target(groupId);
       if (!group?.authorized) throw new Error('Todos os grupos precisam de autorização para publicar.');
       if (Boolean(group.simulation) !== (this.adapter.status.mode === 'simulated')) throw new Error('Grupos simulados e reais não podem ser misturados.');
       const config = this._groupConfig(campaign, groupId);
@@ -272,7 +276,7 @@ class Scheduler extends EventEmitter {
     if ((campaign.dailyRoundLimit && counts.rounds >= campaign.dailyRoundLimit) || (campaign.dailySendLimit && counts.sends >= campaign.dailySendLimit)) lower = nextLocalDay(at);
     const history = this._history(campaign);
     let next = Infinity;
-    for (const groupId of campaign.groupIds) {
+    for (const groupId of this._destinations(campaign)) {
       const config = this._groupConfig(campaign, groupId);
       const last = history.get(groupId)?.lastAt;
       const interval = config.intervalMinutes * 60000;
@@ -437,8 +441,8 @@ class Scheduler extends EventEmitter {
   _maySend(campaignId, groupId) {
     if (this.store.persistenceFailed) { this.blockOnPersistenceFailure(); return false; }
     const campaign = this.store.getCampaign(campaignId);
-    const group = this.store.getGroup(groupId);
-    return !this.closed && !this.persistenceFailed && !this._automationStopped() && this._connected() && campaign?.state === 'active' && campaign.groupIds.includes(groupId) && group?.authorized && Boolean(group.simulation) === (this.adapter.status.mode === 'simulated');
+    const group = this._target(groupId);
+    return !this.closed && !this.persistenceFailed && !this._automationStopped() && this._connected() && campaign?.state === 'active' && this._destinations(campaign).includes(groupId) && group?.authorized && Boolean(group.simulation) === (this.adapter.status.mode === 'simulated');
   }
 
   async _wait(ms, signal) {
@@ -469,20 +473,40 @@ class Scheduler extends EventEmitter {
       try {
         this.campaignInFlight++;
         let result;
-        try { result = await this.adapter.send(job.groupId, { ...job.itemSnapshot, clientMessageId: job.messageId }, job.itemSnapshot.mediaId ? this.store.getMedia(job.itemSnapshot.mediaId) : null); }
+        try {
+          const originalTarget=this._target(job.groupId);
+          const guard=()=>{
+            if(signal.aborted||!this._maySend(job.campaignId,job.groupId))throw Object.assign(new Error('Envio cancelado antes da submissão.'),{code:'SEND_CANCELLED',definitive:true,submitted:false});
+            const campaign=this.store.getCampaign(job.campaignId),target=this._target(job.groupId);
+            if(!isWithinSchedule(this.now(),this._groupConfig(campaign,job.groupId).schedule))throw Object.assign(new Error('A janela de horário terminou antes da submissão.'),{code:'CAMPAIGN_WINDOW_CLOSED',definitive:true,submitted:false});
+            // This job already contributes one attempt to the durable count.
+            if(campaign.dailySendLimit&&this._counts(campaign.id,this.now()).sends>campaign.dailySendLimit)throw Object.assign(new Error('O limite diário foi alterado ou atingido antes da submissão.'),{code:'CAMPAIGN_DAILY_LIMIT',definitive:true,submitted:false});
+            if(originalTarget?.isContact&&target?.phone!==originalTarget.phone)throw Object.assign(new Error('O telefone do contato mudou; revise o destino.'),{code:'CONTACT_CHANGED',definitive:true,submitted:false});
+            const payload=this.beforeSend?.({campaign,job,target,at:this.now()})||job.itemSnapshot;
+            if(JSON.stringify(job.itemSnapshot)!==JSON.stringify(payload))this._persist('updateJob',job.id,{itemSnapshot:payload});
+            job.itemSnapshot=payload;
+            return {...payload,clientMessageId:job.messageId};
+          };
+          const payload=guard(),asset=payload.mediaId?this.store.getMedia(payload.mediaId):null;
+          result=originalTarget?.isContact?await this.adapter.sendPrivateContent(originalTarget.phone,payload,asset,{beforeSubmit:()=>{const p=guard();this.onSendResult?.({campaign:this.store.getCampaign(job.campaignId),job,target:this._target(job.groupId),status:'sending',at:this.now()});return p;}}):await this.adapter.send(job.groupId,payload,asset,{beforeSubmit:()=>{const p=guard();this.onSendResult?.({campaign:this.store.getCampaign(job.campaignId),job,target:this._target(job.groupId),status:'sending',at:this.now()});return p;}});
+        }
         finally { this.campaignInFlight--; }
         const confirmed = result?.status === 'confirmed' || this.receipts.has(result?.messageId || job.messageId);
         this._persist('updateJob', job.id, {
           status: confirmed ? 'confirmed' : 'uncertain', messageId: result?.messageId || job.messageId, resultAt: this.now(),
           error: confirmed ? null : 'Resultado incerto; revise antes de qualquer reenvio.'
         });
+        this.onSendResult?.({campaign:this.store.getCampaign(job.campaignId),job,target:this._target(job.groupId),status:confirmed?'confirmed':'uncertain',at:this.now()});
         this.emit('change');
         return confirmed ? 'confirmed' : 'uncertain';
       } catch (error) {
+        if(error?.submitted===false||error?.safeToRetry===true)this.onSendResult?.({campaign:this.store.getCampaign(job.campaignId),job,target:this._target(job.groupId),status:'cancelled',at:this.now()});
         const safeRetry = error?.safeToRetry === true;
         const definitive = safeRetry || error?.definitive === true;
         const restricted = this.adapter.status.state === 'restricted' || error?.restricted === true;
         const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : definitive ? 'SEND_FAILED' : 'SEND_UNCERTAIN';
+        const skipped = {PROMOTION_TARGET_PAUSED:'Destino pausado.',PROMOTION_OPT_OUT:'O contato recusou mensagens promocionais.',PROMOTION_OUTSIDE_SCHEDULE:'Fora do horário promocional.',PROMOTION_REPEAT_LIMIT:'Limite de repetição atingido.',PROMOTION_INTERVAL:'Intervalo promocional ainda não cumprido.',CAMPAIGN_WINDOW_CLOSED:'A janela de horário terminou.',CAMPAIGN_DAILY_LIMIT:'Limite diário atingido.'}[code];
+        if(skipped&&error?.submitted===false){this._persist('updateJob',job.id,{status:'cancelled',resultAt:this.now(),errorCode:code,error:skipped});this._diagnostic(job,code,skipped,attempt,'Destino omitido com segurança; demais destinos continuam elegíveis.');this.emit('change');return 'skipped';}
         if (safeRetry && attempt < policy.maxAttempts && !restricted && !signal.aborted && this._connected()) {
           this._persist('updateJob', job.id, { status: 'queued', error: 'Falha anterior à submissão; tentativa limitada pendente.' });
           this._diagnostic(job, code, 'Falha temporária anterior à submissão.', attempt, 'Nova tentativa limitada agendada.');
@@ -532,7 +556,7 @@ class Scheduler extends EventEmitter {
   async _runRound(campaign) {
     const at = this.now();
     const history = this._history(campaign);
-    const groups = campaign.groupIds.filter(groupId => {
+    const groups = this._destinations(campaign).filter(groupId => {
       const config = this._groupConfig(campaign, groupId);
       const last = history.get(groupId)?.lastAt;
       return (last === undefined || last === null || last + config.intervalMinutes * 60000 <= at) && isWithinSchedule(at, config.schedule);
@@ -583,7 +607,8 @@ class Scheduler extends EventEmitter {
       this._persist('updateRound', round.id, { status: roundStatus, finishedAt: this.now() });
       this.currentRound = null;
       const live = this.store.getCampaign(campaign.id);
-      if (live?.state === 'active') {
+      if (live?.state === 'active'&&live.oneShot&&roundStatus==='completed'){this._persist('saveCampaign',{...live,state:'stopped',nextRunAt:null});}
+      else if (live?.state === 'active') {
         const next = this._nextEligibleAt(live, this.now(), { afterRound: true });
         this._persist('saveCampaign', { ...live, state: Number.isFinite(next) ? 'active' : 'stopped', nextRunAt: Number.isFinite(next) ? next : null });
       }
@@ -594,21 +619,21 @@ class Scheduler extends EventEmitter {
   getSummary(id) {
     const c = this.store.getCampaign(id);
     if (!c) throw new Error('Campanha não encontrada.');
-    const names = c.groupIds.map(id => this.store.getGroup(id)?.name || id);
+    const names = this._destinations(c).map(id => this._target(id)?.name || id);
     const types = { text: 'Texto', image: 'Imagem', video: 'Vídeo', document: 'Documento' };
     const content = (c.items || []).map((item, i) => `${i + 1}. ${types[item.type] || item.type}: ${item.type === 'text' ? item.text : this.store.getMedia(item.mediaId)?.name || 'Mídia ausente'}${item.caption ? ` — ${item.caption}` : ''}`);
     const days = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
     const p = scheduleParts(c.schedule);
     const duration = p.start === p.end ? 1440 : (p.end - p.start + 1440) % 1440;
     let estimated = 0;
-    for (const groupId of c.groupIds) {
+    for (const groupId of this._destinations(c)) {
       const config = this._groupConfig(c, groupId);
       const gp = scheduleParts(config.schedule);
       const length = gp.start === gp.end ? 1440 : (gp.end - gp.start + 1440) % 1440;
       estimated += Math.ceil(length / config.intervalMinutes) * (c.mode === 'rotate' ? Math.min(1, config.items.length) : config.items.length);
     }
     if (c.dailySendLimit) estimated = Math.min(estimated, c.dailySendLimit);
-    if (c.dailyRoundLimit) estimated = Math.min(estimated, c.dailyRoundLimit * c.groupIds.reduce((sum, id) => sum + (c.mode === 'rotate' ? 1 : this._groupConfig(c, id).items.length), 0));
+    if (c.dailyRoundLimit) estimated = Math.min(estimated, c.dailyRoundLimit * this._destinations(c).reduce((sum, id) => sum + (c.mode === 'rotate' ? 1 : this._groupConfig(c, id).items.length), 0));
     const overrides = c.groupIds.filter(id => c.groupOverrides?.[id]?.enabled).map(id => {
       const config = this._groupConfig(c, id);
       const preview = config.items.map((item, index) => `${index + 1}. ${types[item.type]}: ${item.type === 'text' ? item.text : this.store.getMedia(item.mediaId)?.name || 'Mídia ausente'}${item.caption ? ` — ${item.caption}` : ''}`).join('\n');
@@ -617,7 +642,7 @@ class Scheduler extends EventEmitter {
     return [
       `${c.name} (${c.id}) — ${c.state}`,
       `Modo: ${c.mode === 'rotate' ? 'alternar: próximo conteúdo a cada participação do grupo' : 'repetir todos os conteúdos na ordem'}.`,
-      `Grupos (${names.length}): ${names.join(', ') || 'nenhum'}.`,
+      `Destinos (${names.length}): ${names.join(', ') || 'nenhum'}.`,
       'Conteúdo:', ...(content.length ? content : ['Nenhum conteúdo principal.']),
       `Intervalo entre inícios: ${c.intervalMinutes} min. Espaçamento entre envios: ${c.spacingSeconds} s.`,
       `Dias: ${p.days.map(d => days[d]).join(', ')}. Horário: ${c.schedule?.startTime || '00:00'}–${c.schedule?.endTime || '00:00'} (${duration / 60} h).`,

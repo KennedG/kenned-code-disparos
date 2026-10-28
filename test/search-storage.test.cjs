@@ -13,7 +13,7 @@ const offer=(extra={})=>({model:'iPhone 18 Pro Max',modelKey:'iphone-18-pro-max'
 test('schema v4 migrates narrowly preserving campaign progress and producing an original pre-migration copy',async t=>{
   const {store:s,open}=await fixture(t);seed(s);s.insertJob({id:'j1',roundId:'r1',campaignId:'c1',groupId:'g1',itemId:'i1',status:'confirmed',attempts:1,createdAt:at,messageId:'NEVER-REPEAT'});s.clearHistory({actor:'owner'});s.close();
   const db=new DatabaseSync(s.filename);db.exec('PRAGMA user_version=4');db.close();const before=fs.readFileSync(s.filename);
-  const upgraded=await open();assert.equal(upgraded.schemaVersion,7);assert.equal(upgraded.getJob('j1').messageId,'NEVER-REPEAT');assert.equal(upgraded.listHistory().total,0);assert.equal(upgraded.listCampaigns().length,1);assert.equal(upgraded.getSearchMonitorStats().offers,0);
+  const upgraded=await open();assert.equal(upgraded.schemaVersion,8);assert.equal(upgraded.getJob('j1').messageId,'NEVER-REPEAT');assert.equal(upgraded.listHistory().total,0);assert.equal(upgraded.listCampaigns().length,1);assert.equal(upgraded.getSearchMonitorStats().offers,0);
   const files=fs.readdirSync(path.join(upgraded.dir,'backups'));assert.equal(files.length,1);assert.deepEqual(fs.readFileSync(path.join(upgraded.dir,'backups',files[0])),before);
 });
 

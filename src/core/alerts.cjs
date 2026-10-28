@@ -400,7 +400,10 @@ class AlertService extends EventEmitter {
             this._trace(alert, 'recipient', 'ALERT_RECIPIENT_RESOLVED', resolved?.isSelf ? 'Destinatário resolvido como a própria conta conectada.' : 'Destinatário privado resolvido pela integração.', 'Iniciando submissão; envio ainda não confirmado.', attempt);
             if (this.scheduler) this.scheduler.lastSubmissionAt = this.now();
             submitted = true;
-            result = await adapter.sendPrivate(alert.number, alert.text, { clientMessageId: alert.messageId });
+            result = await adapter.sendPrivate(alert.number, alert.text, { clientMessageId: alert.messageId, beforeSubmit: () => {
+              if (this.closed || this._stopped() || stopRevision !== this.stopRevision || this.store.persistenceFailed || this.scheduler?.persistenceFailed || adapterRevision !== this.adapterRevision || mode !== this._mode() || adapter.status.state !== 'connected' || this._get('alerts', alert.id)?.status !== 'sending') throw Object.assign(new Error('Alerta interrompido antes da submissão.'), { code:'ALERT_CANCELLED', definitive:true, submitted:false, safeToRetry:false });
+              this._validateRecipient(alert);
+            } });
           } else {
             const config = this.store.getSetting('independentAlertChannel', null);
             if (!config?.enabled || !/^https:\/\//i.test(config.url || '')) throw Object.assign(new Error('Canal independente indisponível.'), { safeToRetry: true, definitive: true });

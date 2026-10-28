@@ -5,8 +5,8 @@ const validation = require('./validation.cjs');
 
 const fault = (message, code) => Object.assign(new Error(message), {code});
 class TemplateService {
-  constructor({store,auth,media,now=()=>Date.now()}) {
-    this.store=store;this.auth=auth;this.media=media;this.now=now;
+  constructor({store,auth,media,commercial,now=()=>Date.now()}) {
+    this.store=store;this.commercial=commercial;this.auth=auth;this.media=media;this.now=now;
   }
   _assert(userId,permission) {
     if(!this.auth)throw fault('A validação de acesso aos modelos está indisponível.','AUTH_REQUIRED');
@@ -30,10 +30,18 @@ class TemplateService {
     const name=typeof input.name==='string'?input.name.trim():'';
     if(!name||name.length>120||/[\x00-\x1f]/.test(name))throw fault('Informe um nome de modelo de 1 a 120 caracteres.','TEMPLATE_NAME_INVALID');
     const items=validation.items(input.items,this.store);
+    const sources=this.store.listCampaigns().filter(c=>this.auth.canFor(userId??this.auth.currentUserId,'campaign.view',c)).flatMap(c=>c.items||[]);
+    const inventoryIds=new Set(old?.inventoryIds||[]);
+    for(let index=0;index<items.length;index++){
+      const raw=input.items[index],trusted=old?.items.find(i=>i.id===raw.id)||sources.find(i=>i.id===raw.id);
+      let ref=trusted?.commercialRef;
+      if(!ref&&raw.commercialRef){this._assert(userId,'commerce.view');if(!this.commercial)throw fault('Validação comercial indisponível.','COMMERCIAL_REF_INVALID');ref=this.commercial.validateCommercialRef(raw.commercialRef,raw);}
+      if(ref){items[index].commercialRef=structuredClone(ref);for(const line of ref.lines||[])if(line.sourceType==='inventory')inventoryIds.add(line.sourceId);}
+    }
     if(!items.length)throw fault('Adicione ao menos um texto ou arquivo ao modelo.','TEMPLATE_EMPTY');
     for(const item of items)if(item.type!=='text')this.media.getPath(item.mediaId);
     if(old&&input.expectedUpdatedAt!==undefined&&Number(input.expectedUpdatedAt)!==Number(old.updatedAt??old.createdAt))throw fault('O modelo foi alterado. Reabra-o antes de salvar.','TEMPLATE_STALE');
-    const model={...old,id:old?.id||randomUUID(),name,items,createdAt:old?.createdAt??this.now(),updatedAt:this.now(),createdBy:old?.createdBy??user.id,updatedBy:user.id};
+    const model={...old,id:old?.id||randomUUID(),name,items,...(inventoryIds.size?{inventoryIds:[...inventoryIds]}:{}),...(items.find(i=>i.commercialRef)?.commercialRef.audience?{audience:items.find(i=>i.commercialRef).commercialRef.audience}:{}),createdAt:old?.createdAt??this.now(),updatedAt:this.now(),createdBy:old?.createdBy??user.id,updatedBy:user.id};
     return this.store.transaction(()=>{
       this.store.saveTemplate(model);
       const persisted=this._get(model.id);
@@ -59,7 +67,7 @@ class TemplateService {
   apply(id,userId) {
     const model=this.get(id,userId);
     for(const item of model.items)if(item.type!=='text')this.media.getPath(item.mediaId);
-    return {templateId:model.id,name:model.name,items:model.items.map(item=>({...item,id:randomUUID()}))};
+    return {templateId:model.id,name:model.name,audience:model.audience,inventoryIds:model.inventoryIds||[],items:model.items.map(item=>({...item,id:randomUUID(),templateId:model.id,sourceTemplateItemId:item.id}))};
   }
 }
 module.exports={TemplateService};

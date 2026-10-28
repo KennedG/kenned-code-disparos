@@ -289,7 +289,13 @@ class ReminderService extends EventEmitter {
       current = this._save('reminder_deliveries', { ...ledger, attempts: attempt, status: 'sending', submittedAt: this.now(), targetId: resolved.jid, isSelf: resolved.isSelf === true });
       this._trace(current, 'recipient', 'REMINDER_RECIPIENT_RESOLVED', 'Destinatário privado resolvido e autorização validada.', 'Submissão iniciada; confirmação ainda pendente.');
       this.inFlight.add(current.id); if (this.scheduler) this.scheduler.lastSubmissionAt = this.now(); submitted = true;
-      const result = await adapter.sendPrivate(current.number, current.text, { clientMessageId: current.messageId });
+      const result = await adapter.sendPrivate(current.number, current.text, { clientMessageId: current.messageId, beforeSubmit: () => {
+        const fresh = this._get('reminders', current.reminderId), ledger = this._get('reminder_deliveries', current.id);
+        if (this._blocked() || adapter !== this.adapter || revision !== this.adapterRevision || mode !== this._mode() || ledger?.status !== 'sending' || !fresh || fresh.scheduleRevision !== current.scheduleRevision || !current.test && !['active','completed'].includes(fresh.state)) throw fail('Lembrete interrompido antes da submissão.', 'REMINDER_CANCELLED');
+        if (this._recipient(current.recipientId).phone !== current.number) throw fail('O destinatário foi alterado antes da submissão.', 'REMINDER_RECIPIENT_DISABLED');
+        if (current.userId) this._assert(current.userId, 'reminder.control');
+        if (current.deadlineAt < this.now()) throw fail('O prazo do lembrete venceu antes da submissão.', 'REMINDER_OVERDUE_SKIPPED');
+      } });
       if (mode !== this._mode() || adapter !== this.adapter) return;
       const latest = this._get('reminder_deliveries', current.id), confirmed = ['confirmed', 'delivered'].includes(latest?.status) || ['confirmed', 'delivered'].includes(result?.status);
       const delivered = latest?.status === 'delivered' || result?.status === 'delivered' || confirmed && ['whatsapp-delivered', 'whatsapp-read'].includes(result?.confirmationScope);

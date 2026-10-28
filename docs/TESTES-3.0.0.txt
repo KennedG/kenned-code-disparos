@@ -1,0 +1,889 @@
+
+> kenned-code-disparos@3.0.0 test
+> node scripts/test.cjs
+
+
+adapter.test.cjs
+✔ simulação identifica grupos fictícios e oferece falha antes do envio e resultado incerto (8.655943ms)
+✔ integração real exige Windows e proteção do sistema operacional (1.849044ms)
+✔ sessão e chaves ficam cifradas e gravadas atomicamente, sem arquivos de texto de autenticação (50.010923ms)
+✔ sendMessage sem ACK retorna incerto; ACK autenticado confirma inclusive após timeout (44.02769ms)
+✔ erro após submissão não autoriza retentativa e restrição pausa transporte (11.373673ms)
+✔ desconexão libera envio pendente como incerto sem aguardar um transporte travado (5.498108ms)
+✔ tempo de submissão encerra transporte travado e registra resultado incerto sem retentativa (26.160962ms)
+✔ reconectar cria outro transporte e preserva a sessão cifrada (13.68305ms)
+✔ logout confirmado remove a sessão inválida e aguarda conexão explícita (10.545312ms)
+✔ sessão cifrada corrompida permanece bloqueada até remoção explícita (9.729302ms)
+✔ resposta de controle travada tem prazo e encerra transporte sem repetir (25.850851ms)
+✔ download atrasado tem prazo e destrói um stream que chega depois sem fornecer mídia (26.045145ms)
+✔ download que para após alguns bytes é rejeitado sem retornar conteúdo parcial (29.746425ms)
+✔ mídia usa bytes verificados da biblioteca e rejeita caminho externo ou conteúdo alterado (8.468764ms)
+✔ identidade vem do protocolo, LID sem número é rejeitado e histórico/replay não entram (19.135521ms)
+✔ bridge assíncrona de proteção cifra e restaura credenciais antes de criar transporte (8.220663ms)
+✔ alerta privado valida telefone e não mostra confirmado sem ACK autenticado (23.30591ms)
+✔ alertas privados concorrentes compartilham submissão e aguardam confirmação (6.687062ms)
+✔ queda de internet fecha transporte, mantém sessão e marca envio pendente como incerto (13.128183ms)
+✔ motivos de sessão expirada, restrição e erro de rede são tipados sem expor segredos (7.018712ms)
+✔ buffers de simulação têm limite e alerta incerto continua incerto sem novo envio (23.599358ms)
+✔ gravação protegida agrupa rajadas e aguarda atualizações que chegam durante a cifra (17.323787ms)
+✔ falha de proteção em uma rajada produz um único evento e encerra a conexão com segurança (13.537497ms)
+✔ falha tardia do transporte antigo não restringe a nova conexão (3.732408ms)
+✔ resposta privada usa chat recebido autenticado sem USYNC e rejeita contexto fabricado (9.186587ms)
+✔ chat privado LID usa PN alternativo autenticado e mantém o JID original na resposta (5.967417ms)
+✔ LID sem telefone no evento consulta mapeamento autenticado antes da autorização, sem número fictício (7.124238ms)
+✔ prova da conversa privada persiste protegida na sessão e resiste a reinício sem confiar em chamadas externas (7.781924ms)
+✔ resposta administrativa com prova usa confirmação da integração e eco automático é identificado (6.76685ms)
+✔ identificação privada factual sobrevive à reconexão e reinício protegidos sem depender de USYNC (7.902843ms)
+ℹ tests 30
+ℹ suites 0
+ℹ pass 30
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 463.655403
+
+alerts.test.cjs
+✔ one occurrence queues one alert per distinct authorized recipient and uses the original failure time (32.836772ms)
+✔ reconnection flushes pending alerts sequentially with server confirmation and preserves failure timestamp (6.276555ms)
+✔ ambiguous alert result never retries; late ACK reconciles only its durable message identifier (1.397915ms)
+✔ a crash during alert submission recovers to uncertain and never performs a second network request (0.59044ms)
+✔ only safe presubmission alert failures retry using bounded configurable delays and the same identifier (2.567156ms)
+✔ private test uses the real transport path and an uncertain result requires an audited explicit review (4.404521ms)
+✔ disconnect notifications deduplicate a failure, omit manual disconnects and create a new occurrence after reconnection (6.253041ms)
+✔ automatic resume is opt-in and only resumes previously active unchanged connection-paused campaigns (26.8304ms)
+✔ independent HTTPS channel is marked channel acceptance and works while WhatsApp is disconnected (4.088649ms)
+✔ notification muting persists and cleanup does not recreate the local occurrence on restart (3.973852ms)
+✔ alert message exposes campaign outcome counts without credentials (0.512192ms)
+✔ automatic reconnection obeys a finite attempt limit and never reconnects an expired or manual session (3.907474ms)
+✔ uncertain sends and an explicit manual pause are never automatically resumed (5.510145ms)
+✔ storage poisoning creates one immediate local critical warning and blocks all private submissions (0.462819ms)
+✔ zero automatic reconnect attempts means zero socket attempts even when reconnect is enabled (4.415843ms)
+✔ an automatic connection attempt waits for handshake or QR instead of recreating the socket on a timer (1.817486ms)
+✔ pending alerts use bounded indexed batches and concurrent flush calls share one network worker (38.18624ms)
+✔ disconnect immediately persists one local occurrence and private pending notices for owners and configured recipients (1.378118ms)
+✔ global critical incidents use explicit system recipient selection and a separately recorded occurrence (1.080095ms)
+✔ per-recipient test and full alert test share the production occurrence notification and queue pipeline (1.912022ms)
+✔ the own account recipient is resolved by the integration and confirmation is recorded only after transport acknowledgement (1.878322ms)
+✔ recipient resolution failures never submit and show an actionable reason without exposing provider secrets (1.350541ms)
+✔ known failed alerts support an explicit audited retry while uncertain and confirmed alerts reject it (1.350305ms)
+✔ late delivered receipt reconciles uncertain or reviewed work without duplication and never degrades on a later server ACK (0.961977ms)
+✔ a receipt delivered during transport submission cannot be overwritten by a late uncertain transport result (0.90651ms)
+✔ simulation never invokes an independent real webhook and simulated private work cannot leak after adapter mode switch (5.619439ms)
+✔ removing or disabling a private recipient while offline prevents any queued delivery after reconnection (0.961727ms)
+✔ critical scheduler failures notify once per unresolved occurrence and create a new occurrence after recovery (2.209162ms)
+✔ a persisted offline disconnect is reused on restart instead of generating duplicate pending alerts (2.239204ms)
+✔ a recipient disabled while WhatsApp resolves its private identifier is revalidated before submission (2.063655ms)
+✔ an active user who lost ownership while the private alert was pending no longer receives the global failure (0.759619ms)
+✔ a confirmed delivery receipt wins over a later rejected transport promise and cannot become retryable work (1.271459ms)
+✔ the real integration unsupported-recipient code gives the user an update instruction and cannot retry infinitely (1.116965ms)
+✔ the real integration known presubmission temporary failure remains retryable despite definitive outcome classification (0.965083ms)
+✔ real read proof stays stronger than later delivery proof or server acceptance (0.843256ms)
+✔ a simulation-only receipt never claims a real WhatsApp server confirmation scope (0.833723ms)
+✔ parar tudo cancela pendentes, bloqueia novas filas e testes, mas mantém notificações locais (2.573795ms)
+✔ parar tudo durante resolução privada não deixa o antigo lote enviar após retomada (1.25521ms)
+✔ envio já em andamento mantém confirmação e é informado separadamente dos cancelados (1.44644ms)
+✔ política global de alerta limita tentativas e respeita intervalo configurado com identificador estável (2.81147ms)
+✔ desconexão com automação interrompida avisa localmente e não retoma campanhas ou alertas (1.084137ms)
+✔ cancelamento da fila automática é controle operacional e não produz falha de persistência (0.664349ms)
+ℹ tests 42
+ℹ suites 0
+ℹ pass 42
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 200.557037
+
+audit-self-delivery.test.cjs
+✔ native SQLite plus WhatsAppAdapter accepts a manual self command with device PN and sends no-results once (351.078619ms)
+✔ authorized other sender is searched and configured private recipients receive results, never implicit group origin (471.298722ms)
+✔ persisted automatic IDs reject own automation echoes and replay after reconnect while new manual commands still work (268.405602ms)
+✔ real production alerts queue on disconnect, notify locally, then send once after ACK; server acceptance is not device delivery (190.150781ms)
+✔ campaign error and recipient test share the real alert pipeline without first-send suppression or duplicate occurrences (209.489209ms)
+✔ search and alert queues share one FIFO and stay unconfirmed until their individual authenticated ACKs (194.397671ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1693.644318
+
+auth.test.cjs
+✔ passwords use random salted asynchronous scrypt and verify safely (607.027698ms)
+✔ only one first-owner registration succeeds including concurrent attempts (128.836994ms)
+✔ setup adopts existing campaigns and legacy authorized phones without modifying content or progress (115.254201ms)
+✔ no hashes, password or recovery secrets appear in public users/status/audits (228.309361ms)
+✔ unauthenticated signup/user management and permission calls are denied (114.441982ms)
+✔ seller visibility and action scope are enforced from saved ownership (396.1598ms)
+✔ individual grants and all-campaign scope take effect and can be revoked live (234.135494ms)
+✔ last owner cannot be deleted, disabled or demoted; additional owner can (250.244803ms)
+✔ administrator cannot grant owner privileges or modify a protected owner role (343.807052ms)
+✔ custom profiles are configurable and cannot be deleted while assigned (215.404744ms)
+✔ deactivated users and phone commands lose permission immediately without changing GUI actor (350.380982ms)
+✔ phone identities are validated and cannot be claimed by multiple local users (231.626691ms)
+✔ login throttles repeated failures persistently and permits recovery after the interval (437.354005ms)
+✔ admin-created credentials require a password change before app and WhatsApp operations (596.747141ms)
+✔ owner offline recovery codes work once, never stored as plaintext, and require secure new password (428.593371ms)
+✔ authorized administrator-issued reset expires, consumes once and never exposes another owner code (654.859377ms)
+✔ password and recovery rotation invalidate reset tokens and previous offline codes (419.264239ms)
+✔ important actions and denials record actor, time and purpose separately from history (238.307636ms)
+✔ additional owners receive their private recovery codes only on their own first login (478.85096ms)
+✔ real local database persists auth and ordinary backup/history cleanup preserve accounts and recovery state (404.056509ms)
+ℹ tests 20
+ℹ suites 0
+ℹ pass 20
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6885.361541
+
+automation-control.test.cjs
+✔ global stop latches synchronously before any awaited callback, cancels queued work and preserves campaigns (68.743832ms)
+✔ global stop aborts a campaign spacing wait and records an already-submitted result once (69.574111ms)
+✔ stop remains persisted across restart and explicit resume does not reactivate old campaigns (57.25716ms)
+✔ a cancelled external callback cannot run after explicit resume while its predecessor remains in flight (50.251385ms)
+✔ failed stop bookkeeping and failed resume persistence keep the runtime fail-closed (51.073095ms)
+✔ private administrator help, menu and status work with verified identity and a shared manual reply queue (196.950782ms)
+✔ private stop is processed once, reports automatic queues, preserves administrative replies and requires explicit resume (175.934889ms)
+✔ search authorization alone cannot execute administrative private commands, and names never authorize (157.120016ms)
+✔ manual own-account admin commands are supported, while automatic echoes and forwarded packets are ignored (176.223188ms)
+✔ queued admin reply revalidates revocation before its network submission (162.351958ms)
+✔ simulation and real integration retain separate global stop latches (57.863615ms)
+✔ verified administrator LID packets reply only to their original private chat (164.20743ms)
+✔ an ambiguous administrative reply has one submission and cannot repeat a completed stop (161.779306ms)
+ℹ tests 13
+ℹ suites 0
+ℹ pass 13
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1559.814294
+
+backend-230.test.cjs
+✔ 2.3 service ranks original publication times in a two-hour window, persists periods and excludes financed or unpriced products (497.579772ms)
+✔ 2.3 private incoming BUSCAS replies only to the authorized requester, regardless of configured owner/responsible destinations (6661.434204ms)
+✔ 2.3 unauthorized local identity cannot execute BUSCAS or claim the owner by payload (417.26009ms)
+✔ 2.3 alerts distinguish offline pending and simulated confirmation, preserve the original event time and survive restart (3306.030418ms)
+✔ 2.3 template backend persists formatted text and managed media through close/reopen and applies a saved model without mutable sharing (352.688928ms)
+✔ 2.3 media deletion backend identifies template/campaign usage and deletes independent managed copies only after typed confirmation (229.616698ms)
+✔ 2.3 reminders persist schedule, show test confirmation and refuse automatic work under the persistent global stop latch (1423.87517ms)
+✔ 2.3 verified private intake creates one actionable contact pending, group senders are ignored, and saving classifies only local storage (272.152007ms)
+✔ 2.3 private administrative commands stay available during STOP and cancel every automatic pending family before reconnect (581.436145ms)
+✔ 2.3 portable reminder backup and restoration enforce reminder permissions before opening a file dialog (884.29605ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 14636.971872
+
+backend.test.cjs
+✔ upgrade keeps existing campaigns and the first owner adopts them; no unauthenticated data or mutation (421.42138ms)
+✔ backend enforces own campaign scope, denied settings and media paths, and last owner protection (574.331584ms)
+✔ history deletion requires preview and typed confirmation; confirmed and uncertain operational jobs remain reviewable (222.951412ms)
+✔ native notification results are persisted truthfully and disconnection works while the GUI is logged out (392.881752ms)
+✔ history export uses native save selection and never contains password hashes or recovery codes (195.715621ms)
+✔ sound preferences reject invalid values and the test passes exact configured volume to the native host (229.930019ms)
+✔ own-scope settings editors cannot change the shared integration, backup foreign data or replace all campaigns (654.348594ms)
+✔ global campaign visibility alone does not authorize connection changes, complete backups or restore (444.942306ms)
+✔ owner metrics survive display settings, rejected commands and logout without exposing totals to sellers (770.286199ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3928.415945
+
+backup-reminders.test.cjs
+✔ portable backup exports only validated reminder configuration and restores paused across actual restart without replaying operational ledger (322.708058ms)
+✔ a legacy backup without reminders key preserves existing local reminder configuration and ledger byte for byte (250.872414ms)
+✔ a missing user recipient in another computer restores as paused and review required without importing or authorizing users (101.290962ms)
+✔ malformed reminder configurations and retry policies reject before any existing data is replaced (237.104633ms)
+✔ an explicit empty reminders collection clears only local configurations and retains every operational ledger (167.620673ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1090.178602
+
+business-backend.test.cjs
+✔ backend sale idempotency and financial permission gates preserve stock and hide private costs from seller/manager (1414.48411ms)
+✔ backend commercial draft protects audience, manages private consent, and saved stock templates keep availability provenance (4510.504984ms)
+✔ schema upgrade takes recoverable pre-migration SQLite backup and local full snapshot preserves financial ledgers (105.521811ms)
+✔ financial report recipients must have both report and financial permissions, and STOP blocks new automatic reports (398.197996ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6435.911345
+
+campaign-business-300.test.cjs
+✔ pausing one promotional group skips only that destination and preserves other authorized sends (226.975315ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 247.560998
+
+commands.test.cjs
+✔ somente administradores autenticados em conversa direta podem comandar (8.507155ms)
+✔ telefone real verificado suporta LID; mensagens não verificadas e número LID não autenticam (0.700282ms)
+✔ comando repetido não é processado novamente, inclusive após recriar controlador (0.553829ms)
+✔ sem administradores configurados os comandos permanecem desabilitados (4.392463ms)
+✔ criar e editar campanhas não as ativa e preserva texto/legendas (7.525957ms)
+✔ ativação exige resumo e confirmação de uso único (5.376585ms)
+✔ confirmação expirada, cancelada ou de revisão antiga nunca ativa (2.128441ms)
+✔ confirmação pertence ao administrador que recebeu o resumo (4.618635ms)
+✔ alteração de destinos ativa somente após resumo; fila velha é pausada antes da retomada (4.737634ms)
+✔ pausar e parar tudo invalidam confirmações pendentes (4.330683ms)
+✔ grupos não autorizados, outra integração e excesso de grupos são recusados (2.595855ms)
+✔ mídias só são importadas em uma sessão de conteúdo da campanha selecionada (3.385501ms)
+✔ sessão expirada não baixa nem associa mídias (0.858536ms)
+✔ mídia de outro administrador não é associada à sessão alheia (0.547817ms)
+✔ menu configura horários, dias, intervalo, modo e ordena conteúdos (5.498054ms)
+✔ configuração individual recebe seu próprio conteúdo sem alterar outros grupos (3.821444ms)
+✔ edição de conteúdo ativo aguarda confirmação, e alteração concorrente invalida sessão (2.013209ms)
+✔ avanço de rodadas não invalida resumo e preserva o contador ao confirmar alteração (4.547821ms)
+✔ atualizações de execução não encerram a sessão de edição do WhatsApp (1.452139ms)
+✔ mudança de estado após o resumo invalida confirmação mesmo sem alterar conteúdo (1.331141ms)
+✔ parada externa durante a espera da fila impede aplicar conteúdo e retomar (1.162959ms)
+✔ conteúdo individual vazio usa os conteúdos principais como o agendador (0.817489ms)
+✔ legenda de mídia com prefixo não executa comandos e permanece conteúdo da campanha (1.985265ms)
+✔ parada autorizada interrompe campanha enquanto uma configuração aguarda mídia (3.573351ms)
+✔ parada prioritária de remetente não autorizado não interrompe campanhas (0.275544ms)
+✔ download com prazo excedido libera a fila e não importa conteúdo parcial (2.011655ms)
+✔ falha da resposta de controle não bloqueia o próximo comando (1.668034ms)
+✔ número legado sem vínculo com usuário ativo não autentica em produção (0.430049ms)
+✔ campanhas e prévias respeitam o escopo do vendedor sem alterar o login do aplicativo (2.75918ms)
+✔ permissões de editar, iniciar, pausar e encerrar são separadas no controle remoto (2.029583ms)
+✔ confirmação revalida permissões e identidade após mudança de acesso (1.470507ms)
+✔ criação remota grava o dono correto e auditoria separada sem salvar texto ou tokens (2.199629ms)
+✔ edição de mídia revalida acesso depois do download e não importa mídia sem permissão (0.67088ms)
+✔ vendedor não encerra globalmente campanhas de outro usuário (0.437111ms)
+ℹ tests 34
+ℹ suites 0
+ℹ pass 34
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 121.403527
+
+commerce-automation.test.cjs
+✔ known fixed and percentage markup calculations use cents and markup over cost (3.558609ms)
+✔ opportunity matches exact model capacity condition price and original two-hour age (198.452055ms)
+✔ installments, entry and ambiguous values cannot trigger cheap opportunity alert (95.054465ms)
+✔ same provider offer repeated and forwarded copies cannot create duplicate alerts (81.985728ms)
+✔ opportunity pause cancels queued delivery and deletion preserves operational ledger (67.670428ms)
+✔ demand matches sale price after markup and notifies administrator only (128.978225ms)
+✔ buyer proposal requires explicit approval, strips internal data, and never publishes automatically (93.430603ms)
+✔ stale edited and opted-out buyer proposals refuse approval (70.080656ms)
+✔ unavailable supplier phone is shown honestly and forwarded sender never becomes original provider (236.886698ms)
+✔ off-line deliveries remain pending with original publication and resume once after reconnection (61.88327ms)
+✔ permissions for searching administering and finance are separate on writes and recipients (55.205865ms)
+✔ admin-only daily report distinguishes sales profit receipts cards and physical drawer (70.203872ms)
+✔ daily report actual financial updates get clearly identified version and no automatic duplicate (86.773037ms)
+✔ no sales and unknown costs produce explicit truthful daily report (0.319408ms)
+✔ bounded safe pre-submission retry and final failure do not claim success (70.817474ms)
+✔ uncertain submission is not automatically repeated and receipt upgrades to delivered (47.979357ms)
+✔ permission revoked during asynchronous recipient resolution blocks final network call (61.165467ms)
+✔ STOP during recipient resolution cancels pending delivery and prevents new automatic work (57.971518ms)
+✔ simulation records never resolve or send while real mode is active (51.043638ms)
+✔ restart converts interrupted deliveries to uncertain without resubmitting and retains persistent config (54.603912ms)
+✔ financial details remain absent from nonfinancial commerce snapshot (53.523913ms)
+ℹ tests 21
+ℹ suites 0
+ℹ pass 21
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1663.41124
+
+commerce-finance.test.cjs
+✔ known totals: original deposit, discount, split payments, card fee and direct expense reconcile exactly (151.327379ms)
+✔ partial sale and later payment preserve sale-day turnover and distinguish prior-sale receipt (113.873582ms)
+✔ idempotent repeated clicks and persistence after reopening do not duplicate sales, cash or stock changes (75.380066ms)
+✔ mid-transaction failure rolls back stock, sale, receipts, movement, reservation and operation marker (63.313131ms)
+✔ reservation blocks another buyer and deposit cannot be reused or exceed total (81.390745ms)
+✔ released and expired reservation deposits remain refundable with exactly one durable outflow (85.884084ms)
+✔ cancel, financial refund and physical return are distinct audited operations with bounded replay (100.464597ms)
+✔ partial approved refund changes effective paid/outstanding and correction retains history (72.942854ms)
+✔ untrusted payment fields cannot convert new-sale or later receipt into refund (54.562591ms)
+✔ cash opening and close distinguish physical drawer from Pix/card, counted difference and general expense (109.283651ms)
+✔ future receipts and close before already registered movement are rejected; overnight open cash is shown (66.713747ms)
+✔ accessory cost pool retains every cent across mixed-cost purchases, sale and stock return (85.678309ms)
+✔ editing unchanged average cost preserves pool residual and recorded cost revaluation remains audited (55.007183ms)
+✔ known credit-card fee on deposit cannot be removed from sale and remaining cost average follows exact pool (66.179605ms)
+✔ historical cash report excludes later receipts and future close count/difference (74.635328ms)
+✔ direct expense correction creates exact cash reversal without double-counting a general expense (67.724554ms)
+✔ safe public stock omits cost pool, supplier, serial, IMEI and internal notes; unknown cost stays unknown (90.88634ms)
+✔ commercial reports filter audience/product/campaign and never invent campaign attribution (88.606639ms)
+✔ financial records remain isolated between simulated and real modes and ordinary history cleanup preserves ledger (84.128253ms)
+✔ stale sale version, invalid money, unknown buyer and duplicate individual device identifiers reject (93.473092ms)
+✔ sale and reservation mark linked scheduled stock advertisement for review within the same transaction (72.93352ms)
+✔ snapshot bounds recent financial history while sale payments, cash balance and full reports retain every record (563.521304ms)
+✔ campaign report separates period-recorded interest from actual orders without inferred attribution (94.624166ms)
+✔ financial lookup indexes exist on fresh, current and migrated stores and select only related mode-scoped records (136.973616ms)
+ℹ tests 24
+ℹ suites 0
+ℹ pass 24
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2581.191919
+
+commercial.test.cjs
+✔ fixed and percentage rules are additions over cost, with exact cent rounding (4.445044ms)
+✔ invalid or overflowing money and ambiguous percentages are rejected (3.219253ms)
+✔ retail, wholesale and per-device overrides are independent and persist (115.997675ms)
+✔ public preview strips cost, profit, supplier contact, IMEI and internal notes and labels stock versus order (100.178032ms)
+✔ missing color, condition, battery or warranty is omitted rather than invented (56.0001ms)
+✔ installment, entry, unknown-price or ambiguous supplier offers cannot become commercial confirmed prices (67.875032ms)
+✔ original publication time determines supplier validity; edits do not renew an old offer (49.27734ms)
+✔ a table intended for retail never goes to an unclassified or wholesale group (69.892507ms)
+✔ existing free-form group campaigns preserve their optional audience behavior (61.309931ms)
+✔ contact multicategories, custom categories and trusted phone deduplication preserve prior data (83.264935ms)
+✔ private audience uses registered categories and explicit consent, never a display name (87.502347ms)
+✔ pausing a contact or group policy blocks every promotional attempt (84.997162ms)
+✔ sold or reserved products are removed only from unchanged structured generated announcements (98.391587ms)
+✔ an announcement cannot silently continue when all stock is sold or reserved (72.463847ms)
+✔ an unstructured replacement cannot bypass stock control by removing an item reference (53.387254ms)
+✔ updated product attributes require an explicit announcement review even when stock remains available (53.362477ms)
+✔ edited original supplier offer requires review instead of retaining stale price (56.746862ms)
+✔ repetition ledger counts confirmed/uncertain once and excludes the same in-progress job from retries (64.322888ms)
+✔ a proven pre-submission failure releases a reservation; uncertain does not (70.110416ms)
+✔ promotional minimum interval and timezone schedule apply before sending (48.404086ms)
+✔ overnight promotional windows belong to the configured opening weekday in Brasília (0.397229ms)
+✔ commercial reference tampering and stale previews cannot supply campaign source metadata (58.766719ms)
+✔ WhatsApp advertisement suggestion is a draft with factual attributes and explicit audience/availability (57.264515ms)
+✔ multicategories, lists and policies survive a real SQLite close/reopen and remain separate from simulation (74.69862ms)
+✔ failure persisting a contact or a commercial list rolls back data and audit atomically (51.412192ms)
+ℹ tests 25
+ℹ suites 0
+ℹ pass 25
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1570.344533
+
+contact-intake.test.cjs
+✔ a new verified private sender creates one persistent pending and owner notification without registering a contact (191.992258ms)
+✔ duplicate/repeated messages preserve the original time and do not repeat the pending notification (167.09725ms)
+✔ a profile arriving later fills only the empty profile without another notification (149.595543ms)
+✔ group participants, own automation, forwarded data, history and unsupported identity never create contacts (169.422675ms)
+✔ a trusted adapter PN mapping for private LID is kept without treating the LID as a telephone (149.139278ms)
+✔ existing local contacts are recognized and private messages do not create intake records (147.29315ms)
+✔ legacy imported contacts with a country-code plus sign are matched by the indexed lookup (146.562252ms)
+✔ saving a pending contact uses an editable name and category and accurately reports local-only storage (165.481348ms)
+✔ contacts registered while intake is open are updated safely rather than creating a duplicate phone (145.567923ms)
+✔ dismissal does not register a contact or repeatedly notify for later messages (146.666436ms)
+✔ invalid names or categories preserve the unresolved pending without false saved success (143.492304ms)
+✔ backend permissions are checked against the active account and cannot be forged by a display name (295.265008ms)
+✔ pending/saved data and duplicate notification protection survive SQLite close and restart (166.766186ms)
+✔ simulated/real pending records stay separate even for the same phone and never accept the other mode ingress (145.406803ms)
+✔ intake stores profile/identity metadata but never copies private message text or credentials into notification data (143.402391ms)
+✔ an intake write failure rolls back pending and notification together before any native event (142.380055ms)
+✔ saving is verified from persisted data and rolls back if a persistence adapter falsely claims success (145.802051ms)
+✔ actual WhatsApp notify protocol feeds a verified PN/private identity and profile into persistent intake (152.215117ms)
+✔ actual WhatsApp notify duplicates, group messages and historical append do not create repeated contacts (157.623474ms)
+ℹ tests 19
+ℹ suites 0
+ℹ pass 19
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3082.224015
+
+export-records.test.cjs
+✔ paged JSON export checks permission between pages and leaves the previous file intact if revoked (5.10859ms)
+✔ paged JSON export returns the true record count and preserves non-ASCII content (3.598024ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 15.301598
+
+media-stream.test.cjs
+✔ file import copies and hashes asynchronously without reading the complete original (72.781561ms)
+✔ old-format backup and unknown-extension received media restore across tiny token/base64 boundaries (258.246311ms)
+✔ a late corrupt checksum cleans every staged file and preserves existing data/media (133.375897ms)
+✔ late invalid campaign configuration rolls back all restored media without replacing the database (113.889871ms)
+✔ malformed base64, duplicate object keys and prototype keys fail safely before restore (147.726959ms)
+✔ database rejection removes imported files instead of leaving unmanaged orphans (49.886797ms)
+✔ backup stays compatible, excludes credentials and preserves an existing export if a source is corrupt (60.793934ms)
+✔ 24 MiB import, backup and restore complete with a 48 MiB V8 heap ceiling (1200.222945ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2049.084279
+
+mode-isolation.test.cjs
+✔ real and simulation data, settings, metrics and pending outbound queues remain separated across restarts (84.815465ms)
+✔ group synchronization can hide an unavailable list without deleting saved publishing authorization (41.298815ms)
+✔ automation IDs remain detectable after history cleanup, mode changes and application restart (43.151771ms)
+✔ legacy migration identifies explicit simulated destinations while preserving real lookalikes and quarantining ambiguous pending sends (71.291757ms)
+✔ backend mode switching removes all fictitious screens and selectors and keeps legitimate users and real registrations (257.460125ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 505.153391
+
+persistence.test.cjs
+✔ campaign configuration version stays stable across rounds but changes with edited content (57.849861ms)
+✔ disk persistence failure blocks later mutations and leaves last durable data intact (41.084641ms)
+✔ received media with an unknown filename extension produces a restorable backup (115.833154ms)
+✔ legacy backups restore received filenames and remain restored after first-use initialization (101.60998ms)
+✔ malformed campaign and administrator data reject restoration before replacing saved configuration (120.660587ms)
+✔ SQLite persists every write before close and preserves campaign revisions (53.122769ms)
+✔ process exit without close cannot erase the durable pre-send marker (149.241412ms)
+✔ restart cancels old queued work, preserves uncertain outcomes and never resumes campaigns (51.14039ms)
+✔ SQLite rejects duplicate round/group/item dispatches and preserves confirmed outcomes (40.336764ms)
+✔ refresh cannot grant publication authorization to a previously denied group (45.021284ms)
+✔ first-use example contains exactly 15 simulated groups and stays disabled across restarts (37.480816ms)
+✔ campaign validation ignores a request to autoactivate a newly created campaign (52.428289ms)
+✔ managed media survives moving the original and store restart (42.933274ms)
+✔ media manager rejects paths outside its managed folder and unsupported files (61.832579ms)
+✔ backup roundtrip restores campaign content and files as drafts without credentials (137.986874ms)
+✔ corrupted media checksums reject restore without changing existing data (98.373373ms)
+✔ backup supplied media paths, IDs and names cannot escape the managed folder (100.751828ms)
+✔ restore rejects missing media references and cleans files written before validation (92.52184ms)
+✔ restore rejects duplicate media IDs and removes partially restored files (101.254641ms)
+ℹ tests 19
+ℹ suites 0
+ℹ pass 19
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1512.854612
+
+private-submit-300.test.cjs
+✔ financial report does not submit when recipient finance permission is revoked during sendPrivate second USYNC (332.624169ms)
+✔ global STOP during sendPrivate second USYNC cancels the financial report without socket submission (336.415786ms)
+✔ private campaign checks stock after real USYNC and verified media preparation before submitting old advertisement (306.800034ms)
+✔ private campaign cannot submit when its allowed schedule closes during actual recipient USYNC (322.55759ms)
+✔ production commerce tick expires reservation while STOP stays latched, preserves deposit and allows explicit refund (462.311833ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1770.194318
+
+private-transport-230.test.cjs
+✔ comando privado PN autorizado consulta oferta capturada e responde somente ao solicitante sem USYNC (527.290318ms)
+✔ comando privado LID mapeado pelo protocolo responde ao solicitante sem consulta de existência (288.945861ms)
+✔ número privado não autorizado não executa busca nem recebe resposta apesar do nome exibido (434.277813ms)
+✔ alerta privado do dono particular usa chat recebido e separa servidor de entrega ao dispositivo (252.186158ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1510.787286
+
+reminders.test.cjs
+✔ Brasília recurring reminders map local 10:00 to original 13:00 UTC and respect configured weekdays (30.599591ms)
+✔ one-date reminders do not repeat, skip missing DST times, and choose only first ambiguous wall time (1.074208ms)
+✔ invalid dates, unauthorized raw numbers, malformed schedule and unbounded retries reject (98.653506ms)
+✔ one due reminder persists before transport, goes only to its authorized private recipient, and cannot overlap ticks (80.089846ms)
+✔ configuration and confirmation survive actual SQLite reopen without duplicate submission (126.805811ms)
+✔ offline skip policy discards one overdue occurrence and never catches up lost rounds (90.183114ms)
+✔ overdue sendOnce sends only most recent occurrence within grace, once, with original local time (88.800046ms)
+✔ a queued overdue reminder expires without network submission when reconnection exceeds grace (83.715021ms)
+✔ uncertain integration result never retries and late confirmed/delivered/read receipts reconcile without sending again (214.273436ms)
+✔ a crash in sending state becomes uncertain after restart and cannot be resent automatically (141.780189ms)
+✔ only safe failures retry with bounded configurable intervals and stable message identifier (72.787553ms)
+✔ recipient revocation during lookup prevents transport and records a clear definitive failure (67.607059ms)
+✔ stop all cancels durable pending work and blocks new schedules and tests until explicit global resume (63.92044ms)
+✔ stopping during recipient resolution prevents an already queued submission from reaching the network (54.550385ms)
+✔ a message already in transport is reported as in flight and its eventual confirmation is preserved after stop (108.224607ms)
+✔ editing or deleting a reminder cancels pending work without deleting confirmation ledger (90.034669ms)
+✔ real and simulation reminder entities, recipients and deliveries remain physically mode isolated (81.207928ms)
+✔ independent reminder permissions are enforced in backend for view, create, edit, control and delete (51.311274ms)
+✔ a real delivery cannot fall back to a guessed recipient or simulation resolution (88.112275ms)
+✔ confirmation receipt wins a competing request error and remains non-retryable (175.835376ms)
+✔ several due days while running offline retain only one pending automatic occurrence for later reconnect (64.851773ms)
+✔ configured active alert recipient is available but disabling it before a due send safely pauses the reminder (54.49246ms)
+✔ one-date automatic reminder completes once while preserving pending delivery until a bounded reconnect (57.842586ms)
+✔ the actual shared Scheduler and SimulatedAdapter confirm reminder transport and global queued cancellation allows explicit resume (80.850078ms)
+ℹ tests 24
+ℹ suites 0
+ℹ pass 24
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2082.193206
+
+scheduler-integration.test.cjs
+✔ real SQLite + local simulator: 15 deliveries are durable before transport and restart rebases without replay (680.114747ms)
+✔ real SQLite + local simulator: uncertain delivery survives restart, blocks resume and reconciles by durable ID (170.501673ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 883.702326
+
+scheduler.test.cjs
+✔ creating a campaign never activates it; 15 authorized destinations preserve media/text order (32.124685ms)
+✔ interval counts from round start; separate spacing is enforced and early ticks do nothing (2.118257ms)
+✔ a slow round skips elapsed slots with no simultaneous round or backlog (1.194027ms)
+✔ one global worker serializes campaigns and concurrent ticks (4.468909ms)
+✔ a synchronous transport event cannot reenter the worker and create a second round (0.953336ms)
+✔ a durable queue write failure blocks submissions and further activation (1.703536ms)
+✔ pause cancels pending destinations, allows the in-flight result to settle, and resume avoids recent duplicates (1.930468ms)
+✔ stop all interrupts a wait immediately and does not leave active campaigns (1.209711ms)
+✔ emergency stop aborts the current campaign before an earlier campaign persistence failure (1.346358ms)
+✔ a persistence failure after transport settlement blocks all later submissions even if another write succeeds (1.613719ms)
+✔ a late receipt persistence failure blocks sending without throwing from a transport event (1.024436ms)
+✔ a storage fault outside the scheduler blocks ticks and activation without repeated persistence attempts (0.381125ms)
+✔ real storage: a settings write fault immediately before transport prevents the network request (79.369585ms)
+✔ waitForIdle settles the in-flight result before callers replace persistent data (1.257496ms)
+✔ disconnection pauses active campaigns and prevents pending sends or disconnected activation (1.07316ms)
+✔ uncertain outcomes pause immediately and are never retried; late server receipt reconciles (1.322859ms)
+✔ ambiguous exceptions have one attempt and do not expose adapter secrets in history (1.262673ms)
+✔ only definitive pre-submission failures get bounded retries using the same durable message ID (1.184116ms)
+✔ a retry never submits after the group operating window has closed (0.870267ms)
+✔ a retry rechecks the individual group end date before another network request (1.215372ms)
+✔ a restriction stops attempts even when a failure was definitely before submission (1.085683ms)
+✔ daily send and round limits defer to the next local day instead of accumulating slots (4.321839ms)
+✔ a simulated suspension creates one current round rather than all missed rounds (1.405451ms)
+✔ group override intervals can be shorter and rotation advances per group participation (3.342511ms)
+✔ individual windows run independently, including outside the main campaign window (1.932989ms)
+✔ local weekday, inclusive dates and overnight windows use the opening day (0.248048ms)
+✔ expired scheduling stops rather than replaying previous dates (1.137823ms)
+✔ restart marks in-flight work uncertain and stale queued work cancelled without any submission (2.595835ms)
+✔ activation rejects unauthorized, mixed integration groups, invalid limits, duplicate destinations and missing media (1.194657ms)
+✔ summary includes content, authorized groups, frequency, individual settings and sending estimate (0.826905ms)
+✔ campaign retry policy controls attempts and delay; exhausted failures emit one durable incident (2.187452ms)
+✔ a known definitive nonretryable error stops once; an ambiguous error remains uncertain (0.818796ms)
+✔ a temporary failure which succeeds within the configured policy preserves campaign progression (2.765348ms)
+✔ idempotent timer startup and a private-alert submission hold cannot duplicate campaign work (1.207147ms)
+✔ indexed aggregate queries replace loading old history and accept compact group round counts (0.718454ms)
+ℹ tests 35
+ℹ suites 0
+ℹ pass 35
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 174.064257
+
+search-adapter.test.cjs
+✔ captura está desativada inicialmente; seleção de monitoramento é independente dos comandos (48.639313ms)
+✔ texto original, legenda, identificação autenticada e nomes reais são preservados sem número fictício (8.303483ms)
+✔ PN alternativo e mapeamento autenticado resolvem LID; divergência não inventa telefone (5.056049ms)
+✔ deduplicação usa mensagem e conversa; não interfere com a autorização legado (10.867694ms)
+✔ histórico opt-in é recebido em lotes limitados e nunca vira comando ou histórico completo (10.616864ms)
+✔ atrasos de reconexão preservam hora original e não executam comandos (4.080475ms)
+✔ mensagem recuperada do telefone é histórico mesmo com timestamp recente (4.250007ms)
+✔ eventos reais de edição e revogação alteram a referência sem reescrever a hora original (5.843032ms)
+✔ protocolMessage edit/revoke é dado operacional, sem executar textos editados como comandos (3.729178ms)
+✔ comunidades usam somente metadados reais dos grupos participantes (3.491518ms)
+✔ resposta da busca usa destinatário explícito, exige ACK e não repete resultado incerto (25.05275ms)
+✔ desconexão suspende entrega e ignora eventos de geração antiga (4.933179ms)
+✔ simulação fornece captura, edição, exclusão e entrega privada com identificação explícita (2.869255ms)
+✔ comando manual da própria conta usa autor autenticado, não o destinatário ou participant (4.189896ms)
+✔ self desconhecido ou LID sem mapeamento não transforma ID em telefone (3.569276ms)
+✔ conversa self LID é identificada só pela conta e metadados autenticados, sem liberar conversa de terceiros (4.769655ms)
+✔ respostas automáticas e ledger persistente são marcados antes do echo para impedir loops (3.924275ms)
+✔ comando manual é capturado uma vez e recuperação da própria conta permanece histórico (13.089319ms)
+✔ destinatário próprio usa JID autenticado com dispositivo removido, sem consulta ou fallback (19.761148ms)
+✔ USYNC resolve JID real, incluindo LID fornecido pelo servidor, sem telefone derivado do LID (18.239488ms)
+✔ número não encontrado, identificador divergente ou integração ausente falham antes do envio (3.337645ms)
+✔ lookup temporário tem prazo, erros sanitizados e pode repetir somente antes da submissão (14.827757ms)
+✔ consultas simultâneas compartilham resolução e mudança de conexão invalida resultado antigo (3.577726ms)
+✔ ACK comprova aceitação; entrega e leitura só aparecem quando recibos reais chegam (3.966652ms)
+✔ reserva persistida após queda não permite reenviar item sem confirmação (3.367887ms)
+✔ simulação de self e destinatários nunca utiliza rede e identifica dados fictícios (0.556727ms)
+✔ SQLite com filas pendentes permite primeira submissão e reserva de transporte impede repetição após reinício (93.087507ms)
+✔ falha de persistência bloqueia transporte antes de enviar e erro não revela conteúdo sensível (4.589632ms)
+ℹ tests 28
+ℹ suites 0
+ℹ pass 28
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 346.216626
+
+search-backend.test.cjs
+✔ BUSCAS upgrade preserves campaigns, settings and paused state; only owners automatically get search permissions (683.560583ms)
+✔ backend requires both account permission and explicit BUSCAS authorization; payload actor cannot impersonate owner (1061.492602ms)
+✔ BUSCAS honors password-change gate and deactivated accounts even when grants exist (853.425686ms)
+✔ simulated transport captures multi-product lists and ranks shorthand without confusing versions or financing (321.117724ms)
+✔ simulated command tests cannot forge actors; fixture text stays data; prefix and locations are enforced (3276.575952ms)
+✔ latest supplier offer replaces older prices; edit and delete retain the original message reference (238.784563ms)
+✔ separate BUSCAS cleanup preserves campaigns, users, settings and operational delivery protection (280.829764ms)
+✔ disconnect warns about stale capture and keeps private delivery pending until simulated reconnect (3279.153615ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 10010.148822
+
+search-parser.test.cjs
+✔ requested shorthand 18 pro Max Silver is exact iPhone Pro Max and leaves missing capacity explicit (7.861063ms)
+✔ ProMax, accents and Silver/Prata aliases are equivalent without losing capacity or condition (5.057639ms)
+✔ compact model/capacity/color spelling never silently downgrades ProMax to the base model (8.725902ms)
+✔ Air and cellular versions remain distinct; unsupported model suffixes require review (10.81263ms)
+✔ configurable literal aliases work and cannot execute a regex or instruction (4.515996ms)
+✔ Samsung Plus shorthand is preserved as a distinct version (0.784204ms)
+✔ unknown, conflicting or unsupported query filters never silently broaden a search (5.537382ms)
+✔ capacity conversion and explicit battery filtering keep unknown battery out (2.745337ms)
+✔ BRL forms R$ 7.000,00, 7.000 and 7000 yield the same total announced price (3.027106ms)
+✔ multiline product lists associate each price with the current model, capacity and color (8.807146ms)
+✔ explicit per-color and per-capacity rows split into individual offers (7.528641ms)
+✔ standalone accessory prices and inline accessory surcharges never become phone prices (3.875242ms)
+✔ installment-only and entry-only offers are review records without any ranked total (6.940425ms)
+✔ cash total is separated from entry, installment and discount figures (5.354882ms)
+✔ a bare pair of prices is ambiguous and never ranked (1.948708ms)
+✔ several capacities/colors/models without clear associations require review (2.770109ms)
+✔ from and lot prices preserve their conditions and require an explicit non-cash criterion (4.052547ms)
+✔ observations, warranty, battery and original text are preserved for the applicable offer (2.577236ms)
+✔ inline condition does not silently propagate to a different subsequent model (1.055911ms)
+✔ plural condition headings apply to the next block without relabeling previous products (1.414309ms)
+✔ contact and battery numbers are never inferred as prices or supplier phone numbers (2.1112ms)
+✔ a labelled sales contact is preserved separately without inventing country codes or supplier identity (2.160653ms)
+✔ one explicit contact for a supplier list applies to its products; different labelled contacts remain local (2.748016ms)
+✔ unavailability records retain exact model/capacity/color association even without a price (1.644731ms)
+✔ bounded input prevents oversized untrusted supplier messages from consuming unbounded CPU (0.835373ms)
+✔ ranking requires the exact model version and filters capacity, color and condition independently (4.426264ms)
+✔ latest same supplier and exact combination replaces old price before sorting (2.66432ms)
+✔ new unavailable, deleted or uncertain same-combination offers suppress an older captured price (3.285973ms)
+✔ different conditions are not duplicates and optional one-per-supplier uses the cheapest compatible offer (2.465103ms)
+✔ copies from the same verified supplier collapse while equal adverts from different suppliers remain distinct (15.399217ms)
+✔ forwarded copies collapse to an available original without attributing the forwarder as the original supplier (1.585181ms)
+✔ ranked result count is at most ten; supplier/group and numeric filters are enforced (8.9147ms)
+✔ internal candidate selection supports final alternative sorting without reducing public result limits (9.779205ms)
+ℹ tests 33
+ℹ suites 0
+ℹ pass 33
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 166.302087
+
+search-service.test.cjs
+✔ BUSCAS captures separate list products, exact versions and prices without monthly instalments (223.150685ms)
+✔ command is anchored and case insensitive; results go to private owner; bare prefix returns guidance (287.788139ms)
+✔ unapproved numbers, disallowed locations, forwarded and supplier-data commands are silently ignored (209.322899ms)
+✔ local roles need explicit module authorization and effective backend permissions (346.469179ms)
+✔ prefix changes, per-user limit and durable command IDs prevent duplicate replies (306.905653ms)
+✔ latest same supplier offer replaces cheaper old price while condition remains separate; unavailability removes exact product (242.753928ms)
+✔ edits retain original timestamps and deletes do not resurrect through later events (234.296941ms)
+✔ unknown LID phone remains unavailable; forwarded copies do not pretend the reposter is original supplier (176.844564ms)
+✔ disconnect creates a gap and queues delivery; reconnect sends once and uncertainty is never automatically repeated (219.366118ms)
+✔ history and offers cleanup are separate and retain campaigns, permissions and command delivery ledgers (222.666858ms)
+✔ recipient destinations require explicit origin enabling and valid registered contacts (0.796645ms)
+✔ manual commands from the authenticated own account work in self chat and are deduplicated; automation and non-owner self identity are rejected (264.06136ms)
+✔ own-account permission requires the active owner mapped to the authenticated phone and respects enabled command groups (295.94451ms)
+✔ configured private recipients are used exactly, resolution precedes submission and test-send exposes pending then ACK status (211.316263ms)
+✔ invalid explicitly selected owner never substitutes another recipient and a failure notice identifies the reason (206.724725ms)
+✔ safe recipient-resolution failures can be retried manually, uncertainty and confirmed delivery cannot (206.772606ms)
+✔ a destination removed during asynchronous WhatsApp resolution is revalidated and receives no result (210.346771ms)
+✔ recipient status reads latest delivery after more than 500 older records, and group synchronization refreshes search selectors (182.287113ms)
+✔ a private result failure produces one private error notice without replacing result status or looping on failed notices (208.716337ms)
+✔ requester delivery uses the actual authorized requesting phone rather than a different primary profile number (182.114249ms)
+✔ blocked supplier does not reappear through a forwarded copy and independent original sellers remain eligible (182.855315ms)
+✔ commands awaiting the serial queue honor module, location and prefix changes before execution (204.486578ms)
+✔ price-only review cannot promote offers with ambiguous product association (186.391631ms)
+✔ custom periods use configured timezone and reject normalized invalid calendar dates (3.58757ms)
+✔ default battery, price, warranty and supplier filters preserve exact model and latest offer semantics (207.309983ms)
+✔ search history distinguishes local queries, pending private results and confirmed or uncertain deliveries (339.969766ms)
+✔ supplier filters inspect identity fields and bare blocked phones match trusted sender keys (178.787969ms)
+✔ rolling two-hour window uses original publication time, supports minutes/hours and disabling without fake cheap prices (215.844108ms)
+✔ an edited old offer stays outside the two-hour window even when captured or edited now (171.958982ms)
+✔ higher-price and newest sorting happen before the ten-result limit and saved preferences survive reopening SQLite (254.380182ms)
+✔ configured model, storage, condition, supplier and group filters use captured metadata (201.388404ms)
+✔ authorized incoming private search replies only to the requester despite configured owner or responsible recipients (334.839711ms)
+✔ private default allows explicitly authorized users while unapproved identities, an explicit disable and a restricted whitelist are respected (296.873264ms)
+✔ global automation guard blocks new search deliveries and prevents queued sends until an explicit resumption (175.12144ms)
+✔ a global stop cancels pending search deliveries permanently, reports in-flight submissions and preserves command dedupe (192.510148ms)
+✔ a confirmed integration receipt wins over a later provider rejection and cannot become a retry (196.863484ms)
+ℹ tests 36
+ℹ suites 0
+ℹ pass 36
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 7797.791222
+
+search-stop-pump.test.cjs
+✔ reconnect: global stop safely settles a search pump queued behind a manual task and explicit resume permits only new replies (303.711631ms)
+✔ maintenance: global stop safely settles a search pump queued behind a manual task and explicit resume permits only new replies (220.199877ms)
+✔ a reconnect pump rejection is diagnosed once without an unhandled rejection or an immediate retry loop (198.641874ms)
+✔ background setup errors remain contained even if the diagnostic store is also unavailable (180.586886ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 912.600551
+
+search-storage.test.cjs
+✔ schema v4 migrates narrowly preserving campaign progress and producing an original pre-migration copy (61.867803ms)
+✔ capture is atomic and idempotent, edits preserve original time/text, stale updates and resurrection are rejected (60.93024ms)
+✔ deletion arriving before an original message prevents late history from restoring a removed offer (49.361434ms)
+✔ indexed queries preserve version, capacity, color, condition and uncertain prices with bounded pagination (132.492476ms)
+✔ latest supplier/product is chosen before price filters and a later sold product suppresses an older active price (41.85145ms)
+✔ one result per supplier is selected in SQL before pagination and honors numeric filter aliases (517.636213ms)
+✔ blocked original supplier also excludes identical forwarded copies before ranking pagination (345.158875ms)
+✔ supplier identity and warranty filters are applied before the 500 candidate limit with escaped wildcards (412.223913ms)
+✔ search cleanup preserves command dedupe, uncertain delivery, campaign data and independent audit (63.017596ms)
+✔ confirmed and uncertain result deliveries cannot be automatically requeued, while late ACK can confirm uncertainty (46.743094ms)
+✔ batched delivery summaries include every part without pagination or exposing result text (425.64741ms)
+✔ authorization identity is unique, pagination and deactivation survive restart without names granting identity (70.177829ms)
+✔ bounded durable capture inbox and recorded gaps expose true timing and survive a restart (64.508325ms)
+✔ portable backup excludes captured data and grants; ordinary campaign restore preserves local BUSCAS settings and base (69.637535ms)
+✔ retention removes captured source/offers and visible old search history without losing operational delivery or dedupe (62.214099ms)
+✔ real and simulation search storage have independent messages, grants, runs, deliveries, counters and cleanup even with identical IDs (98.765902ms)
+✔ legacy simulation migration uses explicit protocol or metadata evidence, preserving legitimately named real data (72.196892ms)
+ℹ tests 17
+ℹ suites 0
+ℹ pass 17
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2604.832053
+
+sound.test.cjs
+✔ sound volume clamps to the Windows audio gain range including mute (5.983054ms)
+✔ duplicate occurrences play once and disabled event types stay silent (10.062256ms)
+✔ overnight quiet hours suppress alerts but explicit tests can play (1.190331ms)
+✔ repeats respect the configured interval and total limit (0.494581ms)
+✔ muting an occurrence cancels repeats and stops current playback (2.550731ms)
+✔ different alerts never play concurrently and playback failures are reported (0.592655ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 34.91205
+
+storage-v2.test.cjs
+✔ legacy SQLite upgrades in place with a complete pre-migration copy and WAL FULL durability (163.683939ms)
+✔ clearing presentation histories preserves duplicate protection, daily limits, data and immutable audit (57.446973ms)
+✔ category-only cleanup keeps other records and never turns uncertainty into a retry (76.699995ms)
+✔ history projections show one current send outcome, with indexed pagination and literal search (244.505105ms)
+✔ diagnostic pages scope campaigns and global events without loading unrelated failures (45.275098ms)
+✔ calendar date filters include the entire final local day and reject malformed dates (49.549673ms)
+✔ retention bounds visible logs by age, entries and bytes while keeping operational ledgers and audit (62.711674ms)
+✔ group checkpoints count each round once across multiple content items and survive history cleanup (61.866631ms)
+✔ local accounts and recovery are preserved on ordinary restore; credentials never enter portable backup (203.003709ms)
+✔ ordinary restore preserves managed local sound assets and excludes machine-specific paths from exported settings (91.810191ms)
+✔ malformed new settings reject restoration before changing existing campaigns and accounts (89.687375ms)
+✔ transaction rollback is atomic, UNIQUE validation does not poison storage and new fields cannot invoke arbitrary SQL (66.798234ms)
+✔ diagnostics and audit omit credential fields and truncate oversized messages (72.930343ms)
+✔ pending private alerts are loaded in bounded due batches and ACK lookup uses durable message ID (138.642267ms)
+✔ streamed log export yields between pages, produces valid JSON and retains the old file on failure (68.189323ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 15
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1502.053613
+
+submission-queue.test.cjs
+✔ external submissions use FIFO and hold a due campaign until both requests settle (121.091474ms)
+✔ an already submitted campaign finishes before either external request starts (57.94484ms)
+✔ a failed external callback releases its hold and does not poison subsequent requests or campaigns (63.611736ms)
+✔ shutdown waits for the running request and explicitly rejects queued work without removing its durable ledger (50.657081ms)
+✔ real search and alert services share the scheduler queue and persist confirmations without overlapping transports (231.28507ms)
+✔ a safe search delivery failure remains pending and releases the shared slot so the queued alert can confirm (240.21208ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 776.597742
+
+templates-media.test.cjs
+✔ named templates preserve text formatting, media captions, edits, copies and campaign use after database reopen (283.654847ms)
+✔ templates reject empty content, absent managed files, conflicting edits and unsuccessful persistence (197.444733ms)
+✔ backend template permissions distinguish create, edit, delete and viewing; mode isolation prevents crossing media (269.856054ms)
+✔ bulk deletion removes only managed copies, persists removal and records an independent audit (203.984396ms)
+✔ media deletion is blocked by models, paused campaigns, per-group content and orphan uncertain operational snapshots (194.386169ms)
+✔ bulk deletion is all-or-nothing when one selected file is linked and database failure restores all staged files (176.119498ms)
+✔ deletion revalidates references and permissions after asynchronous staging; symlinks cannot delete external files (176.244903ms)
+✔ crash recovery restores staged media whose database entry remains and cleans committed tombstones across integration modes (192.499875ms)
+✔ deletion permissions are enforced in the backend and inactive accounts cannot inspect or remove files (254.853491ms)
+✔ a Windows-style file lock after metadata commit is reported honestly and its quarantined file is removed at restart (165.958285ms)
+✔ access revoked while files are staged cancels deletion and restores the managed file (308.328717ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2435.184953
+
+worker.test.cjs
+✔ real worker persists owner and campaigns, enforces login, and cannot expose internal RPC actions (560.684293ms)
+✔ real worker sends disconnect events to native host while logged out and records only explicit notification acknowledgement (476.80509ms)
+✔ a CPU-bound backend RPC leaves the host event loop responsive; worker exit rejects unresolved requests (288.962232ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1331.695214
+Desktop: 6 fluxos passaram (instância/IPC/bandeja, retorno das notificações, suspensão/rede/encerramento, manifesto, nova identidade com perfil legado preservado e renderizador real de áudio com ganho/volume). Facade nativa; exibição e áudio físicos no Windows não verificados.

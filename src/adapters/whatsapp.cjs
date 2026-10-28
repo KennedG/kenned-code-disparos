@@ -853,12 +853,20 @@ class WhatsAppAdapter extends EventEmitter {
     }
   }
 
-  async send(groupId, item, media) {
+  async send(groupId, item, media, { beforeSubmit } = {}) {
     if (this.status.state !== 'connected' || !this.socket) throw definitiveError('WhatsApp desconectado. Envios pausados.', true);
     if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) throw definitiveError('O destino precisa ser um grupo do WhatsApp.');
     if (!ALLOWED_TYPES.has(item?.type)) throw definitiveError('Tipo de conteúdo não suportado.');
     const group = this.store?.getGroup(groupId);
     if (!group || !group.authorized || group.simulation) throw definitiveError('O grupo não tem autorização registrada para envio real.');
+    const content=item.type==='text'?{text:String(item.text||'')}:await this._prepareContent(item,media);
+    if(item.type==='text'&&!content.text.trim())throw definitiveError('O texto da mensagem está vazio.');
+    const live=this._beforeSubmit(beforeSubmit)||item;this._refreshContent(content,live);
+    return this._submitVerified(groupId,content,item.clientMessageId);
+  }
+
+  async _prepareContent(item,media) {
+    if(!ALLOWED_TYPES.has(item?.type))throw definitiveError('Tipo de conteúdo não suportado.');
     let content;
     if (item.type === 'text') {
       if (!String(item.text || '').trim()) throw definitiveError('O texto da mensagem está vazio.');
@@ -882,14 +890,33 @@ class WhatsAppAdapter extends EventEmitter {
       if (item.caption) content.caption = String(item.caption);
       if (item.type === 'document') content.fileName = media.name || path.basename(media.path);
     }
-    return this._submitVerified(groupId, content, item.clientMessageId);
+    return content;
   }
 
-  async sendPrivate(number, text, { clientMessageId } = {}) {
+  _refreshContent(content,item) { if(item.type==='text')content.text=String(item.text||'');else if(item.caption)content.caption=String(item.caption);else delete content.caption; }
+  _beforeSubmit(callback) {
+    try { const value=callback?.(); if(value&&typeof value.then==='function')throw new Error('A verificação de envio precisa ser síncrona.'); return value; }
+    catch(error) { throw Object.assign(error instanceof Error?error:new Error('Verificação de envio recusada.'),{definitive:true,submitted:false,safeToRetry:false}); }
+  }
+
+  async sendPrivateContent(number,item,media,{beforeSubmit}={}) {
+    const recipient=await this.resolveRecipient(String(number));
+    const socket=this.socket,generation=this.generation;
+    const content=item.type==='text'?{text:String(item.text||'')}:await this._prepareContent(item,media);
+    if(item.type==='text'&&!content.text.trim())throw definitiveError('O texto da mensagem está vazio.');
+    const live=this._beforeSubmit(beforeSubmit)||item;this._refreshContent(content,live);
+    if(this.socket!==socket||this.generation!==generation)throw definitiveError('A conexão mudou antes do envio privado.',true,'WA_RECIPIENT_CONNECTION_CHANGED');
+    return this._submitVerified(recipient.jid,content,item.clientMessageId);
+  }
+
+  async sendPrivate(number, text, { clientMessageId, beforeSubmit } = {}) {
     const digits = String(number || '');
     if (!/^[1-9]\d{9,14}$/.test(digits)) throw definitiveError('Informe o telefone privado com código do país e DDD, usando 10 a 15 dígitos.');
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw definitiveError('Informe um alerta de 1 a 16.000 caracteres.');
     const recipient = await this.resolveRecipient(digits);
+    // Resolution may wait on the network. The caller's current authorization,
+    // stop latch and occurrence must be checked at the irreversible boundary.
+    this._beforeSubmit(beforeSubmit);
     return this._submitVerified(recipient.jid, { text }, clientMessageId);
   }
 

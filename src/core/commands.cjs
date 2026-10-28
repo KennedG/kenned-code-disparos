@@ -17,7 +17,7 @@ class ControlError extends Error {}
 const fail = message => { throw new ControlError(message); };
 
 class CommandController {
-  constructor({ store, scheduler, adapter, mediaManager, authService, automationControl, statusProvider, sendAdminReply, now = () => Date.now() }) {
+  constructor({ store, scheduler, adapter, mediaManager, authService, automationControl, statusProvider, sendAdminReply, commercialService, now = () => Date.now() }) {
     this.store = store;
     this.scheduler = scheduler;
     this.adapter = adapter;
@@ -25,7 +25,7 @@ class CommandController {
     this.authService = authService || null;
     this.automationControl = automationControl || null;
     this.statusProvider = statusProvider || null;
-    this.sendAdminReply = sendAdminReply || null;
+    this.sendAdminReply = sendAdminReply || null;this.commercialService=commercialService||null;
     this.actorContext = new AsyncLocalStorage();
     this.now = now;
     this.sessions = new Map();
@@ -254,7 +254,7 @@ class CommandController {
   _validateActivation(campaign) {
     this._validateProposal(campaign);
     if (this.adapter.status?.state !== 'connected') fail('Conecte o WhatsApp ou o modo simulado no aplicativo antes de ativar.');
-    if (!campaign.groupIds.length) fail('Selecione pelo menos um grupo antes de ativar a campanha.');
+    if (!campaign.groupIds.length&&!(campaign.contactIds||[]).length) fail('Selecione pelo menos um grupo ou contato antes de ativar a campanha.');
     for (const id of campaign.groupIds) {
       const override = campaign.groupOverrides?.[id];
       const items = override?.enabled && Array.isArray(override.items) && override.items.length ? override.items : campaign.items;
@@ -268,7 +268,8 @@ class CommandController {
     const days = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
     const schedule = campaign.schedule || {};
     const groups = campaign.groupIds.map(id => this.store.getGroup(id));
-    const perRound = groups.length * (campaign.mode === 'rotate' ? Math.min(1, campaign.items.length) : campaign.items.length);
+    const contacts = (campaign.contactIds || []).map(id => this.store.getEntity('contacts',id));
+    const perRound = (groups.length + contacts.length) * (campaign.mode === 'rotate' ? Math.min(1, campaign.items.length) : campaign.items.length);
     const [startH, startM] = (schedule.startTime || '00:00').split(':').map(Number);
     const [endH, endM] = (schedule.endTime || '23:59').split(':').map(Number);
     let minutes = endH * 60 + endM - startH * 60 - startM;
@@ -289,6 +290,7 @@ class CommandController {
       `Modo: ${campaign.mode === 'rotate' ? 'próximo item a cada rodada' : 'repetir todos os itens'}\n` +
       `Conteúdos (${campaign.items.length}):\n${contents || '(nenhum)'}\n` +
       `Grupos (${groups.length}):\n${groups.map(group => `${group?.name || '(indisponível)'} — ${group?.id || ''}`).join('\n') || '(nenhum)'}\n` +
+      `Contatos privados (${contacts.length}):\n${contacts.map(contact => `${contact?.name || '(indisponível)'} — ${contact?.phone || ''}`).join('\n') || '(nenhum)'}\n` +
       `Intervalo entre inícios de rodadas: ${campaign.intervalMinutes} min\nEspaçamento entre grupos: ${campaign.spacingSeconds} s\n` +
       `Horário local do computador: ${schedule.startTime}–${schedule.endTime}; ${(schedule.days || []).map(day => days[day]).join(', ')}\n` +
       `Datas: ${schedule.startDate || 'sem início definido'} a ${schedule.endDate || 'sem encerramento definido'}\n` +
@@ -420,7 +422,7 @@ class CommandController {
       '1 Criar campanha\n2 Editar/selecionar campanha\n3 Selecionar/remover grupos e configurar grupo\n' +
       '4 Horários, intervalos e limites\n5 Adicionar texto ou mídia\n6 Ordenar/remover conteúdos\n7 Resultados e falhas\n8 Prévia e ativação\n' +
       `${this.statusProvider ? '9 Estado de filas, monitoramento, alertas e lembretes\n' : ''}` +
-      '0 Encerrar menu\nResponda com o número. Para retornar de uma etapa: !mega menu.' +
+      '0 Encerrar menu\nAnúncio revisável: !mega anuncio varejo pronta entrega | modelo e preço\nResponda com o número. Para retornar de uma etapa: !mega menu.' +
       `${this.automationControl ? '\nEmergência: !mega parar tudo. Reabrir as filas: !mega retomar sistema.' : ''}`;
   }
 
@@ -428,6 +430,15 @@ class CommandController {
     const words = body.trim().split(/\s+/);
     const command = fold(words.shift() || 'menu');
     this._trace(context, 'interpretacao', 'ADMIN_COMMAND_PARSED', `Comando administrativo interpretado: ${['ajuda','menu','cancelar','confirmar','status','campanhas','grupos','parar','criar','editar','previa','pausar','ativar','retomar','intervalo','adicionar-grupo','remover-grupo'].includes(command) ? command : 'não reconhecido'}.`);
+    if(command==='anuncio'){
+      if(!this.commercialService)fail('O módulo de anúncios não está disponível.');this._assert('commerce.list');this._assert('campaign.create');
+      const match=/^(varejo|atacado)\s+(pronta entrega|sob encomenda)\s*\|\s*([\s\S]+)$/i.exec(words.join(' '));
+      if(!match)fail('Use !mega anuncio varejo pronta entrega | iPhone 15 Pro Max 256GB Azul seminovo R$ 3.850,00. Informe somente os fatos conhecidos.');
+      const draft=this.commercialService.createAdDraft({text:match[3],audience:match[1].toLowerCase()==='varejo'?'retail':'wholesale',availability:match[2].toLowerCase()});
+      const campaign=this._newCampaign('Anúncio — '+draft.facts.model);const saved=this.store.saveCampaign({...campaign,audience:draft.audience,items:[{id:randomUUID(),type:'text',text:draft.text}]});
+      this._session(sender,saved);this._audit('commerce.ad.draft',saved.id);
+      return this._reply(context,'📝 *PRÉVIA DO ANÚNCIO*\n\n'+draft.text+'\n\nRascunho salvo: '+saved.id+'\nRevise texto, valor, público e fotos no aplicativo ou com !mega menu. Selecione destinos e peça !mega ativar '+saved.id+'. A ativação exige confirmação; nada foi publicado.');
+    }
     if (command === 'ajuda') return this._reply(context, this._help());
     if (command === 'menu') {
       const old = this.sessions.get(sender);
@@ -453,7 +464,7 @@ class CommandController {
         `Campanhas: ${campaigns.length}; ativas: ${campaigns.filter(campaign => campaign.state === 'active').length}\n` +
         `Próximo envio: ${next ? new Date(next).toLocaleString('pt-BR') : 'não programado'}\n` +
         `${this.automationControl ? `Automação: ${this.automationControl.isStopped() ? 'INTERROMPIDA — retomada explícita necessária' : 'habilitada'}\n` : ''}` +
-        `${details ? `Filas: ${counts(details.queues || details.queue || details.scheduler)}\nMonitoramento: ${counts(details.monitoring || details.monitor || details.search)}\nAlertas: ${counts(details.alerts)}\nLembretes: ${counts(details.reminders)}\n` : ''}` +
+        `${details ? `Filas: ${counts(details.queues || details.queue || details.scheduler)}\nMonitoramento: ${counts(details.monitoring || details.monitor || details.search)}\nAlertas: ${counts(details.alerts)}\nLembretes: ${counts(details.reminders)}\nOportunidades e relatórios: ${counts(details.commerce)}\n` : ''}` +
         `${this.adapter.status?.mode === 'simulated' ? 'Modo simulado: nenhuma mensagem real é enviada.' : 'O envio requer computador ligado, internet e conexão ativa.'}`);
     }
     if (command === 'campanhas') return this._reply(context, this._campaignList());
@@ -468,7 +479,7 @@ class CommandController {
         const report = await this.automationControl.stop({ actorId: this.actorContext.getStore()?.id || null, source: 'whatsapp' });
         this._audit('automation.stop-all', null, { report });
         const count = value => typeof value === 'number' ? value : Number(value?.cancelled ?? value?.stopped ?? value?.campaigns ?? value?.count) || 0;
-        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
+        return this._reply(context, `🛑 Todos os envios automáticos foram interrompidos.\n\nCampanhas: ${count(report.campaigns)}\nEnvios de campanhas pendentes: ${Number(report.campaigns?.jobs || report.jobs) || 0}\nResultados de buscas pendentes: ${count(report.search)}\nAlertas pendentes: ${count(report.alerts)}\nLembretes pausados: ${Number(report.reminders?.paused ?? report.reminders?.stopped ?? count(report.reminders)) || 0}\nAvisos de lembretes pendentes cancelados: ${count(report.reminders)}\nOportunidades, demandas e relatórios cancelados: ${count(report.commerce)}\n\n${report.inFlight ? `${report.inFlight} envio(s) já em andamento não pôde/puderam ser cancelado(s); o resultado será registrado.\n` : ''}Novas entradas nas filas estão bloqueadas. Os dados foram preservados. Para reabrir as filas, envie !mega retomar sistema. As campanhas precisam de ativação individual.${report.errors?.length ? `\n⚠️ ${report.errors.join(' ')}` : ''}`);
       }
       await this.scheduler.stopAll();
       this._audit('campaign.stop-all');

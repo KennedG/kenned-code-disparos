@@ -3,7 +3,7 @@
 const { EventEmitter } = require('node:events');
 const { randomUUID } = require('node:crypto');
 
-const CONTACT_CATEGORIES = Object.freeze(['Cliente Nerópolis', 'Lojista Camelódromo']);
+const { CONTACT_CATEGORIES, CommercialService } = require('./commercial.cjs');
 const normalizePhone = value => String(value || '').replace(/[\s()+.\-]/g, '');
 const validPhone = value => /^[1-9]\d{9,14}$/.test(value);
 const text = (value, max) => String(value ?? '').trim().slice(0, max);
@@ -117,25 +117,28 @@ class ContactIntake extends EventEmitter {
     const actor = this._assert(existing ? 'contacts.edit' : 'contacts.create', actorId);
     const name = String(input.name ?? '').trim();
     if (!name || name.length > 120) throw fault('Informe um nome com até 120 caracteres.', 'CONTACT_NAME_INVALID');
-    if (!CONTACT_CATEGORIES.includes(input.category)) throw fault('Selecione Cliente Nerópolis ou Lojista Camelódromo.', 'CONTACT_CATEGORY_INVALID');
+    const commercial = new CommercialService({ store: this.store, now: this.now });
+    const categories = input.categories ?? (input.category ? [input.category] : []);
+    if (!Array.isArray(categories) || !categories.length) throw fault('Selecione ao menos uma categoria cadastrada.', 'CONTACT_CATEGORY_INVALID');
+    const contactInput = commercial.normalizeContact({ name, phone: pending.phone, categories }, existing || {});
     if (pending.status !== 'pending') throw fault('Esta pendência já foi resolvida. Edite o cadastro de contatos para alterá-la.', 'CONTACT_PENDING_CLOSED');
     const result = this._tx(() => {
       const saved = this.store.saveEntity('contacts', {
         ...existing, id: existing?.id || randomUUID(), name, phone: pending.phone,
-        category: input.category, notes: existing?.notes || '',
+        category: contactInput.category, categories: contactInput.categories, notes: existing?.notes || '',
         profileName: pending.profileName, firstContactAt: pending.firstContactAt,
         createdAt: existing?.createdAt || this.now(), updatedAt: this.now(),
         savedLocation: 'system', addressBookSupported: false
       });
       const persisted = this.store.getEntity('contacts', saved.id);
-      if (!persisted || persisted.name !== name || persisted.phone !== pending.phone || persisted.category !== input.category) throw fault('O contato não foi persistido. A pendência foi preservada.', 'CONTACT_PERSISTENCE_FAILED');
+      if (!persisted || persisted.name !== name || persisted.phone !== pending.phone || JSON.stringify(persisted.categories) !== JSON.stringify(contactInput.categories)) throw fault('O contato não foi persistido. A pendência foi preservada.', 'CONTACT_PERSISTENCE_FAILED');
       const resolved = this.store.saveEntity('contact_pending', {
         ...pending, status: 'saved', resolvedAt: this.now(), resolvedBy: actor.id,
         contactId: persisted.id, savedLocation: 'system'
       });
       this.store.addAudit({ id: randomUUID(), at: this.now(), userId: actor.id,
         action: 'contacts.intake.save', contactId: persisted.id,
-        pendingContactId: pending.id, category: input.category, savedLocation: 'system' });
+        pendingContactId: pending.id, category: contactInput.category, categories: contactInput.categories, savedLocation: 'system' });
       return { contact: persisted, pending: resolved, savedLocation: 'system', addressBookSupported: false,
         message: 'Contato salvo no cadastro local do sistema. A integração não grava na agenda do WhatsApp.' };
     });

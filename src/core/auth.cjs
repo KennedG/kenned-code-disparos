@@ -28,6 +28,10 @@ const PERMISSIONS = Object.freeze([
   ['search.filters', 'Alterar filtros e apelidos de BUSCAS', 'BUSCAS'],
   ['search.manage', 'Gerenciar monitoramento e autorizações de BUSCAS', 'BUSCAS'],
   ['automation.control', 'Parar e retomar todas as automações', 'Controle do sistema'],
+  ['stock.view','Visualizar estoque e disponibilidade','Estoque'], ['stock.manage','Cadastrar, reservar e alterar estoque','Estoque'],
+  ['supplier.view','Consultar fornecedores','Fornecedores'], ['supplier.manage','Gerenciar fornecedores e compras','Fornecedores'],
+  ['commerce.view','Consultar listas, oportunidades e demandas','Comercial'], ['commerce.manage','Gerenciar oportunidades, demandas e públicos','Comercial'], ['commerce.list','Montar listas e anúncios comerciais','Comercial'],
+  ['finance.view','Consultar custos, margens, vendas e caixa','Financeiro'], ['finance.manage','Registrar vendas, recebimentos e movimentações','Financeiro'], ['finance.reports','Consultar e receber relatórios financeiros','Financeiro'], ['finance.export','Exportar dados financeiros e recuperação','Financeiro'],
   ...['view','create','edit','delete','control'].map(action=>[`reminder.${action}`,({view:'Visualizar lembretes',create:'Criar lembretes',edit:'Editar lembretes',delete:'Excluir lembretes',control:'Ativar, pausar e testar lembretes'})[action],'Lembretes'])
 ].map(([id, label, section]) => Object.freeze({ id, label, section })));
 const PERMISSION_IDS = new Set(PERMISSIONS.map(p => p.id));
@@ -35,7 +39,7 @@ const ALL = [...PERMISSION_IDS];
 const DEFAULT_ROLES = Object.freeze([
   { id: 'role-owner', name: 'Dono', permissions: ALL, campaignScope: 'all', isOwner: true, builtIn: true },
   { id: 'role-admin', name: 'Administrador', permissions: ALL.filter(p => p !== 'users.assignOwner' && !p.startsWith('search.')), campaignScope: 'all', isOwner: false, builtIn: true },
-  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !p.startsWith('search.') && !['history.clear', 'settings.edit', 'connection.manage', 'audit.view', 'automation.control'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
+  { id: 'role-manager', name: 'Responsável', permissions: ALL.filter(p => !p.startsWith('users.') && !p.startsWith('search.') && !p.startsWith('finance.') && !p.startsWith('supplier.') && !['stock.manage','commerce.manage','commerce.list','history.clear', 'settings.edit', 'connection.manage', 'audit.view', 'automation.control'].includes(p)), campaignScope: 'all', isOwner: false, builtIn: true },
   { id: 'role-seller', name: 'Vendedor', permissions: ['campaign.view', 'campaign.create', 'campaign.edit', 'campaign.start', 'campaign.pause', 'campaign.stop', 'contacts.view', 'contacts.create', 'contacts.edit', 'groups.view', 'media.view', 'media.create', 'reports.view', 'history.view', 'notifications.view'], campaignScope: 'own', isOwner: false, builtIn: true }
 ]);
 
@@ -104,6 +108,11 @@ class AuthService {
           if (role?.builtIn===true) this.store.saveEntity('roles',{...role,permissions:[...new Set([...(role.permissions||[]),...ALL.filter(p=>p.startsWith('reminder.')||id==='role-admin'&&p==='automation.control')])]});
         }
         this.store.setSetting('authPermissionSchema230',true);
+      }
+      if (!this.store.getSetting('authPermissionSchema300')) {
+        const admin=this.store.getEntity('roles','role-admin');
+        if(admin?.builtIn===true)this.store.saveEntity('roles',{...admin,permissions:[...new Set([...(admin.permissions||[]),...ALL.filter(p=>/^(stock|supplier|commerce|finance)\./.test(p))])]});
+        this.store.setSetting('authPermissionSchema300',true);
       }
     });
   }

@@ -7,11 +7,13 @@ const { DatabaseSync } = require('node:sqlite');
 const { configurationFingerprint } = require('./campaign-version.cjs');
 const { createSearchSchema, attachSearchStore } = require('./search-store.cjs');
 
-const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts','reminders','reminder_deliveries','contact_pending','contact_intake_events']);
+const BUSINESS_TABLES = ['inventory','suppliers','purchases','reservations','sales','sale_payments','sale_events','cash_sessions','cash_movements','commercial_lists','contact_categories','promotional_targets','promotion_ledger','opportunity_rules','buyer_demands','commerce_matches','commerce_deliveries','daily_reports'];
+const NEW_TABLES = ['reminders','reminder_deliveries','contact_pending','contact_intake_events',...BUSINESS_TABLES];
+const ENTITY_TABLES = new Set(['users','roles','recovery_tokens','audit','diagnostics','notifications','alerts','alert_recipients','contacts',...NEW_TABLES]);
 const HISTORY_CATEGORIES = ['campaigns','sends','errors','notifications'];
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const SHARED_TABLES = new Set(['settings','users','roles','recovery_tokens']);
-const MODE_SETTING = /^(buscas|search)|^recentCommandIds$|^systemAlertRecipientIds$|^automationState$/i;
+const MODE_SETTING = /^(buscas|search|commercial|commerce|dailyReport|promotion)|^recentCommandIds$|^systemAlertRecipientIds$|^automationState$/i;
 const PRIVATE_SETTING = /secret|cred|session|qr|recentCommand|^mode:|^integrationMode$|^audioAssets$|^webhook$|^independentAlertChannel$|password|auth|recovery|^(login|lockout|buscas|search)/i;
 
 function atomicWrite(filename, data) {
@@ -91,7 +93,7 @@ async function createStore(dir,options={}) {
       const addColumns=(table,columns)=>{const present=new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(r=>r.name));for(const[name,type]of Object.entries(columns))if(!present.has(name))db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);};
       addColumns('rounds',{campaignId:'TEXT',startedAt:'INTEGER',finishedAt:'INTEGER',status:'TEXT',dayKey:'TEXT'});
       addColumns('jobs',{createdAt:'INTEGER',firstAttemptAt:'INTEGER',resultAt:'INTEGER',attempts:'INTEGER NOT NULL DEFAULT 0',messageId:'TEXT',dayKey:'TEXT'});
-      for(const table of [...ENTITY_TABLES].filter(t=>!['reminders','reminder_deliveries','contact_pending','contact_intake_events'].includes(t)))db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT);
+      for(const table of [...ENTITY_TABLES].filter(t=>!NEW_TABLES.includes(t)))db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT);
         CREATE INDEX IF NOT EXISTS ${table}_created ON ${table}(createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_campaign ON ${table}(campaignId,createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_user ON ${table}(userId,createdAt DESC);
@@ -124,7 +126,7 @@ async function createStore(dir,options={}) {
         INSERT INTO group_progress(campaignId,groupId,lastAt,roundCount) SELECT campaignId,groupId,MAX(startedAt),COUNT(*) FROM group_rounds GROUP BY campaignId,groupId ON CONFLICT(campaignId,groupId) DO UPDATE SET lastAt=excluded.lastAt,roundCount=excluded.roundCount;`);
       for(const c of all('campaigns'))if(!Number.isInteger(c.configRevision))prepared('UPDATE campaigns SET data=? WHERE id=?').run(json({...c,configRevision:c.revision||1}),c.id);
       }
-      for(const table of ['reminders','reminder_deliveries','contact_pending','contact_intake_events'])db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp');
+      for(const table of NEW_TABLES)db.exec(`CREATE TABLE IF NOT EXISTS ${table}(id TEXT PRIMARY KEY,data TEXT NOT NULL,createdAt INTEGER NOT NULL DEFAULT 0,campaignId TEXT,userId TEXT,status TEXT,kind TEXT,storageMode TEXT NOT NULL DEFAULT 'whatsapp');
         CREATE INDEX IF NOT EXISTS ${table}_mode_status_time ON ${table}(storageMode,status,createdAt DESC);
         CREATE INDEX IF NOT EXISTS ${table}_mode_user ON ${table}(storageMode,userId,createdAt DESC);`);
       db.exec(`CREATE INDEX IF NOT EXISTS reminders_due ON reminders(storageMode,json_extract(data,'$.nextDueAt'));
@@ -185,8 +187,27 @@ async function createStore(dir,options={}) {
           CREATE TRIGGER audit_immutable_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'Auditoria imutável'); END;`);
       }
       db.exec("CREATE INDEX IF NOT EXISTS contacts_phone_mode ON contacts(storageMode,json_extract(data,'$.phone'));");
+      db.exec(`CREATE INDEX IF NOT EXISTS inventory_available ON inventory(storageMode,status,json_extract(data,'$.kind'));
+        CREATE INDEX IF NOT EXISTS sales_date ON sales(storageMode,json_extract(data,'$.soldAt'),status);
+        CREATE INDEX IF NOT EXISTS sale_payments_received ON sale_payments(storageMode,json_extract(data,'$.receivedAt'));
+        CREATE INDEX IF NOT EXISTS sales_mode_created ON sales(storageMode,createdAt DESC);
+        CREATE INDEX IF NOT EXISTS sale_payments_sale ON sale_payments(storageMode,json_extract(data,'$.saleId'),createdAt DESC);
+        CREATE INDEX IF NOT EXISTS sale_payments_reservation ON sale_payments(storageMode,json_extract(data,'$.reservationId'),createdAt DESC);
+        CREATE INDEX IF NOT EXISTS cash_movements_session ON cash_movements(storageMode,json_extract(data,'$.cashSessionId'),createdAt DESC);
+        CREATE INDEX IF NOT EXISTS cash_movements_mode_created ON cash_movements(storageMode,createdAt DESC);
+        CREATE INDEX IF NOT EXISTS commerce_deliveries_due ON commerce_deliveries(storageMode,status,json_extract(data,'$.nextAttemptAt'));
+        CREATE INDEX IF NOT EXISTS commerce_deliveries_message ON commerce_deliveries(storageMode,json_extract(data,'$.messageId'));
+        CREATE INDEX IF NOT EXISTS sale_events_sale ON sale_events(storageMode,json_extract(data,'$.saleId'),createdAt);
+        CREATE TRIGGER IF NOT EXISTS sale_events_immutable_update BEFORE UPDATE ON sale_events BEGIN SELECT RAISE(ABORT,'Histórico financeiro imutável'); END;
+        CREATE TRIGGER IF NOT EXISTS sale_events_immutable_delete BEFORE DELETE ON sale_events BEGIN SELECT RAISE(ABORT,'Histórico financeiro imutável'); END;`);
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
     });
+    // These additive indexes also benefit databases already on schema 8.
+    if(version===SCHEMA_VERSION)db.exec(`CREATE INDEX IF NOT EXISTS sales_mode_created ON sales(storageMode,createdAt DESC);
+      CREATE INDEX IF NOT EXISTS sale_payments_sale ON sale_payments(storageMode,json_extract(data,'$.saleId'),createdAt DESC);
+      CREATE INDEX IF NOT EXISTS sale_payments_reservation ON sale_payments(storageMode,json_extract(data,'$.reservationId'),createdAt DESC);
+      CREATE INDEX IF NOT EXISTS cash_movements_session ON cash_movements(storageMode,json_extract(data,'$.cashSessionId'),createdAt DESC);
+      CREATE INDEX IF NOT EXISTS cash_movements_mode_created ON cash_movements(storageMode,createdAt DESC);`);
   }catch(error){db.close();throw error;}
   modeIsolationReady=true;
   const tagged=(table,value)=>{if(!isolated(table))return value;const old=oneRaw(table,value.id);if(old&&old.storageMode!==undefined&&old.storageMode!==storageMode())throw new Error('O registro pertence a outro modo de integração.');return {...value,storageMode:storageMode()};};
@@ -255,9 +276,18 @@ async function createStore(dir,options={}) {
     const items=parseRows(prepared(`SELECT data FROM history${f.sql} ORDER BY createdAt DESC,rowid DESC LIMIT ? OFFSET ?`).all(...f.params,limit,offset));
     return {items,total,limit,offset};
   }
-  const entityFilter=(filter,table)=>queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',userId:'userId',actorId:'userId',status:'status',kind:'kind',ids:'id',code:"json_extract(data,'$.code')",stage:"json_extract(data,'$.stage')",traceId:"json_extract(data,'$.traceId')"},table);
+  const entityFilter=(filter,table)=>queryFilter(filter,{campaignId:'campaignId',campaignIds:'campaignId',userId:'userId',actorId:'userId',status:'status',kind:'kind',ids:'id',saleIds:"json_extract(data,'$.saleId')",reservationIds:"json_extract(data,'$.reservationId')",cashSessionId:"json_extract(data,'$.cashSessionId')",code:"json_extract(data,'$.code')",stage:"json_extract(data,'$.stage')",traceId:"json_extract(data,'$.traceId')"},table);
   const store={
     dir,filename,schemaVersion:SCHEMA_VERSION,get persistenceFailed(){return persistenceFailed;},transaction,
+    createRecoverySnapshot(destination){
+      assertWritable();if(transactionDepth)throw new Error('Aguarde a gravação terminar antes do backup.');
+      const absolute=path.resolve(destination);if(absolute===path.resolve(filename))throw new Error('Escolha outro arquivo para o backup.');
+      fs.mkdirSync(path.dirname(absolute),{recursive:true});
+      // VACUUM INTO captures a consistent SQLite snapshot, including uncheckpointed WAL.
+      db.prepare('VACUUM INTO ?').run(absolute);fs.chmodSync(absolute,0o600);
+      const check=new DatabaseSync(absolute,{readOnly:true});try{if(check.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('O backup não passou na verificação de integridade.');}finally{check.close();}
+      return {path:absolute,schemaVersion:SCHEMA_VERSION,storageMode:storageMode(),bytes:fs.statSync(absolute).size};
+    },
     getSetting,getStorageMode:storageMode,setSetting:(id,value)=>{const key=settingKey(id);return put('settings',{id:key,value});},
     listCampaigns(filter={}){const where=['storageMode=?'],params=[storageMode()];if(filter.ownerId){where.push("json_extract(data,'$.ownerId')=?");params.push(filter.ownerId);}if(filter.ids){if(!filter.ids.length)return [];where.push(`id IN(${filter.ids.map(()=>'?').join(',')})`);params.push(...filter.ids);}return parseRows(prepared(`SELECT data FROM campaigns${where.length?' WHERE '+where.join(' AND '):''} ORDER BY rowid`).all(...params));},
     getCampaign:id=>one('campaigns',id),

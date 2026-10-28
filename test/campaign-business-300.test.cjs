@@ -1,0 +1,21 @@
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const {createStore,seed}=require('../src/core/store.cjs');
+const {CommercialService}=require('../src/core/commercial.cjs');
+const {Scheduler}=require('../src/core/scheduler.cjs');
+const {SimulatedAdapter}=require('../src/adapters/simulated.cjs');
+test('pausing one promotional group skips only that destination and preserves other authorized sends',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kenned-promotion-guard-'));
+ const store=await createStore(dir);seed(store);const clock={at:new Date(2026,9,5,15,0).getTime()},adapter=new SimulatedAdapter({store,delayMs:0});await adapter.connect();
+ const commercial=new CommercialService({store,now:()=>clock.at});
+ const scheduler=new Scheduler({store,adapter,now:()=>clock.at,sleep:async ms=>{clock.at+=ms;},beforeSend:p=>commercial.evaluateJob(p),onSendResult:p=>commercial.recordJobResult(p)});
+ t.after(async()=>{await scheduler.shutdown();await adapter.disconnect();store.close();fs.rmSync(dir,{recursive:true,force:true});});
+ const groups=store.listGroups().slice(0,2),original=store.listCampaigns()[0];
+ const campaign=store.saveCampaign({...original,groupIds:groups.map(g=>g.id),items:[{id:'guard-text',type:'text',text:'Anúncio autorizado'}],audience:'general',schedule:{days:[0,1,2,3,4,5,6],startTime:'00:00',endTime:'00:00'}});
+ await scheduler.activate(campaign.id);
+ commercial.setPromotionTarget({type:'group',targetId:groups[0].id,paused:true});
+ await scheduler.tick();
+ assert.equal(adapter.sent.length,1);assert.equal(adapter.sent[0].groupId,groups[1].id);
+ const skipped=store.listJobs({groupId:groups[0].id})[0];assert.equal(skipped.status,'cancelled');assert.equal(skipped.errorCode,'PROMOTION_TARGET_PAUSED');
+ assert.equal(store.getCampaign(campaign.id).state,'active');assert.equal(store.listJobs({status:'confirmed'}).length,1);
+});

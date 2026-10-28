@@ -54,6 +54,7 @@ class MediaManager {
       const campaign=this.store.getCampaign(job.campaignId),visible=campaign&&this.auth?.canFor(userId??this.auth.currentUserId,'campaign.view',campaign);
       add([job.itemSnapshot,job.contentSnapshot,{mediaId:job.mediaId}].filter(Boolean),{kind:'operational',...(visible?{id:job.id,campaignId:job.campaignId}:{}),label:visible?`${campaign.name} — envio ${job.status==='uncertain'?'incerto, aguardando revisão':'na fila ou em andamento'}`:'Envio operacional protegido',state:job.status});
     }
+    for(const inventory of this.store.listEntities?.('inventory')||[]){const visible=this.auth?.canFor(userId??this.auth.currentUserId,'stock.view');add((inventory.mediaIds||[]).map(mediaId=>({mediaId})),{kind:'inventory',...(visible?{id:inventory.id}:{}),label:visible?`Estoque — ${inventory.model||inventory.name}`:'Foto de estoque protegido'});}
     const media=this.store.listMediaAnyMode?.()||this.store.listMedia();
     for(const id of ids){const item=this.store.getMedia(id);if(!item?.path)continue;for(const other of media)if(other.id!==id&&!selected.has(other.id)&&path.resolve(other.path||'')===path.resolve(item.path))references.get(id).push({kind:'sharedFile',label:'Arquivo gerenciado compartilhado com outro registro da biblioteca'});}
     return references;

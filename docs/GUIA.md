@@ -1,12 +1,12 @@
-# Instalação e uso da versão 2.3.0
+# Instalação e uso da versão 3.0.0
 
 ## Instalar ou atualizar
 
-1. No Windows 10/11 de 64 bits, encerre a versão anterior pelo menu da bandeja e execute **Kenned-Code-Disparos-Setup-2.3.0-x64.exe**. Para atualizar, mantenha a pasta dedicada usada anteriormente: **Mega Disparos** continua aceita. Em uma instalação nova, a pasta padrão é **Kenned Code Disparos**. O atalho e a identidade passam a Kenned Code Disparos; o perfil local antigo é preservado. O instalador inclui o runtime e cria o atalho no menu Iniciar; o atalho na área de trabalho é opcional.
+1. No Windows 10/11 de 64 bits, encerre a versão anterior pelo menu da bandeja e execute **Kenned-Code-Disparos-Setup-3.0.0-x64.exe**. Para atualizar, mantenha a pasta dedicada usada anteriormente: **Mega Disparos** continua aceita. Em uma instalação nova, a pasta padrão é **Kenned Code Disparos**. O atalho e a identidade passam a Kenned Code Disparos; o perfil local antigo é preservado. O instalador inclui o runtime e cria o atalho no menu Iniciar; o atalho na área de trabalho é opcional.
 2. No primeiro acesso, cadastre o **Dono** com usuário e senha de pelo menos 12 caracteres. Guarde os oito códigos de recuperação apresentados uma única vez, fora dos backups comuns. Em uma atualização, campanhas, mídias e configurações anteriores são preservadas e o banco é migrado com cópia de segurança em `backups`.
 3. Em uma instalação nova, teste em **SIMULAÇÃO — DADOS FICTÍCIOS**. A campanha de exemplo tem 15 grupos fictícios, rodadas a cada 10 minutos, espaçamento de 5 segundos e começa desativada. Campanhas anteriores em execução ficam pausadas após a reabertura.
 
-A atualização para 2.3.0 preserva campanhas, arquivos, usuários, configurações e credenciais e migra o banco para esquema 7, com cópia anterior à migração. **BUSCAS começa desativado em instalação nova** e mantém as configurações existentes em atualização; selecionar grupos para monitorar ofertas não altera os destinos das campanhas.
+A atualização para 3.0.0 preserva campanhas, arquivos, usuários, configurações e credenciais e migra o banco para esquema 8, com cópia anterior à migração. **BUSCAS começa desativado em instalação nova** e mantém as configurações existentes em atualização; selecionar grupos para monitorar ofertas não altera os destinos das campanhas.
 
 O Windows pode exibir um aviso de editor desconhecido, pois o instalador não tem assinatura de código. Não é preciso instalar Node.js ou usar terminal.
 
@@ -151,3 +151,7 @@ Consulte [VALIDACAO-2.3.0.md](VALIDACAO-2.3.0.md) e [CORRECOES-2.3.0.md](CORRECO
 O campo de teste no aplicativo aceita a descrição ou o comando completo com o prefixo configurado. A consulta é local; o botão de entrega envia aos destinatários configurados após a ação explícita. O histórico distingue consulta local, pendente, confirmado pelo servidor, falha e resultado incerto, com o destino correspondente. Ofertas ambíguas não participam do ranking. A revisão pode confirmar um preço total verificado; ambiguidade de modelo, capacidade ou cor permanece para revisão ou descarte, preservando a mensagem.
 
 ![BUSCAS com anúncios fictícios](buscas-resultados.png)
+
+## Estoque, comércio e caixa
+
+Consulte [COMERCIO-3.0.0.md](COMERCIO-3.0.0.md). Antes de atualizar ou recuperar, leia [ATUALIZACAO-3.0.0.md](ATUALIZACAO-3.0.0.md).

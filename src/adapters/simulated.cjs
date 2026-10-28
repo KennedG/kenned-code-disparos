@@ -90,7 +90,8 @@ class SimulatedAdapter extends EventEmitter {
     while (this.automaticMessages.size > 10000) this.automaticMessages.delete(this.automaticMessages.values().next().value);
   }
 
-  async send(groupId, item, media) {
+  async send(groupId, item, media, {beforeSubmit}={}) {
+    item=beforeSubmit?.()||item;
     if (this.status.state !== 'connected') {
       throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
     }
@@ -119,10 +120,18 @@ class SimulatedAdapter extends EventEmitter {
     return result;
   }
 
-  async sendPrivate(number, text, { clientMessageId } = {}) {
+  async sendPrivateContent(number,item,media,{beforeSubmit}={}) {
+    const target=await this.resolveRecipient(String(number));item=beforeSubmit?.()||item;
+    if(item.type!=='text'&&!media)throw Object.assign(new Error('Mídia simulada ausente.'),{definitive:true,submitted:false});
+    const result=await this.sendPrivate(target.phone,item.text||item.caption||`Arquivo simulado: ${media.name}`,{clientMessageId:item.clientMessageId});
+    const entry=this.sent.find(e=>e.messageId===result.messageId);if(entry){entry.item={...item};entry.mediaId=media?.id;}return result;
+  }
+
+  async sendPrivate(number, text, { clientMessageId, beforeSubmit } = {}) {
     if (!/^[1-9]\d{9,14}$/.test(String(number || ''))) throw Object.assign(new Error('Telefone privado inválido. Use código do país e DDD.'), { safeToRetry: false });
     if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw Object.assign(new Error('Alerta privado inválido.'), { safeToRetry: false });
     if (this.status.state !== 'connected') throw Object.assign(new Error('Simulação desconectada.'), { safeToRetry: true });
+    beforeSubmit?.();
     const outcome = this.nextOutcome || 'confirmed';
     this.nextOutcome = null;
     if (outcome === 'failed') throw Object.assign(new Error('Falha temporária simulada antes do alerta.'), { safeToRetry: true });
