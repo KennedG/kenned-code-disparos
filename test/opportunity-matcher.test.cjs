@@ -107,7 +107,7 @@ test('two units of same exact model remain separate when original messages diffe
 test('explicit unit reference survives a new publication and campaign', () => {
   const a = candidates('iPhone 13 Pro 256GB R$3000 disponível', { imei: '990000000000002' })[0];
   const b = candidates('iPhone 13 Pro 256GB R$2900 disponível', { imei: '990000000000002', sourceMessageId: 'next-day-original', id: 'copied' })[0];
-  const c = candidates('iPhone 13 Pro 256GB R$2900 disponível', { imei: '351071529238146' })[0];
+  const c = candidates('iPhone 13 Pro 256GB R$2900 disponível', { imei: '990000000000003' })[0];
   assert.equal(a.offerKey, b.offerKey); assert.notEqual(a.offerKey, c.offerKey); assert.doesNotMatch(a.offerKey, /351071/);
 });
 test('explicit original offer reference is preserved independently from campaign identity', () => {

@@ -19,9 +19,9 @@ const delivered = proof => accepted(proof) && (['delivered', 'read'].includes(pr
 const resultOrThrow = result => { if (result?.ok === false) throw failure(result.reason || 'A operação não pôde ser executada.', result.code || 'OP_CONTROL_DENIED'); return result; };
 
 class OpportunityPrivateCommands {
-  constructor({ store, adapter, authService, workflow, sendAdminReply, licenseGuard = () => true, now = () => Date.now() } = {}) {
+  constructor({ store, adapter, authService, workflow, sendAdminReply, statusProvider, licenseGuard = () => true, now = () => Date.now() } = {}) {
     if (!store?.getSetting || !store?.setSetting || !workflow || !authService?.resolveWhatsAppActor) throw new Error('Controle de oportunidades exige armazenamento, fluxo e autorização central.');
-    Object.assign(this, { store, adapter, authService, workflow, sendAdminReply, licenseGuard, now });
+    Object.assign(this, { store, adapter, authService, workflow, sendAdminReply, statusProvider, licenseGuard, now });
     this.closed = false; this.adapterRevision = 0; this.waiting = 0; this.tail = Promise.resolve();
     this.receiptListener = receipt => this._receipt(receipt);
     this._recover(); this.adapter?.on?.('receipt', this.receiptListener);
@@ -188,6 +188,7 @@ class OpportunityPrivateCommands {
         const value = await this.workflow.status();
         if (typeof value === 'string') response = value;
         else { const cfg = this._config(); response = `📋 *Oportunidades — status*\nModo: ${(value?.automatic ?? cfg.automatic ?? cfg.mode === 'automatic') ? 'Automático' : 'Aguardando decisão'}\nEnvios: ${value?.paused ? 'Pausados' : 'Conforme configuração'}\nAguardando aprovação: ${value?.awaitingApproval ?? value?.pendingApproval ?? 0}\nNa fila: ${value?.queued ?? value?.pending ?? 0}\nResultados incertos: ${value?.uncertain ?? 0}\nFalhas: ${value?.failed ?? 0}`; }
+        if(this.statusProvider){const extra=await this.statusProvider(context.commandActorId);if(extra)response+='\n\n'+extra;}
       } else if (/^!ajuda\s*$/i.test(text)) response = help;
       else response = 'Comando inválido.\n\n' + help;
       this._record(context, { status: 'completed', completedAt: this.now() });

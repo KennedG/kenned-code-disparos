@@ -1,6 +1,6 @@
 # Versões publicadas
 
-Atual: **Kenned Code Disparos 2.3.2 R9** e **Automação Comunidade 1.0.1**.
+Revisão mais recente: **Kenned Code Disparos 2.3.2 R10 (homologação real pendente)** e **Automação Comunidade 1.0.1**.
 
 O código está hospedado no GitHub. Os instaladores permanecem no Google Drive, sujeitos às permissões existentes. Nenhum anexo binário de instalador foi enviado ao GitHub: o serviço de uploads recusou a autenticação desta conexão.
 
@@ -28,3 +28,5 @@ O código está hospedado no GitHub. Os instaladores permanecem no Google Drive,
 | Kenned Code Disparos | v2.3.2-r9 | [Versão e código](https://github.com/KennedG/kenned-code-disparos/releases/tag/v2.3.2-r9) | [Download](https://drive.google.com/file/d/1vh5CPj8f70FzCr1_5R01dX3XfauSZa2e/view?usp=drivesdk) |
 | Automação Comunidade | comunidade-v1.0.0 | [Versão e código](https://github.com/KennedG/kenned-code-disparos/releases/tag/comunidade-v1.0.0) | [Download](https://drive.google.com/file/d/1GKDfvmaETasxxyZbk_YaITtm98my_-rb/view?usp=drivesdk) |
 | Automação Comunidade | comunidade-v1.0.1 | [Versão e código](https://github.com/KennedG/kenned-code-disparos/releases/tag/comunidade-v1.0.1) | [Download](https://drive.google.com/file/d/1QMyCf-hW0wg19lIzA2Bv0di9gcWUIEIk/view?usp=drivesdk) |
+
+| Kenned Code Disparos | v2.3.2-r10 | [Versão e código](https://github.com/KennedG/kenned-code-disparos/releases/tag/v2.3.2-r10) | [Instalador e evidências](https://drive.google.com/drive/folders/1tM60pzYQxlWOJ4Oo450ERCK2ym0vsWIM) |

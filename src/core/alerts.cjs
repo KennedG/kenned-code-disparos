@@ -38,6 +38,7 @@ function alertText(incident) {
     const affected = (incident.affectedCampaigns || []).map(c => `📣 ${safeDescription(c.name)} — ${c.pending || 0} mensagens pendentes`).join('\n');
     return `🚨 WhatsApp desconectado\n\n🕒 Ocorrência original: ${at}\n⚠️ Motivo: ${reason}\n🔎 Código do erro: ${codeOf(incident.code, 'WHATSAPP_DISCONNECTED')}${affected ? `\n\n${affected}` : ''}${incident.recoveredAt ? `\n\n✅ Conexão recuperada: ${timestampText(incident.recoveredAt, incident.timezone)}` : ''}\n\nOs envios da campanha aguardam o próximo horário programado. Este aviso ficou pendente enquanto a conexão estava indisponível. Acesse o Kenned Code Disparos para verificar a conexão.`;
   }
+  if(incident.event==='synchronization')return `⚠️ Sincronização do WhatsApp — Kenned Code Disparos\n\n🕒 Ocorrência: ${at}\n${reason}\n🔎 Código: ${codeOf(incident.code,'WA_DECRYPTION_UNAVAILABLE')}\n\nO conteúdo não foi inventado. Confira o aparelho principal e o diagnóstico da sessão. As demais mensagens elegíveis continuam sendo processadas conforme a conexão.`;
   if (incident.event === 'qr-required') return `📲 ${incident.recoveredAt ? 'Aviso da leitura de QR Code necessária durante a falha' : 'Nova leitura de QR Code necessária'} — Kenned Code Disparos\n\n🕒 Ocorrência original: ${at}\n⚠️ ${reason}\n\n${incident.recoveredAt ? `✅ Sessão recuperada: ${timestampText(incident.recoveredAt, incident.timezone)}. A conexão já está pronta; as campanhas aguardam o próximo horário programado.` : 'Abra o aplicativo e leia o QR Code em Aparelhos conectados do WhatsApp. As campanhas permanecem pausadas; este aviso só poderá sair quando houver conexão ou um canal independente autorizado.'}`;
   if (!incident.campaignId && !incident.campaignName) return `${incident.event === 'test' ? '🔔 Teste de alerta' : '🚨 Falha crítica'} — Kenned Code Disparos\n\n🕒 Ocorrência original: ${at}\n⚠️ Motivo: ${reason}\n🔎 Código do erro: ${codeOf(incident.code, 'SYSTEM_ERROR')}\n\nAcesse o sistema para verificar os detalhes. Nenhuma campanha foi ativada por este aviso.`;
   return `🚨 Campanha interrompida por erro\n\n📣 Campanha: ${String(incident.campaignName || 'Campanha').slice(0, 200)}\n🕒 Data e horário: ${at}\n⚠️ Motivo: ${reason}\n✅ Envios confirmados: ${incident.confirmed || 0}\n⏳ Pendentes: ${incident.pending || 0}\n🔎 Código do erro: ${codeOf(incident.code, 'CAMPAIGN_ERROR')}\n\nAcesse o sistema para verificar os detalhes e decidir sobre a retomada.`;
@@ -57,6 +58,7 @@ class AlertService extends EventEmitter {
     this.reconnectAttempts = 0;
     this.reconnecting = null;
     this.reconnectNextAttemptAt = null;
+    this.connectionPhaseAt=this.now();this.connectionStalled=false;
     this.flushing = null;
     this.disconnectOccurrence = null;
     this.previousState = adapter?.status?.state;
@@ -175,7 +177,7 @@ class AlertService extends EventEmitter {
     // alert records were created. Recipient+occurrence keys prevent duplication.
     for (const c of this.store.listCampaigns()) if (c.lastError?.id) this.recordIncident(c.lastError);
     for (const notification of this._list('notifications')) if (notification.active === true && notification.blocking === true && !notification.muted && !notification.resolvedAt && (!notification.integrationMode || notification.integrationMode === this._mode()) && !(notification.event === 'disconnect' && this.adapter?.status?.state === 'connected')) this.emit('localAlert', copy(notification));
-    this.timer = setInterval(() => { void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure()); }, 1000);
+    this.timer = setInterval(() => { this.checkRecoveryHealth(); void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure()); }, 1000);
     this.timer.unref?.();
     void this.flush().catch(() => this.scheduler?.blockOnPersistenceFailure());
     if (this.disconnectOccurrence && this.adapter?.status?.state === 'connected') void this._onStatus(this.adapter.status).catch(() => this.scheduler?.blockOnPersistenceFailure());
@@ -480,8 +482,10 @@ class AlertService extends EventEmitter {
     return { resolved: [...ids], recoveredAt: at };
   }
 
+  recordRecoveryStatistic(kind){const key=`recoveryStatistics:${this._mode()}`,old=this.store.getSetting(key,{since:this.now(),successes:0,failures:0});this.store.setSetting(key,{...old,[kind]:(old[kind]||0)+1,[kind==='successes'?'lastRecoveryAt':'lastFailureAt']:this.now()});}
+
   getRecoveryState() {
-    return { state: this.adapter?.status?.state || 'disconnected', attempts: this.reconnectAttempts, nextAttemptAt: this.reconnectNextAttemptAt, reconnecting: Boolean(this.reconnecting), incident: this.disconnectOccurrence ? copy(this.disconnectOccurrence) : null, manual: this.store.getSetting(`manualDisconnect:${this._mode()}`, false) === true };
+    return { statistics:this.store.getSetting(`recoveryStatistics:${this._mode()}`,{since:this.now(),successes:0,failures:0}), state: this.adapter?.status?.state || 'disconnected', attempts: this.reconnectAttempts, nextAttemptAt: this.reconnectNextAttemptAt, reconnecting: Boolean(this.reconnecting), incident: this.disconnectOccurrence ? copy(this.disconnectOccurrence) : null, manual: this.store.getSetting(`manualDisconnect:${this._mode()}`, false) === true };
   }
 
   flush() {
@@ -715,6 +719,7 @@ class AlertService extends EventEmitter {
   async _onStatus(status) {
     if (this.closed || !status) return;
     const previous = this.previousState;
+    if(previous!==status.state){this.connectionPhaseAt=this.now();this.connectionStalled=false;}
     this.previousState = status.state;
     if (status.state === 'connected') {
       if (!this._connectionReady(status)) { this.emit('change'); return; }
@@ -724,6 +729,7 @@ class AlertService extends EventEmitter {
       const occurrence = this.disconnectOccurrence;
       const recoveredAt = this.now();
       if (occurrence) {
+        this.recordRecoveryStatistic('successes');
         // Add recovery time only to work that has never entered the transport.
         // An accepted or uncertain notice keeps the exact original payload.
         const recovered = { ...occurrence, recoveredAt, timezone: computerTimezone() };
@@ -766,7 +772,7 @@ class AlertService extends EventEmitter {
 
   _canReconnect(status, config = this.store.getSetting('reconnect', {})) {
     const maximum = Number.isInteger(config.maxAttempts) ? Math.max(0, Math.min(10, config.maxAttempts)) : 5;
-    return !this.closed && !this._stopped() && !this.store.persistenceFailed && !this.scheduler?.persistenceFailed && config.enabled !== false && !this.store.getSetting(`manualDisconnect:${this._mode()}`, false) && !['connecting', 'qr', 'connected'].includes(status.state) && status.retryable !== false && !['manual', 'expired', 'session_expired', 'restricted'].includes(status.reasonCode) && this.reconnectAttempts < maximum;
+    return !this.closed && !this._stopped() && !this.store.persistenceFailed && !this.scheduler?.persistenceFailed && config.enabled !== false && !this.store.getSetting(`manualDisconnect:${this._mode()}`, false) && (!['connecting','qr','connected'].includes(status.state)||this.connectionStalled&&status.state!=='qr') && status.retryable !== false && !['manual', 'expired', 'session_expired', 'restricted'].includes(status.reasonCode) && this.reconnectAttempts < maximum;
   }
 
   _scheduleReconnect(status) {
@@ -792,12 +798,36 @@ class AlertService extends EventEmitter {
     this.reconnectTimer?.unref?.();
   }
 
+  checkRecoveryHealth() {
+    this.adapter?.expirePendingDecryption?.();
+    if(!this.closed&&!this._stopped())this.adapter?.checkOperationalHealth?.();
+    if(this.closed||this._stopped()||this.store.getSetting(`manualDisconnect:${this._mode()}`,false))return;
+    const status=this.adapter?.status||{},config=this.store.getSetting('reconnect',{});
+    if(config.enabled===false||status.qr||['manual','session_expired','restricted'].includes(status.reasonCode))return;
+    const deadline=Math.max(15,Math.min(180,Number(config.connectTimeoutSeconds)||45))*1000;
+    if(['connecting','connected'].includes(status.state)&&!this._connectionReady(status)&&this.now()-this.connectionPhaseAt>=deadline){
+      this.connectionStalled=true;
+      if(this._canReconnect(status,config)&&!this.reconnectTimer){
+        if(!this.reconnecting)this.recordRecoveryStatistic('failures');
+      this._diagnostic('WA_RECOVERY_STALLED','A conexão permaneceu sem prontidão além do prazo.','Nova tentativa limitada usará o mesmo mecanismo do botão Reconectar.',null,this.reconnectAttempts,{stage:'reconexao.watchdog'});
+        this.recoveryAbort?.(Object.assign(new Error('A conexão excedeu o prazo de recuperação.'),{code:'WA_RECOVERY_DEADLINE'}));
+        this.reconnecting=null;this.adapter.abortConnectionAttempt?.();this._scheduleReconnect(this.adapter.status);
+      }
+    }
+  }
+
   reconnect({ automatic = false } = {}) {
     if (this.reconnecting) return this.reconnecting;
     if (!automatic) { this.reconnectAttempts = 0; this.store.setSetting?.(`manualDisconnect:${this._mode()}`, false); }
     this._cancelReconnect();
-    this.reconnecting = Promise.resolve().then(() => this.adapter.connect({ reconnect: true })).finally(() => { this.reconnecting = null; });
-    return this.reconnecting;
+    const source=this.adapter,revision=this.adapterRevision;
+    this.connectionPhaseAt=this.now();let timer,operation;
+    const deadline=new Promise((_resolve,reject)=>{
+      this.recoveryAbort=reject;
+      timer=setTimeout(()=>{if(source===this.adapter&&revision===this.adapterRevision){source.abortConnectionAttempt?.();reject(Object.assign(new Error('O preparo da conexão excedeu o prazo. Confira o diagnóstico.'),{code:'WA_RECOVERY_DEADLINE'}));}},Math.max(15,Math.min(180,Number(this.store.getSetting('reconnect',{}).connectTimeoutSeconds)||45))*1000);timer.unref?.();
+    });
+    operation=Promise.race([Promise.resolve().then(()=>source.connect({reconnect:true})),deadline]).catch(error=>{if(source===this.adapter&&revision===this.adapterRevision)this.recordRecoveryStatistic('failures');throw error;}).finally(()=>{clearTimeout(timer);if(this.reconnecting===operation){this.reconnecting=null;this.recoveryAbort=null;}});
+    this.reconnecting=operation;return operation;
   }
 
   networkStateChanged({ online } = {}) {
@@ -809,6 +839,7 @@ class AlertService extends EventEmitter {
 
   async shutdown() {
     this.closed = true;
+    this.recoveryAbort?.(Object.assign(new Error('Recuperação encerrada com o aplicativo.'),{code:'WA_RECOVERY_CLOSED'}));
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this._cancelReconnect();

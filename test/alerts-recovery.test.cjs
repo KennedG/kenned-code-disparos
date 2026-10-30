@@ -79,3 +79,15 @@ test('changing integration mode ends the old active alarm and keeps its private 
  const realAdapter=new EventEmitter();realAdapter.status={state:'disconnected',mode:'whatsapp'};realAdapter.sendPrivate=async()=>{throw new Error('No cross-mode send.');};f.service.setAdapter(realAdapter);await f.service.flush();
  assert.equal(f.store.getEntity('notifications',notification.id).active,false);assert.equal(f.resolved.length,1);assert.equal(f.calls.length,0);assert.equal(f.store.listEntities('alerts')[0].integrationMode,'simulated');assert.equal(f.store.listEntities('alerts')[0].status,'pending');
 });
+
+test('R10 watchdog releases a stuck connecting state and invokes the same mechanism as manual reconnect',async t=>{
+ const f=fixture({initialState:'connecting',settings:{reconnect:{enabled:true,maxAttempts:3,delaySeconds:3,maxDelaySeconds:30,connectTimeoutSeconds:15}}});t.after(()=>f.service.shutdown());f.service.start();let aborted=0,connected=0;
+ f.adapter.abortConnectionAttempt=()=>{aborted++;f.adapter.status={state:'disconnected',mode:'simulated',reasonCode:'stalled',retryable:true};};f.adapter.connect=async options=>{assert.deepEqual(options,{reconnect:true});connected++;f.adapter.status={state:'connecting',mode:'simulated'};};
+ f.clock.at+=15001;f.service.checkRecoveryHealth();assert.equal(aborted,1);assert.equal(f.scheduled.size,1);const [id,timer]=[...f.scheduled][0];f.scheduled.delete(id);timer.fn();await settle();assert.equal(connected,1);await f.service.reconnect();assert.equal(connected,2);
+});
+test('R10 watchdog does not restart a QR challenge, manual disconnect or operational connection',async t=>{
+ const f=fixture({initialState:'connecting'});t.after(()=>f.service.shutdown());f.service.start();let aborted=0;f.adapter.abortConnectionAttempt=()=>aborted++;f.clock.at+=300000;f.adapter.status={state:'connecting',qr:'challenge'};f.service.checkRecoveryHealth();assert.equal(aborted,0);f.adapter.status={state:'connected',ready:true};f.service.checkRecoveryHealth();assert.equal(aborted,0);f.preferences.set('manualDisconnect:simulated',true);f.adapter.status={state:'connecting'};f.service.checkRecoveryHealth();assert.equal(aborted,0);
+});
+test('R10 manual and automatic concurrent recovery requests create only one connection attempt',async t=>{
+ const f=fixture({initialState:'disconnected'});t.after(()=>f.service.shutdown());let release,calls=0;f.adapter.connect=async()=>{calls++;await new Promise(r=>release=r);};const a=f.service.reconnect(),b=f.service.reconnect({automatic:true});assert.equal(a,b);await settle();assert.equal(calls,1);release();await a;
+});

@@ -12,7 +12,7 @@ window.KennedNavigation = (() => {
   const categories = [
     ['Atendimento', [['opportunities', 'Oportunidades', 'search', 'Pedidos dos grupos que combinam com seus anúncios'], ['contacts', 'Contatos', 'groups', 'Classificar contatos e revisar novos interessados']]],
     ['Conteúdo', [['library', 'Modelos', 'text', 'Criar e reutilizar modelos de mensagem', 'templates'], ['library', 'Biblioteca', 'library', 'Organizar fotos, vídeos e documentos', 'media']]],
-    ['Automação', [['alerts', 'Alertas', 'whatsapp', 'Responsáveis e resultados dos avisos privados'], ['reminders', 'Lembretes', 'clock', 'Tarefas e avisos recorrentes']]],
+    ['Automação', [['uptime', 'UPTIME', 'clock', 'Monitoramento automático e relatórios operacionais'], ['alerts', 'Alertas', 'whatsapp', 'Responsáveis e resultados dos avisos privados'], ['reminders', 'Lembretes', 'clock', 'Tarefas e avisos recorrentes']]],
     ['Diagnóstico', [['history', 'Histórico', 'history', 'Consultar resultados de envios e falhas'], ['diagnostics', 'Diagnóstico', 'shield', 'Rastreamento, etapas e orientações de erro'], ['reports', 'Relatórios de envio', 'history', 'Resultados operacionais das campanhas']]],
     ['Administração', [['users', 'Usuários e perfis', 'shield', 'Gerenciar acessos e permissões']]]
   ];

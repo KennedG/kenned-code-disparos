@@ -620,6 +620,7 @@ class CommandController {
         `Próximo envio: ${next ? new Date(next).toLocaleString('pt-BR', { timeZone: this.store.getSetting('buscasSettings', {})?.timezone || 'America/Sao_Paulo' }) : 'não programado'}\n` +
         `${this.automationControl ? `Automação: ${this.automationControl.isStopped() ? 'INTERROMPIDA — retomada explícita necessária' : 'habilitada'}\n` : ''}` +
         `${details ? `Filas: ${counts(details.queues || details.queue || details.scheduler)}\nMonitoramento: ${counts(details.monitoring || details.monitor || details.search)}\nAlertas: ${counts(details.alerts)}\nLembretes: ${counts(details.reminders)}\n` : ''}` +
+        `${details?.uptime ? `UPTIME: ${details.uptime.enabled?'habilitado':'desativado'}; próximo relatório: ${details.uptime.nextAt?new Date(details.uptime.nextAt).toLocaleString('pt-BR'):'não programado'}\n` : ''}` +
         `${this.adapter.status?.mode === 'simulated' ? 'Modo simulado: nenhuma mensagem real é enviada.' : 'O envio requer computador ligado, internet e conexão ativa.'}`);
     }
     if (command === 'campanhas') return this._reply(context, this._campaignList());

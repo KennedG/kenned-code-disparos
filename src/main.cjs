@@ -123,6 +123,7 @@ async function nativeHost(action,payload={}){
     case 'showSaveDialog':return dialog.showSaveDialog(win,payload);
     case 'showMessageBox':return dialog.showMessageBox(win,payload);
     case 'openDataFolder':return shell.openPath(dataDir());
+    case 'openWhatsApp':{const phone=String(payload.phone||'');if(!/^[1-9]\d{9,14}$/.test(phone))throw new Error('Telefone inválido.');await shell.openExternal('https://wa.me/'+phone);return{opened:true};}
     case 'openSupport':await shell.openExternal('https://wa.me/5562994033173');return {opened:true};
     case 'setLoginItemSettings':if(process.platform==='win32')app.setLoginItemSettings({name:APP_NAME,openAtLogin:!!payload.openAtLogin,path:process.execPath,args:['--autostart']});return true;
     case 'localAlert':return nativeAlert(payload);

@@ -221,6 +221,7 @@ class SearchService extends EventEmitter {
     }) };
   }
   listOffers(filters, actorId) { this._assert(actorId, 'view'); return this.store.querySearchOffers(this._pageFilters(filters)); }
+  queryCapturedMessages(filters,actorId){this._assert(actorId,'view');const s=this._settings();const min=s.maxAgeEnabled?this.now()-s.maxAgeValue*(s.maxAgeUnit==='hours'?3600000:60000):null;const from=filters?.from?Number(filters.from):min;return this.store.queryCapturedMessages({...filters,from:from==null?null:min==null?from:Math.max(from,min),to:filters?.to||this.now()});}
   listMessages(filters, actorId) { this._assert(actorId, 'view'); return this.store.querySearchMessages(this._pageFilters(filters)); }
   _pageFilters(filters = {}) { const result = { ...filters }; if (result.limit !== undefined) result.limit = safeNumber(result.limit, 1, 100, 'Limite da página'); if (result.offset !== undefined) result.offset = safeNumber(result.offset, 0, 1_000_000, 'Página'); return result; }
   _eligibleCapture(ctx) { const s = this._settings(); return s.enabled && !this.paused && !this.closed && this._modeMatches(ctx) && ctx?.machineGenerated !== true && ctx?.automaticMessage !== true && (ctx?.isGroup === true || this.groups.has(ctx?.chatId)) && s.monitoredGroupIds.includes(ctx.chatId) && !s.blockedGroupIds.includes(ctx.chatId) && (ctx.all === true || typeof ctx.messageId === 'string' && ctx.messageId.length <= 512); }

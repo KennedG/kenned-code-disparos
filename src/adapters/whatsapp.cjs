@@ -224,7 +224,7 @@ class WhatsAppAdapter extends EventEmitter {
     this.deliveryProofs = new Map();
     this.replyProofKey = null;
     this.identityHydrations = new Map();
-    this.pendingDecryption = new Map();
+    this.pendingDecryption = new Map();this.decryptionHealth={since:Date.now(),pendingObserved:0,recovered:0,expired:0,lastPendingAt:null,lastRecoveredAt:null,lastExpiredAt:null};
     this.commandPrefix = '!busca';
     this.submissionTraceIds = new Map();
     this.sourceCapture = { enabled: false, groupIds: new Set(), activatedAt: 0, importFrom: 0, importUntil: 0 };
@@ -313,7 +313,7 @@ class WhatsAppAdapter extends EventEmitter {
     if (state !== 'connected') this.verifiedRecipientAliases.clear();
     const failure = ['disconnected', 'restricted'].includes(state);
     const own = this._ownAccount();
-    this.status = { state, ready: state === 'connected', mode: 'whatsapp', simulation: false, detail, ownNumber: own.phone || '', ownAccountId: own.id || '', ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
+    this.status = { state, operationalState:extras.qr?'awaiting-manual-authentication':state==='connecting'?'authenticating':state, ready: state === 'connected', mode: 'whatsapp', simulation: false, detail, ownNumber: own.phone || '', ownAccountId: own.id || '', ...(failure ? { reasonCode: state === 'restricted' ? 'restricted' : 'unexpected', at: new Date().toISOString(), manual: false, retryable: state !== 'restricted' } : {}), ...extras };
     this.emit('status', this.status);
   }
 
@@ -326,23 +326,35 @@ class WhatsAppAdapter extends EventEmitter {
   async connect({ reconnect = false } = {}) {
     if (this.connectPromise) return this.connectPromise;
     if (this.status.state === 'connected' && !reconnect) return this.status;
-    this.connectPromise = (async () => {
+    let operation;
+    operation = (async () => {
       // Replacing a stale transport is not a user-requested disconnect. Keep
       // its classification separate so recovery cannot revoke scheduling.
       if (reconnect && this.socket) await this.disconnect({ manual: false, reasonCode: 'reconnecting' });
       this.requestedDisconnect = false;
       this.restartCount = 0;
       return this._connect();
-    })().finally(() => { this.connectPromise = null; });
-    return this.connectPromise;
+    })().finally(() => { if(this.connectPromise===operation)this.connectPromise = null; });
+    this.connectPromise=operation;
+    return operation;
+  }
+
+  abortConnectionAttempt(reason = 'Conexão sem prontidão no prazo configurado.') {
+    this.connectionRequestRevision=(this.connectionRequestRevision||0)+1;
+    this.generation++;this.connectPromise=null;
+    const socket=this.socket;this.socket=null;this._resolveAllPending();
+    try{socket?.end?.(new Error(reason));}catch{}
+    this._status('disconnected',reason,{manual:false,retryable:true,reasonCode:'stalled',errorCode:'WA_RECOVERY_DEADLINE',operationalState:'reconnection-failed'});
   }
 
   async _connect() {
+    const requestRevision=this.connectionRequestRevision||0;
     if (!this.networkAvailable) {
       this._status('disconnected', 'Sem conexão com a internet. A tentativa de conexão foi adiada.', { reasonCode: 'internet', manual: false, retryable: true, errorCode: 'NETWORK_OFFLINE' });
       throw definitiveError('Sem conexão com a internet. Tente novamente após restabelecer a rede.', true);
     }
     await this._ensureProtection();
+    if(requestRevision!==(this.connectionRequestRevision||0)||this.requestedDisconnect)return this.status;
     this._status('connecting', 'Preparando a conexão não oficial com o WhatsApp…');
     const generation = ++this.generation;
     this.recipientCache.clear();
@@ -512,9 +524,16 @@ class WhatsAppAdapter extends EventEmitter {
         this._status('connecting', readiness.detail, { ready: false, reasonCode: readiness.reasonCode, errorCode: readiness.reasonCode });
         return;
       }
+      if(typeof socket.fetchBlocklist==='function'){
+        this._status('connecting','Autenticando a sessão com o servidor do WhatsApp…',{operationalState:'synchronizing',ready:false});
+        try { await this._boundedControl(()=>socket.fetchBlocklist(),{timeoutMs:Math.min(this.controlTimeoutMs,15000)}); }
+        catch(error){if(socket===this.socket&&generation===this.generation)this.abortConnectionAttempt('O servidor não confirmou a prontidão da sessão. A recuperação terá tentativas limitadas.');return;}
+        if(socket!==this.socket||generation!==this.generation||this.requestedDisconnect)return;
+        this.authenticatedProbeAt=Date.now();
+      }
       this.restartCount = 0;
       this.captureHealth.lastConnectionAt = Date.now();
-      this._status('connected', 'WhatsApp conectado por Baileys, integração não oficial. Use apenas grupos autorizados.');
+      this._status('connected', 'WhatsApp conectado por Baileys, integração não oficial. Use apenas grupos autorizados.',{operationalState:typeof socket.fetchBlocklist==='function'?'connected':'connected-with-problems',serverAuthenticated:typeof socket.fetchBlocklist==='function',serverVerifiedAt:this.authenticatedProbeAt||null});
     }
     if (update.connection !== 'close') return;
     this.socket = null;
@@ -1619,6 +1638,24 @@ class WhatsAppAdapter extends EventEmitter {
     } finally { clearTimeout(timer); }
   }
 
+  async resolveParticipantNumber(identity) {
+    const id=accountJid(identity?.senderId),declared=normalizePhone(identity?.senderPhone||identity?.recipient);
+    let actual=phoneFromJid(id);
+    if(id.endsWith('@lid')){
+      actual=this.contacts.get(id)?.phoneNumber||null;
+      if(!actual){
+        if(!this.getConnectionReadiness().ready)throw definitiveError('Conecte o WhatsApp para verificar o participante cujo telefone não foi disponibilizado.',true,'OP_PRIVATE_IDENTITY_OFFLINE');
+        const socket=this.socket,generation=this.generation,lookup=socket.signalRepository?.lidMapping?.getPNForLID;
+        if(typeof lookup==='function'){const mapping=await this._boundedControl(()=>lookup.call(socket.signalRepository.lidMapping,id),{timeoutMs:5000});this._assertTransport(socket,generation);actual=phoneFromJid(mapping);if(actual)this._rememberContacts([{id,phoneNumber:`${actual}@s.whatsapp.net`}]);}
+      }
+    }
+    if(actual&&declared&&actual!==declared&&!this.verifiedPhoneAliases(actual).includes(declared)&&brazilNinthDigitPair(actual,declared)&&this.getConnectionReadiness().ready)await this.resolveRecipient(declared,{timeoutMs:5000});
+    if(actual&&declared&&actual!==declared&&!this.verifiedPhoneAliases(actual).includes(declared))throw definitiveError('O telefone registrado diverge da identidade do participante. Revise o diagnóstico.',false,'OP_PRIVATE_IDENTITY_CONFLICT');
+    const phone=actual||declared;
+    if(!phone||!id||id.endsWith('@g.us'))throw definitiveError('O WhatsApp não forneceu telefone confiável para este participante. Não foi criado número a partir do LID.',false,'OP_PRIVATE_RECIPIENT_UNAVAILABLE');
+    return{phone,senderId:id,resolutionSource:actual?'authenticated-participant':'captured-verified-phone'};
+  }
+
   async resolveRecipient(number, { traceId, timeoutMs } = {}) {
     try {
       const result = await this._resolveRecipient(number, { timeoutMs });
@@ -1849,10 +1886,18 @@ class WhatsAppAdapter extends EventEmitter {
     return resultPromise;
   }
 
+  checkOperationalHealth(){
+    if(this.healthProbe||this.status.state!=='connected'||this.requestedDisconnect||typeof this.socket?.fetchBlocklist!=='function'||Date.now()-(this.lastHealthProbeAt||this.authenticatedProbeAt||0)<120000)return this.healthProbe;
+    const socket=this.socket,generation=this.generation;this.lastHealthProbeAt=Date.now();
+    this.healthProbe=(async()=>{try{await this._boundedControl(()=>socket.fetchBlocklist(),{timeoutMs:Math.min(this.controlTimeoutMs,10000)});this._assertTransport(socket,generation);this.authenticatedProbeAt=Date.now();this.status={...this.status,serverAuthenticated:true,serverVerifiedAt:this.authenticatedProbeAt};return true;}catch(error){if(socket===this.socket&&generation===this.generation&&!this.requestedDisconnect){this._transportDiagnostic({},'connection.health','WA_HEALTH_CHECK_FAILED','O servidor não confirmou a sessão no prazo; recuperação controlada será iniciada.');this.abortConnectionAttempt('Sessão sem resposta na verificação operacional. Aguardando recuperação.');}return false;}finally{this.healthProbe=null;}})();return this.healthProbe;
+  }
+
+  expirePendingDecryption(now=Date.now()){let count=0,first;for(const[id,pending]of this.pendingDecryption)if(pending.expiresAt<now){first ||= pending.message;this.pendingDecryption.delete(id);count++;}if(count){this.decryptionHealth.expired+=count;this.decryptionHealth.lastExpiredAt=now;this._transportDiagnostic(first||{},'transport.recovery','WA_DECRYPTION_UNAVAILABLE',`${count} mensagem(ns) sem conteúdo original após o prazo. Revise a sessão; nenhum conteúdo foi inventado.`,{expired:count});}return count;}
+
   _incoming(event, generation) {
     if (generation !== this.generation) return;
     const now = Date.now();
-    for (const [id, pending] of this.pendingDecryption) if (pending.expiresAt < now) this.pendingDecryption.delete(id);
+    this.expirePendingDecryption(now);
     for (const message of event.messages || []) {
       const key = message.key || {};
       const recovered = typeof event.requestId === 'string' && event.requestId.length > 0;
@@ -1886,13 +1931,14 @@ class WhatsAppAdapter extends EventEmitter {
         // this, a ciphertext event permanently suppresses the recovered body.
         const ciphertext = this.library?.WAMessageStubType?.CIPHERTEXT ?? this.library?.proto?.WebMessageInfo?.StubType?.CIPHERTEXT ?? 2;
         if (message.messageStubType === ciphertext) {
-          this.pendingDecryption.set(this._decryptionKey(message, generation), { timestamp, fromMe: key.fromMe === true, expiresAt: now + 120000 });
+          if(!this.pendingDecryption.has(this._decryptionKey(message,generation))){this.decryptionHealth.pendingObserved++;this.decryptionHealth.lastPendingAt=now;}
+          this.pendingDecryption.set(this._decryptionKey(message, generation), { message:{key:{...key}},timestamp, fromMe: key.fromMe === true, expiresAt: now + 120000 });
           while (this.pendingDecryption.size > 2000) this.pendingDecryption.delete(this.pendingDecryption.keys().next().value);
           this._transportDiagnostic(message, 'transport.waiting', 'WA_DECRYPTION_PENDING', 'Mensagem recebida sem conteúdo decifrado. Aguardando recuperação suportada pela integração.');
         } else this._transportDiagnostic(message, 'transport.ignored', 'WA_MESSAGE_CONTENT_UNSUPPORTED', 'Evento sem texto ou mídia compatível; não interpretado como comando.');
         continue;
       }
-      this.pendingDecryption.delete(this._decryptionKey(message, generation));
+      if(this.pendingDecryption.delete(this._decryptionKey(message, generation))){this.decryptionHealth.recovered++;this.decryptionHealth.lastRecoveredAt=now;this._transportDiagnostic(message,'transport.recovered','WA_DECRYPTION_RECOVERED','Conteúdo original recuperado pela integração. Processamento único liberado.');}
       if (isGroup && type !== 'text' && this._sourceChatAllowed(chatId)) {
         this._transportDiagnostic(message, 'transport.ignored', 'WA_SOURCE_CAPTION_DATA', 'Legenda do grupo de origem tratada somente como conteúdo, sem executar comandos.');
         continue;

@@ -36,7 +36,7 @@ async function fixture(t, options = {}) {
       const created = { ev: new EventEmitter(), ws: new EventEmitter(), user: { id: `${STORE_PHONE}@s.whatsapp.net` }, end() {},
         groupFetchAllParticipating: () => groupQuery(),
         onWhatsApp: async phone => [{ jid: `${phone}@s.whatsapp.net`, exists: true }],
-        fetchBlocklist: async () => [],
+        fetchBlocklist: options.probe || (async () => []),
         sendMessage: async (target, content, sendOptions) => {
           sent.push({ target, content, messageId: sendOptions.messageId });
           if (options.ack !== false) setImmediate(() => created.ws.emit('CB:ack,class:message', { attrs: { id: sendOptions.messageId } }));
@@ -48,7 +48,7 @@ async function fixture(t, options = {}) {
   };
   const adapter = new WhatsAppAdapter({ store, credentialsDir: path.join(dir, 'session'), runtimePlatform: 'win32', ackTimeoutMs: 15, controlTimeoutMs: 100,
     safeStorage: { isEncryptionAvailable: () => true, encryptString: v => Buffer.from(v), decryptString: v => Buffer.from(v).toString() }, loadLibrary: async () => library });
-  await adapter.connect(); socket.ev.emit('connection.update', { connection: 'open' });
+  await adapter.connect(); socket.ev.emit('connection.update', { connection: 'open' }); await settle();
   const searches = new SearchService({ store, adapter, authService: auth, sleep: async () => {} }); searches.start();
   searches.saveSettings({ enabled: true, monitoredGroupIds: [GROUP], commandGroupIds: [], privateCommandsEnabled: true, commandPrivateNumbers: [OWNER_PHONE] }, owner.id);
   t.after(async () => { await searches.shutdown(); await adapter.disconnect(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
@@ -126,7 +126,7 @@ test('captura/reconexão preserva IDs, listener único, hora original e ediçõe
   const f = await fixture(t), original = f.message('stable-publication');
   await f.emit(original); const storedTime = f.store.getSearchMessage(GROUP, original.key.id).originalAt;
   const oldSocket = f.socket; await f.adapter.disconnect({ reasonCode: 'unexpected', manual: false });
-  await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' });
+  await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' }); await settle();
   assert.equal(f.socket.ev.listenerCount('messages.upsert'), 1);
   await f.emit(f.message('stale-socket'), {}, oldSocket); await f.emit(original); await f.emit(f.message('after-reconnect'), { type: 'append' });
   assert.equal(f.store.getSearchMonitorStats().messages, 2); assert.equal(f.store.getSearchMessage(GROUP, 'stale-socket'), undefined);
@@ -154,7 +154,7 @@ test('consulta de grupos iniciada na sessão antiga não contamina a sessão rec
   const f = await fixture(t); let release;
   f.setGroupQuery(() => new Promise(resolve => { release = resolve; }));
   const pending = f.adapter.listGroups(); const rejected = assert.rejects(pending, error => error.code === 'WA_RECIPIENT_CONNECTION_CHANGED'); await settle();
-  await f.adapter.disconnect({ reasonCode: 'unexpected', manual: false }); await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' });
+  await f.adapter.disconnect({ reasonCode: 'unexpected', manual: false }); await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' }); await settle();
   release({ stale: { id: '120363555555555555@g.us', subject: 'Não deve contaminar' } }); await rejected;
   assert.equal(f.adapter.knownSearchGroups.has('120363555555555555@g.us'), false);
 });
@@ -177,7 +177,7 @@ test('reconexão interna não emite desconexão manual; escolha explícita do us
   await f.adapter.connect({ reconnect: true });
   assert.equal(statuses.some(status => status.manual === true || status.reasonCode === 'manual'), false);
   assert.ok(statuses.some(status => status.reasonCode === 'reconnecting' && status.manual === false));
-  f.socket.ev.emit('connection.update', { connection: 'open' });
+  f.socket.ev.emit('connection.update', { connection: 'open' }); await settle();
   await f.adapter.disconnect(); assert.equal(statuses.at(-1).reasonCode, 'manual'); assert.equal(statuses.at(-1).manual, true);
 });
 
@@ -186,7 +186,7 @@ test('evento tardio do transporte já fechado não consome identificador de publ
   const old = f.socket; old.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: Object.assign(new Error('controlled-close'), { statusCode: 503 }) } });
   await settle(); assert.equal(f.adapter.status.state, 'disconnected'); await f.emit(late, {}, old);
   assert.equal(f.store.getSearchMonitorStats().messages, 0);
-  await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' }); await f.emit(late);
+  await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' }); await settle(); await f.emit(late);
   assert.equal(f.store.getSearchMonitorStats().messages, 1);
 });
 
@@ -195,7 +195,7 @@ test('resultado incerto de resposta privada não bloqueia a próxima busca nem �
   const command = id => f.message(id, '!busca iPhone 15 Pro Max 256GB', { key: { remoteJid: `${OWNER_PHONE}@s.whatsapp.net`, participant: undefined } });
   const first = command('uncertain-one'); await f.emit(first); await f.emit(command('uncertain-two'));
   assert.equal(f.sent.length, 2); assert.ok(f.store.listSearchDeliveries().items.every(delivery => delivery.status === 'uncertain'));
-  await f.adapter.disconnect({ reasonCode: 'unexpected', manual: false }); await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' });
+  await f.adapter.disconnect({ reasonCode: 'unexpected', manual: false }); await f.adapter.connect(); f.socket.ev.emit('connection.update', { connection: 'open' }); await settle();
   await f.emit(first); await f.searches.waitForIdle(); assert.equal(f.sent.length, 2);
   const firstId = f.sent[0].messageId;
   f.socket.ws.emit('CB:ack,class:message', { attrs: { id: firstId } }); await settle();
@@ -230,3 +230,19 @@ test('falhas permanentes da captura são mostradas separadamente da fila elegív
   const answer = await f.searches.executeSearch({ query: 'iPhone 15 Pro Max 256GB' }, f.owner.id);
   assert.equal(answer.count, 0); assert.equal(answer.stale, true); assert.ok(answer.warnings.some(warning => warning.includes('SEARCH_TIMESTAMP_UNKNOWN')));
 });
+
+
+test('R10 opening a socket does not announce an operational session until authenticated probe succeeds', async t => {
+ let release;const probe=new Promise(r=>release=r);const f=await fixture(t,{probe:()=>probe});assert.equal(f.adapter.status.state,'connecting');assert.equal(f.adapter.status.operationalState,'synchronizing');assert.equal(f.adapter.getConnectionReadiness().ready,false);release([]);await settle();assert.equal(f.adapter.status.state,'connected');assert.equal(f.adapter.status.serverAuthenticated,true);
+});
+test('R10 failed authenticated probe stays disconnected and preserves protected credentials', async t => {
+ const f=await fixture(t,{probe:async()=>{throw Error('Servidor indisponível');}});await settle();assert.equal(f.adapter.status.state,'disconnected');assert.equal(f.adapter.status.errorCode,'WA_RECOVERY_DEADLINE');assert.equal(f.adapter.status.retryable,true);
+});
+test('R10 private opportunity identity resolves actual participant PN and authenticated LID without group substitution',async t=>{
+ const f=await fixture(t);let result=await f.adapter.resolveParticipantNumber({senderId:`${OWNER_PHONE}@s.whatsapp.net`,senderPhone:OWNER_PHONE});assert.equal(result.phone,OWNER_PHONE);const lid='9912345678@lid';f.socket.signalRepository={lidMapping:{getPNForLID:async()=>`${OWNER_PHONE}@s.whatsapp.net`}};result=await f.adapter.resolveParticipantNumber({senderId:lid});assert.equal(result.phone,OWNER_PHONE);await assert.rejects(f.adapter.resolveParticipantNumber({senderId:GROUP}),/identidade|participante|telefone/i);await assert.rejects(f.adapter.resolveParticipantNumber({senderId:`${OWNER_PHONE}@s.whatsapp.net`,senderPhone:'5562999990999'}),{code:'OP_PRIVATE_IDENTITY_CONFLICT'});
+});
+test('R10 unresolved LID is never converted to a fake telephone or sent to group',async t=>{const f=await fixture(t);await assert.rejects(f.adapter.resolveParticipantNumber({senderId:'998877665544@lid'}),/telefone|identificar|identidade/i);assert.equal(f.sent.length,0);});
+
+test('R10 a stale operational socket is probed once and a failing probe triggers controlled recovery',async t=>{const f=await fixture(t);let probes=0;f.adapter.lastHealthProbeAt=Date.now()-130000;f.socket.fetchBlocklist=async()=>{probes++;throw Error('Sem resposta');};const a=f.adapter.checkOperationalHealth(),b=f.adapter.checkOperationalHealth();assert.equal(a,b);await a;assert.equal(probes,1);assert.equal(f.adapter.status.state,'disconnected');assert.equal(f.adapter.status.reasonCode,'stalled');});
+test('R10 frequent UI refreshes do not create excess server health queries',async t=>{const f=await fixture(t);let probes=0;f.socket.fetchBlocklist=async()=>{probes++;return[];};for(let i=0;i<100;i++)await f.adapter.checkOperationalHealth();assert.equal(probes,0);});
+test('R10 persisted Brazilian phone variant requires refreshed authenticated alias proof after reconnect',async t=>{const f=await fixture(t),canonical=OWNER_PHONE.slice(0,4)+OWNER_PHONE.slice(5),original=f.adapter.resolveRecipient;let called=0;f.adapter.resolveRecipient=async number=>{called++;assert.equal(number,OWNER_PHONE);const phones=[canonical,OWNER_PHONE],binding={phones,generation:f.adapter.generation,socket:f.socket,accountId:f.adapter._ownAccount().id,expiresAt:Date.now()+60000};for(const p of phones)f.adapter.verifiedRecipientAliases.set(p,binding);return{jid:canonical+'@s.whatsapp.net',phone:canonical,identityAliasesConfirmed:true};};t.after(()=>f.adapter.resolveRecipient=original);const resolved=await f.adapter.resolveParticipantNumber({senderId:canonical+'@s.whatsapp.net',senderPhone:OWNER_PHONE});assert.equal(called,1);assert.equal(resolved.phone,canonical);assert.deepEqual(new Set(f.adapter.verifiedPhoneAliases(canonical)),new Set([canonical,OWNER_PHONE]));});

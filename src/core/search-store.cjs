@@ -264,6 +264,24 @@ function attachSearchStore(store,{db,prepared: basePrepared,transaction}) {
   };
   // Singular aliases keep call sites consistent with the existing alert store.
   api.listSearchAuthorization=api.listSearchAuthorizations;
+  const messageFoldRaw=value=>String(value??'').normalize('NFKC').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/([a-z])(\d)/g,'$1 $2').replace(/(\d)([a-z])/g,'$1 $2').replace(/\bpromax\b/g,'pro max').replace(/\s+/g,' ').trim();
+  const foldCache=new Map();let foldBytes=0;const messageFold=value=>{const text=String(value??'');if(foldCache.has(text))return foldCache.get(text);const folded=messageFoldRaw(text),bytes=2*(text.length+folded.length);if(bytes<1048576){while(foldCache.size&&(foldBytes+bytes>8388608||foldCache.size>=4000)){const key=foldCache.keys().next().value;foldBytes-=2*(key.length+foldCache.get(key).length);foldCache.delete(key);}foldCache.set(text,folded);foldBytes+=bytes;}return folded;};
+  db.function('buscas_message_fold',{deterministic:true},messageFold);
+  api.queryCapturedMessages=(filters={})=>{
+    const text=String(filters.query||'').slice(0,200),terms=[...text.matchAll(/"([^"]+)"|(\S+)/g)].map(m=>messageFold(m[1]||m[2])).filter(Boolean);
+    if(terms.length>10)throw new Error('Use até 10 termos de pesquisa.');
+    const where=['deletedAt IS NULL'],params=[];
+    const expression="buscas_message_fold(json_extract(data,'$.text'))";
+    for(const term of terms){where.push(`instr(${expression},?)>0`);params.push(term);}
+    if(filters.contact){const raw=String(filters.contact).slice(0,200),term=/^[+()\d\s.-]+$/.test(raw)?raw.replace(/\D/g,''):messageFold(raw);where.push("instr(buscas_message_fold(COALESCE(json_extract(data,'$.displayName'),'')||' '||COALESCE(json_extract(data,'$.savedName'),'')||' '||COALESCE(json_extract(data,'$.senderNumber'),'')||' '||COALESCE(senderId,'')),?)>0");params.push(term);}
+    for(const[field,column]of[['groupId','chatId'],['senderId','senderId']])if(filters[field]){where.push(column+'=?');params.push(identifier(filters[field]));}
+    if(filters.from!=null&&filters.from!==''){where.push('originalAt>=?');params.push(timestamp(filters.from));}
+    if(filters.to!=null&&filters.to!==''){where.push('originalAt<=?');params.push(timestamp(filters.to));}
+    const sql=where.join(' AND '),total=Number(prepared('SELECT COUNT(*) n FROM buscas_messages WHERE '+sql).get(...params).n),n=Math.min(100,Math.max(1,Number(filters.limit)||30)),offset=Math.max(0,Number(filters.offset)||0);
+    const relevance=filters.sort==='relevance'&&terms.length>0,order=relevance?`CASE WHEN instr(${expression},?)>0 THEN 0 ELSE 1 END,originalAt DESC,rowid DESC`:filters.sort==='oldest'?'originalAt ASC,rowid ASC':'originalAt DESC,rowid DESC';
+    const args=relevance?[...params,messageFold(text.replace(/"/g,'')),n,offset]:[...params,n,offset];
+    return{items:prepared('SELECT data FROM buscas_messages WHERE '+sql+' ORDER BY '+order+' LIMIT ? OFFSET ?').all(...args).map(decode),total,limit:n,offset,query:text};
+  };
   api.querySearchMessages=api.listSearchMessages;
   api.listSearchRun=api.listSearchRuns;
   api.listSearchDelivery=api.listSearchDeliveries;
